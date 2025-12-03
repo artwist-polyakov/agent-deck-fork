@@ -399,7 +399,7 @@ func (d *NewDialog) View() string {
 	helpStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("240")).
 		MarginTop(1)
-	content.WriteString(helpStyle.Render("Tab/↑↓: navigate • ←/→: select • Enter: create • Esc: cancel"))
+	content.WriteString(helpStyle.Render("Tab: next/accept • ↑↓: navigate • Ctrl+N/P: suggestions • Enter: create • Esc: cancel"))
 
 	// Wrap in dialog box
 	dialog := dialogStyle.Render(content.String())
