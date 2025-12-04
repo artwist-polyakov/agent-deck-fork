@@ -317,7 +317,7 @@ func NewSession(name, workDir string) *Session {
 // This is used when loading sessions from storage - it properly initializes
 // all fields needed for status detection to work correctly
 func ReconnectSession(tmuxName, displayName, workDir, command string) *Session {
-	return &Session{
+	sess := &Session{
 		Name:             tmuxName,
 		DisplayName:      displayName,
 		WorkDir:          workDir,
@@ -327,6 +327,15 @@ func ReconnectSession(tmuxName, displayName, workDir, command string) *Session {
 		toolDetectExpiry: 30 * time.Second,
 		// stateTracker and promptDetector will be created lazily on first status check
 	}
+
+	// Enable pipe-pane for event-driven status detection
+	if sess.Exists() {
+		if err := sess.EnablePipePane(); err != nil {
+			debugLog("Warning: failed to enable pipe-pane for %s: %v", tmuxName, err)
+		}
+	}
+
+	return sess
 }
 
 // ReconnectSessionWithStatus creates a Session with pre-initialized state based on previous status
@@ -360,6 +369,14 @@ func ReconnectSessionWithStatus(tmuxName, displayName, workDir, command string, 
 	default:
 		// Unknown status - default to waiting
 		sess.lastStableStatus = "waiting"
+	}
+
+	// Enable pipe-pane for event-driven status detection
+	// (Note: Also called in ReconnectSession, but we ensure it's enabled after state restoration)
+	if sess.Exists() {
+		if err := sess.EnablePipePane(); err != nil {
+			debugLog("Warning: failed to enable pipe-pane for %s: %v", tmuxName, err)
+		}
 	}
 
 	return sess
