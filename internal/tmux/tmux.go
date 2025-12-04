@@ -949,14 +949,18 @@ func (s *Session) GetStatus() (string, error) {
 		}
 	}
 
-	// Stay GREEN during spike detection window to avoid yellow flicker
-	// When we see a timestamp change but haven't yet confirmed it's sustained (2+ changes),
-	// we should show GREEN, not fall through to the cooldown check which might return YELLOW
+	// During spike detection window (waiting to confirm sustained activity),
+	// keep the PREVIOUS stable status instead of flashing GREEN
+	// Only confirmed sustained activity (2+ changes in 1s) triggers GREEN
 	if !s.stateTracker.activityCheckStart.IsZero() &&
 		time.Since(s.stateTracker.activityCheckStart) < 1*time.Second {
-		s.lastStableStatus = "active"
-		debugLog("%s: SPIKE_WINDOW_ACTIVE → active (avoiding yellow flicker)", shortName)
-		return "active", nil
+		// Return previous status - don't flash GREEN on unconfirmed single spike
+		debugLog("%s: SPIKE_WINDOW_PENDING → keeping %s (not flashing green)", shortName, s.lastStableStatus)
+		if s.lastStableStatus != "" {
+			return s.lastStableStatus, nil
+		}
+		// Fallback if no previous status
+		return "waiting", nil
 	}
 
 	// Check cooldown
