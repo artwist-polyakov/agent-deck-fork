@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
+	"github.com/google/uuid"
 )
 
 // Status represents the current state of a session
@@ -59,6 +60,42 @@ func NewInstanceWithGroup(title, projectPath, groupPath string) *Instance {
 	return inst
 }
 
+// NewInstanceWithTool creates a new session with tool-specific initialization
+// When tool is "claude", pre-assigns a ClaudeSessionID for reliable fork support
+func NewInstanceWithTool(title, projectPath, tool string) *Instance {
+	inst := &Instance{
+		ID:          generateID(),
+		Title:       title,
+		ProjectPath: projectPath,
+		GroupPath:   extractGroupPath(projectPath),
+		Tool:        tool,
+		Status:      StatusIdle,
+		CreatedAt:   time.Now(),
+		tmuxSession: tmux.NewSession(title, projectPath),
+	}
+
+	// Pre-assign Claude session ID if tool is claude
+	// This ensures reliable fork functionality by knowing the session ID upfront
+	if tool == "claude" {
+		inst.ClaudeSessionID = generateUUID()
+		inst.ClaudeDetectedAt = time.Now()
+	}
+
+	return inst
+}
+
+// NewInstanceWithGroupAndTool creates a new session with explicit group and tool
+func NewInstanceWithGroupAndTool(title, projectPath, groupPath, tool string) *Instance {
+	inst := NewInstanceWithTool(title, projectPath, tool)
+	inst.GroupPath = groupPath
+	return inst
+}
+
+// generateUUID generates a valid UUID v4 for Claude session IDs
+func generateUUID() string {
+	return uuid.New().String()
+}
+
 // extractGroupPath extracts a group path from project path
 // e.g., "/home/user/projects/devops" -> "projects"
 func extractGroupPath(projectPath string) string {
@@ -80,18 +117,49 @@ func extractGroupPath(projectPath string) string {
 	return DefaultGroupName
 }
 
+// buildClaudeCommand builds the claude command with --session-id if available
+// This ensures reliable session tracking for fork functionality
+func (i *Instance) buildClaudeCommand(baseCommand string) string {
+	if i.Tool != "claude" || i.ClaudeSessionID == "" {
+		return baseCommand
+	}
+
+	configDir := GetClaudeConfigDir()
+
+	// If baseCommand is just "claude", build full command with session ID
+	if baseCommand == "claude" {
+		return fmt.Sprintf("CLAUDE_CONFIG_DIR=%s claude --session-id %s --dangerously-skip-permissions",
+			configDir, i.ClaudeSessionID)
+	}
+
+	// If it's a custom claude command, inject --session-id after "claude"
+	if strings.Contains(baseCommand, "claude") && !strings.Contains(baseCommand, "--session-id") {
+		// Find "claude" and insert --session-id right after
+		return strings.Replace(baseCommand, "claude ",
+			fmt.Sprintf("claude --session-id %s ", i.ClaudeSessionID), 1)
+	}
+
+	return baseCommand
+}
+
 // Start starts the session in tmux
 func (i *Instance) Start() error {
 	if i.tmuxSession == nil {
 		return fmt.Errorf("tmux session not initialized")
 	}
 
+	// Build command with session ID if claude
+	command := i.Command
+	if i.Tool == "claude" && i.ClaudeSessionID != "" {
+		command = i.buildClaudeCommand(i.Command)
+	}
+
 	// Start the tmux session
-	if err := i.tmuxSession.Start(i.Command); err != nil {
+	if err := i.tmuxSession.Start(command); err != nil {
 		return fmt.Errorf("failed to start tmux session: %w", err)
 	}
 
-	if i.Command != "" {
+	if command != "" {
 		i.Status = StatusRunning
 	}
 
@@ -142,11 +210,27 @@ func (i *Instance) UpdateStatus() error {
 }
 
 // UpdateClaudeSession updates the Claude session ID if Claude is running
+// For sessions with pre-assigned IDs (via --session-id flag), just refresh the timestamp
+// For forked sessions and legacy sessions, use detection to find the session ID
 func (i *Instance) UpdateClaudeSession() {
 	// Only track if tool is Claude
 	if i.Tool != "claude" {
 		return
 	}
+
+	// Check if this is a NEW session with pre-assigned ID (not a fork or legacy session)
+	// Pre-assigned sessions have --session-id in their command
+	isPREAssigned := i.ClaudeSessionID != "" && strings.Contains(i.Command, "--session-id")
+
+	if isPREAssigned {
+		// This is the bulletproof path - we know the ID upfront, no detection needed
+		i.ClaudeDetectedAt = time.Now()
+		return
+	}
+
+	// DETECTION PATH: For forked sessions and legacy sessions
+	// Forked sessions use --resume --fork-session (no --session-id)
+	// Legacy sessions were created before the --session-id feature
 
 	// Get the session's working directory
 	if i.tmuxSession == nil {
@@ -158,10 +242,19 @@ func (i *Instance) UpdateClaudeSession() {
 		workDir = i.ProjectPath
 	}
 
+	// For forked sessions, we need to find the NEW session file created by Claude
+	// The fork command creates a new file, so we look for the most recently modified one
+	isForkSession := strings.Contains(i.Command, "--fork-session")
+
 	// Try to get session ID from Claude config
 	sessionID, err := GetClaudeSessionID(workDir)
 	if err != nil {
-		// No session found - clear if stale
+		// No session found - for forks, this is expected initially (Claude still starting)
+		if isForkSession && i.ClaudeSessionID == "" {
+			// Don't clear - fork is still initializing, will retry on next tick
+			return
+		}
+		// For non-forks, clear if stale
 		if time.Since(i.ClaudeDetectedAt) > 5*time.Minute {
 			i.ClaudeSessionID = ""
 		}
@@ -171,6 +264,37 @@ func (i *Instance) UpdateClaudeSession() {
 	// Update session ID
 	i.ClaudeSessionID = sessionID
 	i.ClaudeDetectedAt = time.Now()
+}
+
+// WaitForClaudeSession waits for Claude to create a session file (for forked sessions)
+// Returns the detected session ID or empty string after timeout
+func (i *Instance) WaitForClaudeSession(maxWait time.Duration) string {
+	if i.Tool != "claude" {
+		return ""
+	}
+
+	workDir := i.ProjectPath
+	if i.tmuxSession != nil {
+		if wd := i.tmuxSession.GetWorkDir(); wd != "" {
+			workDir = wd
+		}
+	}
+
+	// Poll every 200ms for up to maxWait
+	interval := 200 * time.Millisecond
+	deadline := time.Now().Add(maxWait)
+
+	for time.Now().Before(deadline) {
+		sessionID, err := GetClaudeSessionID(workDir)
+		if err == nil && sessionID != "" {
+			i.ClaudeSessionID = sessionID
+			i.ClaudeDetectedAt = time.Now()
+			return sessionID
+		}
+		time.Sleep(interval)
+	}
+
+	return ""
 }
 
 // Preview returns the last 3 lines of terminal output
