@@ -1879,3 +1879,31 @@ func TestSession_SendCtrlC(t *testing.T) {
 		t.Error("Session should still exist after Ctrl+C")
 	}
 }
+
+func TestSession_SendCommand(t *testing.T) {
+	sess := NewSession("send-cmd-test", "/tmp")
+
+	err := sess.Start("")
+	if err != nil {
+		t.Fatalf("Failed to start session: %v", err)
+	}
+	defer sess.Kill()
+
+	// Send a command
+	err = sess.SendCommand("echo hello")
+	if err != nil {
+		t.Fatalf("SendCommand failed: %v", err)
+	}
+
+	// Give it time to execute
+	time.Sleep(200 * time.Millisecond)
+
+	// Capture pane content
+	content, err := sess.CapturePane()
+	if err != nil {
+		t.Fatalf("CapturePane failed: %v", err)
+	}
+	if !strings.Contains(content, "hello") {
+		t.Errorf("Expected 'hello' in output, got: %s", content)
+	}
+}

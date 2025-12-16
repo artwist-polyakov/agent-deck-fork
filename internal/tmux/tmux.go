@@ -1394,6 +1394,16 @@ func (s *Session) SendCtrlC() error {
 	return cmd.Run()
 }
 
+// SendCommand sends a command to the tmux session and presses Enter
+func (s *Session) SendCommand(command string) error {
+	// Send the command text
+	if err := s.SendKeys(command); err != nil {
+		return err
+	}
+	// Press Enter to execute
+	return s.SendEnter()
+}
+
 // GetWorkDir returns the current working directory of the tmux pane
 // This is the live directory from the pane, not the initial WorkDir
 func (s *Session) GetWorkDir() string {
