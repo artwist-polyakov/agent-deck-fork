@@ -1142,15 +1142,30 @@ func (i *Instance) Fork(newTitle, newGroupPath string) (string, error) {
 	workDir := i.ProjectPath
 	configDir := GetClaudeConfigDir()
 
+	// Check dangerous mode from user config (same logic as buildClaudeResumeCommand)
+	dangerousMode := false
+	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
+		dangerousMode = userConfig.Claude.DangerousMode
+	}
+
 	// Capture-resume pattern for fork:
 	// 1. Fork in print mode to get new session ID
 	// 2. Store in tmux environment
 	// 3. Resume the forked session interactively
-	cmd := fmt.Sprintf(
-		`cd '%s' && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
-			`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
-			`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id" --dangerously-skip-permissions`,
-		workDir, configDir, i.ClaudeSessionID, configDir)
+	var cmd string
+	if dangerousMode {
+		cmd = fmt.Sprintf(
+			`cd '%s' && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
+				`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
+				`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id" --dangerously-skip-permissions`,
+			workDir, configDir, i.ClaudeSessionID, configDir)
+	} else {
+		cmd = fmt.Sprintf(
+			`cd '%s' && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
+				`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
+				`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id"`,
+			workDir, configDir, i.ClaudeSessionID, configDir)
+	}
 
 	return cmd, nil
 }
