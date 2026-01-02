@@ -359,7 +359,8 @@ func handleAdd(profile string, args []string) {
 	}
 
 	// Get path argument (defaults to current directory)
-	path := fs.Arg(0)
+	// Fix: sanitize input to remove surrounding quotes that cause issues
+	path := strings.Trim(fs.Arg(0), "'\"")
 	if path == "" || path == "." {
 		var err error
 		path, err = os.Getwd()

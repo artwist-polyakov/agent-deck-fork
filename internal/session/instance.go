@@ -1039,7 +1039,7 @@ func (i *Instance) Restart() error {
 		command = i.buildClaudeResumeCommand()
 	} else if i.Tool == "gemini" && i.GeminiSessionID != "" {
 		// Set GEMINI_SESSION_ID in tmux env so detection works after restart
-		command = fmt.Sprintf("tmux set-environment GEMINI_SESSION_ID %s && gemini --resume %s",
+		command = fmt.Sprintf("tmux set-environment GEMINI_SESSION_ID \"%s\" && gemini --resume \"%s\"",
 			i.GeminiSessionID, i.GeminiSessionID)
 	} else {
 		// Route to appropriate command builder based on tool
@@ -1091,10 +1091,10 @@ func (i *Instance) buildClaudeResumeCommand() string {
 	// This ensures CLAUDE_SESSION_ID is set in tmux env after restart,
 	// so GetSessionIDFromTmux() works correctly and detects the session
 	if dangerousMode {
-		return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID %s && CLAUDE_CONFIG_DIR=%s claude --resume %s --dangerously-skip-permissions",
+		return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID \"%s\" && CLAUDE_CONFIG_DIR=%s claude --resume \"%s\" --dangerously-skip-permissions",
 			i.ClaudeSessionID, configDir, i.ClaudeSessionID)
 	}
-	return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID %s && CLAUDE_CONFIG_DIR=%s claude --resume %s",
+	return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID \"%s\" && CLAUDE_CONFIG_DIR=%s claude --resume \"%s\"",
 		i.ClaudeSessionID, configDir, i.ClaudeSessionID)
 }
 
@@ -1147,7 +1147,7 @@ func (i *Instance) Fork(newTitle, newGroupPath string) (string, error) {
 	// 2. Store in tmux environment
 	// 3. Resume the forked session interactively
 	cmd := fmt.Sprintf(
-		`cd %s && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
+		`cd "%s" && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
 			`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
 			`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id" --dangerously-skip-permissions`,
 		workDir, configDir, i.ClaudeSessionID, configDir)
