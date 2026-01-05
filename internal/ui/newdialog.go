@@ -18,7 +18,8 @@ type NewDialog struct {
 	nameInput            textinput.Model
 	pathInput            textinput.Model
 	commandInput         textinput.Model
-	focusIndex           int
+	claudeOptions        *ClaudeOptionsPanel // Claude-specific options
+	focusIndex           int                 // 0=name, 1=path, 2=command, 3+=options
 	width                int
 	height               int
 	visible              bool
@@ -75,6 +76,7 @@ func NewNewDialog() *NewDialog {
 		pathInput:       pathInput,
 		commandInput:    commandInput,
 		branchInput:     branchInput,
+		claudeOptions:   NewClaudeOptionsPanel(),
 		focusIndex:      0,
 		visible:         false,
 		presetCommands:  []string{"", "claude", "gemini", "opencode", "codex"},
@@ -99,6 +101,8 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 	d.nameInput.Focus()
 	d.suggestionNavigated = false // reset on show
 	d.pathSuggestionCursor = 0    // reset cursor too
+	d.pathInput.Blur()
+	d.claudeOptions.Blur()
 	// Keep commandCursor at previously set default (don't reset to 0)
 	// Reset worktree fields
 	d.worktreeEnabled = false
@@ -113,10 +117,11 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 			d.pathInput.SetValue(cwd)
 		}
 	}
-	// Initialize Gemini YOLO mode from global config
+	// Initialize Gemini YOLO mode and Claude options from global config
 	d.geminiYoloMode = false
 	if userConfig, err := session.LoadUserConfig(); err == nil && userConfig != nil {
 		d.geminiYoloMode = userConfig.Gemini.YoloMode
+		d.claudeOptions.SetDefaults(userConfig)
 	}
 }
 
@@ -246,6 +251,19 @@ func (d *NewDialog) GetSelectedCommand() string {
 	return ""
 }
 
+// GetClaudeOptions returns the Claude-specific options (only relevant if command is "claude")
+func (d *NewDialog) GetClaudeOptions() *session.ClaudeOptions {
+	if !d.isClaudeSelected() {
+		return nil
+	}
+	return d.claudeOptions.GetOptions()
+}
+
+// isClaudeSelected returns true if "claude" is the selected command
+func (d *NewDialog) isClaudeSelected() bool {
+	return d.commandCursor < len(d.presetCommands) && d.presetCommands[d.commandCursor] == "claude"
+}
+
 // Validate checks if the dialog values are valid and returns an error message if not
 func (d *NewDialog) Validate() string {
 	name := strings.TrimSpace(d.nameInput.Value())
@@ -287,6 +305,7 @@ func (d *NewDialog) updateFocus() {
 	d.pathInput.Blur()
 	d.commandInput.Blur()
 	d.branchInput.Blur()
+	d.claudeOptions.Blur()
 
 	switch d.focusIndex {
 	case 0:
@@ -296,11 +315,26 @@ func (d *NewDialog) updateFocus() {
 	case 2:
 		// Command selection (no text input focus needed for presets)
 	case 3:
-		// Branch input (when worktree is enabled)
+		// Branch input (when worktree is enabled) OR Claude options
 		if d.worktreeEnabled {
 			d.branchInput.Focus()
+		} else if d.isClaudeSelected() {
+			d.claudeOptions.Focus()
+		}
+	default:
+		// Claude options (focusIndex >= 4 when worktree enabled)
+		if d.isClaudeSelected() {
+			d.claudeOptions.Focus()
 		}
 	}
+}
+
+// getMaxFocusIndex returns the maximum focus index based on current state
+func (d *NewDialog) getMaxFocusIndex() int {
+	if d.isClaudeSelected() {
+		return 3 // 0=name, 1=path, 2=command, 3=claude options
+	}
+	return 2 // 0=name, 1=path, 2=command
 }
 
 // Update handles key messages
@@ -310,6 +344,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
+	maxIdx := d.getMaxFocusIndex()
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -321,13 +356,18 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 					d.pathInput.SetValue(d.pathSuggestions[d.pathSuggestionCursor])
 				}
 			}
-			// Move to next field (with worktree support)
-			maxFields := 3
-			if d.worktreeEnabled {
-				maxFields = 4 // Include branch field
+			// Move to next field (with worktree and claude options support)
+			if d.focusIndex < maxIdx {
+				d.focusIndex++
+				d.updateFocus()
+			} else if d.focusIndex >= 3 && d.isClaudeSelected() {
+				// Inside claude options - delegate
+				d.claudeOptions, cmd = d.claudeOptions.Update(msg)
+				return d, cmd
+			} else {
+				d.focusIndex = 0
+				d.updateFocus()
 			}
-			d.focusIndex = (d.focusIndex + 1) % maxFields
-			d.updateFocus()
 			// Reset navigation flag when leaving path field
 			if d.focusIndex != 1 {
 				d.suggestionNavigated = false
@@ -354,23 +394,26 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			}
 
 		case "down":
-			// Down always navigates fields (with worktree support)
-			maxFields := 3
-			if d.worktreeEnabled {
-				maxFields = 4 // Include branch field
+			// Down navigates fields or delegates to options
+			if d.focusIndex < maxIdx {
+				d.focusIndex++
+				d.updateFocus()
+			} else if d.focusIndex >= 3 && d.isClaudeSelected() {
+				// Inside claude options - delegate
+				d.claudeOptions, cmd = d.claudeOptions.Update(msg)
+				return d, cmd
 			}
-			d.focusIndex = (d.focusIndex + 1) % maxFields
-			d.updateFocus()
 			return d, nil
 
 		case "shift+tab", "up":
-			maxFields := 3
-			if d.worktreeEnabled {
-				maxFields = 4 // Include branch field
+			if d.focusIndex >= 3 && d.isClaudeSelected() && d.claudeOptions.focusIndex > 0 {
+				// Inside claude options, not at first item - delegate
+				d.claudeOptions, cmd = d.claudeOptions.Update(msg)
+				return d, cmd
 			}
 			d.focusIndex--
 			if d.focusIndex < 0 {
-				d.focusIndex = maxFields - 1
+				d.focusIndex = maxIdx
 			}
 			d.updateFocus()
 			return d, nil
@@ -392,12 +435,22 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				}
 				return d, nil
 			}
+			// Delegate to claude options if focused there
+			if d.focusIndex >= 3 && d.isClaudeSelected() {
+				d.claudeOptions, cmd = d.claudeOptions.Update(msg)
+				return d, cmd
+			}
 
 		case "right":
 			// Command selection
 			if d.focusIndex == 2 {
 				d.commandCursor = (d.commandCursor + 1) % len(d.presetCommands)
 				return d, nil
+			}
+			// Delegate to claude options if focused there
+			if d.focusIndex >= 3 && d.isClaudeSelected() {
+				d.claudeOptions, cmd = d.claudeOptions.Update(msg)
+				return d, cmd
 			}
 
 		case "w":
@@ -418,6 +471,13 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				d.geminiYoloMode = !d.geminiYoloMode
 				return d, nil
 			}
+
+		case " ":
+			// Space toggles checkboxes in claude options
+			if d.focusIndex >= 3 && d.isClaudeSelected() {
+				d.claudeOptions, cmd = d.claudeOptions.Update(msg)
+				return d, cmd
+			}
 		}
 	}
 
@@ -437,6 +497,12 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 		// Branch input (when worktree is enabled)
 		if d.worktreeEnabled {
 			d.branchInput, cmd = d.branchInput.Update(msg)
+		} else if d.isClaudeSelected() {
+			d.claudeOptions, cmd = d.claudeOptions.Update(msg)
+		}
+	default:
+		if d.focusIndex >= 3 && d.isClaudeSelected() {
+			d.claudeOptions, cmd = d.claudeOptions.Update(msg)
 		}
 	}
 
@@ -661,6 +727,13 @@ func (d *NewDialog) View() string {
 		content.WriteString(d.branchInput.View())
 		content.WriteString("\n")
 	}
+
+	// Claude options (only if Claude is selected)
+	if d.isClaudeSelected() {
+		content.WriteString("\n")
+		content.WriteString(d.claudeOptions.View())
+	}
+
 	content.WriteString("\n")
 
 	// Help text with better contrast
@@ -670,6 +743,8 @@ func (d *NewDialog) View() string {
 	helpText := "Tab next/accept │ ↑↓ navigate │ Enter create │ Esc cancel"
 	if d.focusIndex == 2 {
 		helpText = "←→ command │ w worktree │ Tab next │ Enter create │ Esc cancel"
+	} else if d.isClaudeSelected() && d.focusIndex >= 3 {
+		helpText = "Tab next │ ↑↓ navigate │ Space toggle │ Enter create │ Esc cancel"
 	}
 	content.WriteString(helpStyle.Render(helpText))
 
