@@ -173,6 +173,97 @@ func (p *Pool) Shutdown() error {
 	return nil
 }
 
+// StartHealthMonitor launches a background goroutine that checks for
+// failed proxies every 10 seconds and restarts them automatically.
+func (p *Pool) StartHealthMonitor() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-ticker.C:
+				p.restartFailedProxies()
+			}
+		}
+	}()
+	log.Printf("[Pool] Health monitor started (10s interval)")
+}
+
+func (p *Pool) restartFailedProxies() {
+	p.mu.RLock()
+	var failedProxies []string
+	for name, proxy := range p.proxies {
+		// Skip external sockets (we don't own them)
+		if proxy.mcpProcess == nil {
+			continue
+		}
+		if proxy.GetStatus() == StatusFailed {
+			failedProxies = append(failedProxies, name)
+		}
+	}
+	p.mu.RUnlock()
+
+	for _, name := range failedProxies {
+		if err := p.RestartProxyWithRateLimit(name); err != nil {
+			log.Printf("[Pool] Failed to restart %s: %v", name, err)
+		}
+	}
+}
+
+// RestartProxyWithRateLimit restarts a proxy with rate limiting to prevent loops
+func (p *Pool) RestartProxyWithRateLimit(name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	proxy, exists := p.proxies[name]
+	if !exists {
+		return fmt.Errorf("proxy %s not found", name)
+	}
+
+	// Rate limit: minimum 5 seconds between restarts, max 3 per minute
+	if time.Since(proxy.lastRestart) < 5*time.Second {
+		return fmt.Errorf("rate limited: last restart was %v ago", time.Since(proxy.lastRestart))
+	}
+	if proxy.restartCount >= 3 && time.Since(proxy.lastRestart) < time.Minute {
+		return fmt.Errorf("rate limited: %d restarts in last minute", proxy.restartCount)
+	}
+
+	log.Printf("[Pool] Auto-restarting failed proxy: %s", name)
+
+	// Save config before stopping
+	command := proxy.command
+	args := proxy.args
+	env := proxy.env
+	prevRestartCount := proxy.restartCount
+
+	// Stop and remove old proxy
+	_ = proxy.Stop()
+	delete(p.proxies, name)
+	os.Remove(proxy.socketPath)
+
+	// Create and start new proxy
+	newProxy, err := NewSocketProxy(p.ctx, name, command, args, env)
+	if err != nil {
+		return fmt.Errorf("failed to create proxy: %w", err)
+	}
+
+	if err := newProxy.Start(); err != nil {
+		return fmt.Errorf("failed to start proxy: %w", err)
+	}
+
+	// Track restart history
+	newProxy.restartCount = prevRestartCount + 1
+	newProxy.lastRestart = time.Now()
+
+	p.proxies[name] = newProxy
+	log.Printf("[Pool] Successfully restarted %s (restart #%d)", name, newProxy.restartCount)
+
+	return nil
+}
+
 func (p *Pool) ListServers() []ProxyInfo {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
