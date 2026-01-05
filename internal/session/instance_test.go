@@ -109,21 +109,21 @@ func TestInstance_Fork(t *testing.T) {
 		t.Errorf("Fork() failed: %v", err)
 	}
 
-	// Command should use capture-resume pattern with fork
+	// Command should use --session-id pattern (avoids capture-resume with "." prompt)
 	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
 		t.Errorf("Fork() should set CLAUDE_CONFIG_DIR, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "--resume abc-123 --fork-session") {
-		t.Errorf("Fork() should include resume and fork-session flags for capture, got: %s", cmd)
+		t.Errorf("Fork() should include resume and fork-session flags, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, `--output-format json`) {
-		t.Errorf("Fork() should use --output-format json for capture, got: %s", cmd)
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork() should generate UUID with uuidgen, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
 		t.Errorf("Fork() should store session ID in tmux env, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Fork() should resume the captured session, got: %s", cmd)
+	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork() should pass session ID to claude CLI, got: %s", cmd)
 	}
 }
 
@@ -244,9 +244,9 @@ func TestBuildClaudeCommand(t *testing.T) {
 	}
 }
 
-// TestCreateForkedInstance_CaptureResumePattern tests that forked sessions
-// use the capture-resume pattern to reliably get the new session ID
-func TestCreateForkedInstance_CaptureResumePattern(t *testing.T) {
+// TestCreateForkedInstance_SessionIDPattern tests that forked sessions
+// use the --session-id pattern with pre-generated UUID (avoids "." prompt)
+func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 	inst := NewInstance("original", "/tmp/test")
 	inst.ClaudeSessionID = "parent-abc-123"
 	inst.ClaudeDetectedAt = time.Now()
@@ -256,12 +256,15 @@ func TestCreateForkedInstance_CaptureResumePattern(t *testing.T) {
 		t.Fatalf("CreateForkedInstance() failed: %v", err)
 	}
 
-	// Command SHOULD use capture-resume pattern
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Errorf("Fork command should use --output-format json for capture, got: %s", cmd)
+	// Command SHOULD use --session-id pattern (not capture-resume with ".")
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command should generate UUID with uuidgen, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "--resume parent-abc-123 --fork-session") {
 		t.Errorf("Fork command should contain --resume with parent ID and --fork-session, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("Fork command should use --session-id to specify UUID, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
 		t.Errorf("Fork command should store session ID in tmux env, got: %s", cmd)

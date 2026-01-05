@@ -1194,15 +1194,15 @@ func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOp
 	// Build extra flags from options (for fork, we use ToArgsForFork which excludes session mode)
 	extraFlags := i.buildClaudeExtraFlags(opts)
 
-	// Capture-resume pattern for fork:
-	// 1. Fork in print mode to get new session ID
+	// Use --session-id to specify UUID upfront, avoiding capture-resume with "." prompt
+	// 1. Generate UUID for new forked session
 	// 2. Store in tmux environment
-	// 3. Resume the forked session interactively with extra flags
+	// 3. Start fork with --fork-session and --session-id (no intermediate print mode needed)
 	cmd := fmt.Sprintf(
-		`cd '%s' && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
+		`cd '%s' && session_id=$(uuidgen | tr '[:upper:]' '[:lower:]') && `+
 			`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
-			`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id"%s`,
-		workDir, configDir, i.ClaudeSessionID, configDir, extraFlags)
+			`CLAUDE_CONFIG_DIR=%s claude --resume %s --fork-session --session-id "$session_id"%s`,
+		workDir, configDir, i.ClaudeSessionID, extraFlags)
 
 	return cmd, nil
 }
