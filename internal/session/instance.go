@@ -55,6 +55,10 @@ type Instance struct {
 	// Used to detect pending MCPs (added after session start) and stale MCPs (removed but still running)
 	LoadedMCPNames []string `json:"loaded_mcp_names,omitempty"`
 
+	// ToolOptions stores tool-specific launch options (Claude, Codex, Gemini, etc.)
+	// JSON structure: {"tool": "claude", "options": {...}}
+	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
+
 	tmuxSession *tmux.Session // Internal tmux session
 
 	// lastErrorCheck tracks when we last confirmed the session doesn't exist
@@ -178,6 +182,7 @@ func (i *Instance) buildClaudeCommand(baseCommand string) string {
 }
 
 // buildClaudeCommandWithMessage builds the command with optional initial message
+// Respects ClaudeOptions from instance if set, otherwise falls back to config defaults
 func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) string {
 	if i.Tool != "claude" {
 		return baseCommand
@@ -185,33 +190,44 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 
 	configDir := GetClaudeConfigDir()
 
-	// Check if dangerous mode is enabled in user config
-	dangerousMode := false
-	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
-		dangerousMode = userConfig.Claude.DangerousMode
+	// Get options - either from instance or create defaults from config
+	opts := i.GetClaudeOptions()
+	if opts == nil {
+		// Fall back to config defaults
+		userConfig, _ := LoadUserConfig()
+		opts = NewClaudeOptions(userConfig)
 	}
 
-	// If baseCommand is just "claude", build the capture-resume command
-	// This command:
-	// 1. Starts Claude in print mode to get session ID
-	// 2. Stores session ID in tmux environment (for retrieval by agent-deck)
-	// 3. Resumes that session interactively (with dangerous mode if enabled)
-	// 4. Optionally waits for prompt and sends initial message
+	// If baseCommand is just "claude", build the appropriate command
 	if baseCommand == "claude" {
-		var baseCmd string
-		if dangerousMode {
-			baseCmd = fmt.Sprintf(
-				`session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json 2>/dev/null | jq -r '.session_id') && `+
-					`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
-					`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id" --dangerously-skip-permissions`,
-				configDir, configDir)
-		} else {
-			baseCmd = fmt.Sprintf(
-				`session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json 2>/dev/null | jq -r '.session_id') && `+
-					`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
-					`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id"`,
-				configDir, configDir)
+		// Build extra flags string from options
+		extraFlags := i.buildClaudeExtraFlags(opts)
+
+		// Handle different session modes
+		switch opts.SessionMode {
+		case "continue":
+			// Simple -c mode: continue last session
+			return fmt.Sprintf(`CLAUDE_CONFIG_DIR=%s claude -c%s`, configDir, extraFlags)
+
+		case "resume":
+			// Resume specific session by ID
+			if opts.ResumeSessionID != "" {
+				return fmt.Sprintf(`CLAUDE_CONFIG_DIR=%s claude --resume %s%s`,
+					configDir, opts.ResumeSessionID, extraFlags)
+			}
+			// Fall through to default if no ID provided
 		}
+
+		// Default: new session with capture-resume pattern
+		// 1. Starts Claude in print mode to get session ID
+		// 2. Stores session ID in tmux environment
+		// 3. Resumes that session interactively
+		var baseCmd string
+		baseCmd = fmt.Sprintf(
+			`session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json 2>/dev/null | jq -r '.session_id') && `+
+				`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
+				`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id"%s`,
+			configDir, configDir, extraFlags)
 
 		// If message provided, append wait-and-send logic
 		if message != "" {
@@ -219,19 +235,12 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 			escapedMsg := strings.ReplaceAll(message, "'", "'\"'\"'")
 
 			// Run wait-and-send in background, keep Claude in foreground
-			// The wait loop runs in a subshell that polls for ">" prompt (Claude's input prompt)
-			// Once detected, sends the message via tmux send-keys (text + Enter separately)
 			baseCmd = fmt.Sprintf(
 				`session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json 2>/dev/null | jq -r '.session_id') && `+
 					`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
 					`(sleep 2; SESSION_NAME=$(tmux display-message -p '#S'); while ! tmux capture-pane -p -t "$SESSION_NAME" | tail -5 | grep -qE "^>"; do sleep 0.2; done; tmux send-keys -l -t "$SESSION_NAME" '%s'; tmux send-keys -t "$SESSION_NAME" Enter) & `+
 					`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id"%s`,
-				configDir, escapedMsg, configDir, func() string {
-					if dangerousMode {
-						return " --dangerously-skip-permissions"
-					}
-					return ""
-				}())
+				configDir, escapedMsg, configDir, extraFlags)
 		}
 
 		return baseCmd
@@ -239,6 +248,32 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 
 	// For custom commands (e.g., fork commands), return as-is
 	return baseCommand
+}
+
+// buildClaudeExtraFlags builds extra command-line flags string from ClaudeOptions
+func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
+	if opts == nil {
+		return ""
+	}
+
+	var flags []string
+
+	if opts.SkipPermissions {
+		flags = append(flags, "--dangerously-skip-permissions")
+	}
+	if opts.UseChrome {
+		flags = append(flags, "--chrome")
+	}
+	if opts.AppendSystemPrompt != "" {
+		// Escape the prompt for shell
+		escaped := strings.ReplaceAll(opts.AppendSystemPrompt, "'", "'\"'\"'")
+		flags = append(flags, fmt.Sprintf("--append-system-prompt '%s'", escaped))
+	}
+
+	if len(flags) == 0 {
+		return ""
+	}
+	return " " + strings.Join(flags, " ")
 }
 
 // buildGeminiCommand builds the gemini command with session capture
@@ -1134,7 +1169,15 @@ func (i *Instance) CanFork() bool {
 // Fork returns the command to create a forked Claude session
 // Uses capture-resume pattern: starts fork in print mode to get new session ID,
 // stores in tmux environment, then resumes interactively
+// Deprecated: Use ForkWithOptions instead
 func (i *Instance) Fork(newTitle, newGroupPath string) (string, error) {
+	return i.ForkWithOptions(newTitle, newGroupPath, nil)
+}
+
+// ForkWithOptions returns the command to create a forked Claude session with custom options
+// Uses capture-resume pattern: starts fork in print mode to get new session ID,
+// stores in tmux environment, then resumes interactively
+func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOptions) (string, error) {
 	if !i.CanFork() {
 		return "", fmt.Errorf("cannot fork: no active Claude session")
 	}
@@ -1142,30 +1185,24 @@ func (i *Instance) Fork(newTitle, newGroupPath string) (string, error) {
 	workDir := i.ProjectPath
 	configDir := GetClaudeConfigDir()
 
-	// Check dangerous mode from user config (same logic as buildClaudeResumeCommand)
-	dangerousMode := false
-	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
-		dangerousMode = userConfig.Claude.DangerousMode
+	// If no options provided, use defaults from config
+	if opts == nil {
+		userConfig, _ := LoadUserConfig()
+		opts = NewClaudeOptions(userConfig)
 	}
+
+	// Build extra flags from options (for fork, we use ToArgsForFork which excludes session mode)
+	extraFlags := i.buildClaudeExtraFlags(opts)
 
 	// Capture-resume pattern for fork:
 	// 1. Fork in print mode to get new session ID
 	// 2. Store in tmux environment
-	// 3. Resume the forked session interactively
-	var cmd string
-	if dangerousMode {
-		cmd = fmt.Sprintf(
-			`cd '%s' && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
-				`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
-				`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id" --dangerously-skip-permissions`,
-			workDir, configDir, i.ClaudeSessionID, configDir)
-	} else {
-		cmd = fmt.Sprintf(
-			`cd '%s' && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
-				`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
-				`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id"`,
-			workDir, configDir, i.ClaudeSessionID, configDir)
-	}
+	// 3. Resume the forked session interactively with extra flags
+	cmd := fmt.Sprintf(
+		`cd '%s' && session_id=$(CLAUDE_CONFIG_DIR=%s claude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id') && `+
+			`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
+			`CLAUDE_CONFIG_DIR=%s claude --resume "$session_id"%s`,
+		workDir, configDir, i.ClaudeSessionID, configDir, extraFlags)
 
 	return cmd, nil
 }
@@ -1181,8 +1218,14 @@ func (i *Instance) GetActualWorkDir() string {
 }
 
 // CreateForkedInstance creates a new Instance configured for forking
+// Deprecated: Use CreateForkedInstanceWithOptions instead
 func (i *Instance) CreateForkedInstance(newTitle, newGroupPath string) (*Instance, string, error) {
-	cmd, err := i.Fork(newTitle, newGroupPath)
+	return i.CreateForkedInstanceWithOptions(newTitle, newGroupPath, nil)
+}
+
+// CreateForkedInstanceWithOptions creates a new Instance configured for forking with custom options
+func (i *Instance) CreateForkedInstanceWithOptions(newTitle, newGroupPath string, opts *ClaudeOptions) (*Instance, string, error) {
+	cmd, err := i.ForkWithOptions(newTitle, newGroupPath, opts)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1198,6 +1241,11 @@ func (i *Instance) CreateForkedInstance(newTitle, newGroupPath string) (*Instanc
 	forked.Command = cmd
 	forked.Tool = "claude"
 
+	// Store options in the new instance for persistence
+	if opts != nil {
+		forked.SetClaudeOptions(opts)
+	}
+
 	return forked, cmd, nil
 }
 
@@ -1212,6 +1260,32 @@ func (i *Instance) Exists() bool {
 // GetTmuxSession returns the tmux session object
 func (i *Instance) GetTmuxSession() *tmux.Session {
 	return i.tmuxSession
+}
+
+// GetClaudeOptions returns Claude-specific options, or nil if not set
+func (i *Instance) GetClaudeOptions() *ClaudeOptions {
+	if len(i.ToolOptionsJSON) == 0 {
+		return nil
+	}
+	opts, err := UnmarshalClaudeOptions(i.ToolOptionsJSON)
+	if err != nil {
+		return nil
+	}
+	return opts
+}
+
+// SetClaudeOptions stores Claude-specific options
+func (i *Instance) SetClaudeOptions(opts *ClaudeOptions) error {
+	if opts == nil {
+		i.ToolOptionsJSON = nil
+		return nil
+	}
+	data, err := MarshalToolOptions(opts)
+	if err != nil {
+		return err
+	}
+	i.ToolOptionsJSON = data
+	return nil
 }
 
 // GetSessionIDFromTmux reads Claude session ID from tmux environment
