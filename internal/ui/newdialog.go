@@ -234,7 +234,10 @@ func (d *NewDialog) updateFocus() {
 	case 1:
 		d.pathInput.Focus()
 	case 2:
-		// Command selection (no text input focus needed for presets)
+		// Command selection - focus commandInput if shell is selected for custom command
+		if d.commandCursor == 0 { // shell
+			d.commandInput.Focus()
+		}
 	default:
 		// Claude options (focusIndex >= 3)
 		if d.isClaudeSelected() {
@@ -376,6 +379,11 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 		d.nameInput, cmd = d.nameInput.Update(msg)
 	case 1:
 		d.pathInput, cmd = d.pathInput.Update(msg)
+	case 2:
+		// Update custom command input when shell is selected
+		if d.commandCursor == 0 { // shell
+			d.commandInput, cmd = d.commandInput.Update(msg)
+		}
 	default:
 		if d.focusIndex >= 3 && d.isClaudeSelected() {
 			d.claudeOptions, cmd = d.claudeOptions.Update(msg)
@@ -528,8 +536,13 @@ func (d *NewDialog) View() string {
 
 	// Custom command input (only if shell is selected)
 	if d.commandCursor == 0 {
-		content.WriteString(labelStyle.Render("  Custom command:"))
-		content.WriteString("\n  ")
+		// Show active indicator when command field is focused
+		if d.focusIndex == 2 {
+			content.WriteString(activeLabelStyle.Render("  ▸ Custom:"))
+		} else {
+			content.WriteString(labelStyle.Render("    Custom:"))
+		}
+		content.WriteString("\n    ")
 		content.WriteString(d.commandInput.View())
 		content.WriteString("\n\n")
 	}
