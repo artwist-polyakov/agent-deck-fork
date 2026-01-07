@@ -45,3 +45,6 @@ Thumbs.db
 .mcp.json
 .playwright-mcp/
 *.screenstudio/
+
+# Claude Code local settings
+.claude/settings.local.json
