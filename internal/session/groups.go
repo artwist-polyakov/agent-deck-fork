@@ -66,8 +66,10 @@ func NewGroupTree(instances []*Instance) *GroupTree {
 
 		group, exists := tree.Groups[groupPath]
 		if !exists {
-			// Use proper name for default group, otherwise use path as name
-			name := groupPath
+			// Ensure parent groups exist for hierarchical paths
+			tree.ensureParentGroupsExist(groupPath)
+			// Use proper name for default group, otherwise extract name from path
+			name := extractGroupName(groupPath)
 			if groupPath == DefaultGroupPath {
 				name = DefaultGroupName
 			}
@@ -118,9 +120,11 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 
 		group, exists := tree.Groups[groupPath]
 		if !exists {
+			// Ensure parent groups exist for hierarchical paths
+			tree.ensureParentGroupsExist(groupPath)
 			// Group doesn't exist in stored data, create it
-			// Use proper name for default group, otherwise use path as name
-			name := groupPath
+			// Use proper name for default group, otherwise extract name from path
+			name := extractGroupName(groupPath)
 			if groupPath == DefaultGroupPath {
 				name = DefaultGroupName
 			}
@@ -190,6 +194,50 @@ func getParentPath(path string) string {
 		return path[:idx]
 	}
 	return "" // root level
+}
+
+// extractGroupName extracts the display name from a group path
+// e.g., "parent/child" -> "child", "root" -> "root"
+func extractGroupName(path string) string {
+	if path == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(path, "/"); idx != -1 {
+		return path[idx+1:]
+	}
+	return path // root level - path is the name
+}
+
+// ensureParentGroupsExist creates all parent groups for a given path if they don't exist
+// e.g., for path "a/b/c", it creates groups "a" and "a/b" (but not "a/b/c")
+func (t *GroupTree) ensureParentGroupsExist(path string) {
+	parts := strings.Split(path, "/")
+	if len(parts) <= 1 {
+		return // No parents needed for root-level paths
+	}
+
+	// Create each parent level
+	currentPath := ""
+	for i := 0; i < len(parts)-1; i++ { // -1 to exclude the leaf
+		if currentPath == "" {
+			currentPath = parts[i]
+		} else {
+			currentPath = currentPath + "/" + parts[i]
+		}
+
+		if _, exists := t.Groups[currentPath]; !exists {
+			name := extractGroupName(currentPath)
+			group := &Group{
+				Name:     name,
+				Path:     currentPath,
+				Expanded: true,
+				Sessions: []*Instance{},
+				Order:    len(t.GroupList),
+			}
+			t.Groups[currentPath] = group
+			t.Expanded[currentPath] = true
+		}
+	}
 }
 
 // GetGroupLevel returns the nesting level of a group (0 for root, 1 for child, etc.)
@@ -694,8 +742,10 @@ func (t *GroupTree) AddSession(inst *Instance) {
 
 	group, exists := t.Groups[groupPath]
 	if !exists {
-		// Use proper name for default group, otherwise use path as name
-		name := groupPath
+		// Ensure parent groups exist for hierarchical paths
+		t.ensureParentGroupsExist(groupPath)
+		// Use proper name for default group, otherwise extract name from path
+		name := extractGroupName(groupPath)
 		if groupPath == DefaultGroupPath {
 			name = DefaultGroupName
 		}
@@ -758,9 +808,11 @@ func (t *GroupTree) SyncWithInstances(instances []*Instance) {
 
 		group, exists := t.Groups[groupPath]
 		if !exists {
+			// Ensure parent groups exist for hierarchical paths
+			t.ensureParentGroupsExist(groupPath)
 			// Create new group for this session's path
-			// Use proper name for default group, otherwise use path as name
-			name := groupPath
+			// Use proper name for default group, otherwise extract name from path
+			name := extractGroupName(groupPath)
 			if groupPath == DefaultGroupPath {
 				name = DefaultGroupName
 			}

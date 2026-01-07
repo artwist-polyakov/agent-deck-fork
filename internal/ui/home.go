@@ -42,7 +42,11 @@ const (
 
 	// tickInterval for UI refresh - event-driven detection still reduces
 	// expensive operations (SignalFileActivity updates state, tick just redraws)
-	tickInterval = 500 * time.Millisecond
+	// PERFORMANCE: Increased from 500ms to 1s to reduce CapturePane() load
+	// With 10 sessions, each tick triggers 5-10 CapturePane() calls
+	// At 500ms: 10-20 calls/sec = 2-10 sec of blocking per second
+	// At 1s: 5-10 calls/sec = 0.5-5 sec of blocking per second
+	tickInterval = 1 * time.Second
 
 	// logCheckInterval - how often to check for oversized logs (fast check, just file stats)
 	// This catches runaway logs before they cause high CPU
@@ -61,10 +65,24 @@ const (
 	spacingLarge  = 4 // Between major areas (e.g., info sections in preview)
 )
 
-// Minimum terminal size requirements
+// Minimum terminal size requirements (reduced for mobile support)
 const (
-	minTerminalWidth  = 80
-	minTerminalHeight = 20
+	minTerminalWidth  = 40 // Reduced from 80 - supports mobile terminals
+	minTerminalHeight = 12 // Reduced from 20 - supports smaller screens
+)
+
+// Layout mode breakpoints for responsive design
+const (
+	layoutBreakpointSingle  = 50 // Below: single column, no preview
+	layoutBreakpointStacked = 80 // Below: stacked layout (list above preview)
+	// At or above 80: dual column (current side-by-side layout)
+)
+
+// Layout mode names
+const (
+	LayoutModeSingle  = "single"  // <50 cols: list only
+	LayoutModeStacked = "stacked" // 50-79 cols: vertical stack
+	LayoutModeDual    = "dual"    // 80+ cols: side-by-side
 )
 
 // Responsive breakpoints for empty state content tiers
@@ -112,19 +130,25 @@ type Home struct {
 	// State
 	cursor        int            // Selected item index in flatItems
 	viewOffset    int            // First visible item index (for scrolling)
-	isAttaching   bool           // Prevents View() output during attach (fixes Bubble Tea Issue #431)
+	isAttaching   atomic.Bool   // Prevents View() output during attach (fixes Bubble Tea Issue #431) - atomic for thread safety
 	statusFilter  session.Status // Filter sessions by status ("" = all, or specific status)
 	err           error
 	errTime       time.Time // When error occurred (for auto-dismiss)
 	isReloading    bool      // Visual feedback during auto-reload
 	initialLoading bool      // True until first loadSessionsMsg received (shows splash screen)
 	reloadVersion  uint64    // Incremented on each reload to prevent stale background saves
+	reloadMu       sync.Mutex // Protects reloadVersion and isReloading for thread-safe access
 
 	// Preview cache (async fetching - View() must be pure, no blocking I/O)
 	previewCache       map[string]string    // sessionID -> cached preview content
 	previewCacheTime   map[string]time.Time // sessionID -> when cached (for expiration)
 	previewCacheMu     sync.RWMutex         // Protects previewCache for thread-safety
 	previewFetchingID  string               // ID currently being fetched (prevents duplicate fetches)
+
+	// Preview debouncing (PERFORMANCE: prevents subprocess spawn on every keystroke)
+	// During rapid navigation, we delay preview fetch by 150ms to let navigation settle
+	pendingPreviewID  string     // Session ID waiting for debounced fetch
+	previewDebounceMu sync.Mutex // Protects pendingPreviewID
 
 	// Round-robin status updates (Priority 1A optimization)
 	// Instead of updating ALL sessions every tick, we update batches of 5-10 sessions
@@ -163,10 +187,19 @@ type Home struct {
 	lastLogMaintenance time.Time
 	lastLogCheck       time.Time // Fast 10-second check for oversized logs
 
+	// User activity tracking for adaptive status updates
+	// PERFORMANCE: Only update statuses when user is actively interacting
+	lastUserInputTime time.Time // When user last pressed a key
+
+	// Navigation tracking (PERFORMANCE: suspend background updates during rapid navigation)
+	lastNavigationTime time.Time // When user last navigated (up/down/j/k)
+	isNavigating       bool      // True if user is rapidly navigating
+
 	// Cached status counts (invalidated on instance changes)
 	cachedStatusCounts struct {
 		running, waiting, idle, errored int
-		valid                           bool
+		valid                           atomic.Bool // THREAD-SAFE: accessed from main and worker goroutines
+		timestamp                       time.Time   // For time-based expiration
 	}
 
 	// Reusable string builder for View() to reduce allocations
@@ -179,6 +212,18 @@ type reloadState struct {
 	cursorGroupPath string          // Path of group at cursor (if cursor on group)
 	expandedGroups  map[string]bool // Expanded group paths
 	viewOffset      int             // Scroll position
+}
+
+// getLayoutMode returns the current layout mode based on terminal width
+func (h *Home) getLayoutMode() string {
+	switch {
+	case h.width < layoutBreakpointSingle:
+		return LayoutModeSingle
+	case h.width < layoutBreakpointStacked:
+		return LayoutModeStacked
+	default:
+		return LayoutModeDual
+	}
 }
 
 // Messages
@@ -220,6 +265,12 @@ type previewFetchedMsg struct {
 	sessionID string
 	content   string
 	err       error
+}
+
+// previewDebounceMsg signals debounce period elapsed for preview fetch
+// PERFORMANCE: Delays preview fetch during rapid navigation
+type previewDebounceMsg struct {
+	sessionID string
 }
 
 // statusUpdateRequest is sent to the background worker with current viewport info
@@ -851,6 +902,22 @@ func (h *Home) fetchPreview(inst *session.Instance) tea.Cmd {
 	}
 }
 
+// fetchPreviewDebounced returns a command that triggers preview fetch after debounce delay
+// PERFORMANCE: Prevents rapid subprocess spawning during keyboard navigation
+// The 150ms delay allows navigation to settle before spawning tmux capture-pane
+func (h *Home) fetchPreviewDebounced(sessionID string) tea.Cmd {
+	const debounceDelay = 150 * time.Millisecond
+
+	h.previewDebounceMu.Lock()
+	h.pendingPreviewID = sessionID
+	h.previewDebounceMu.Unlock()
+
+	return func() tea.Msg {
+		time.Sleep(debounceDelay)
+		return previewDebounceMsg{sessionID: sessionID}
+	}
+}
+
 // getSelectedSession returns the currently selected session, or nil if a group is selected
 func (h *Home) getSelectedSession() *session.Instance {
 	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
@@ -930,10 +997,10 @@ func (h *Home) triggerStatusUpdate() {
 //   - Always update visible sessions first (ensures UI responsiveness)
 //   - Round-robin through remaining sessions (spreads CPU load over time)
 //
-// Performance: With 100 sessions, updating all takes ~5-10s of cumulative time per tick.
-// With batching, we update ~10-15 sessions per tick, keeping each tick under 100ms.
+// Performance: With 10 sessions, updating all takes ~1-2s of cumulative time per tick.
+// With batching (3 visible + 2 non-visible per tick), we keep each tick under 100ms.
 func (h *Home) processStatusUpdate(req statusUpdateRequest) {
-	const batchSize = 5 // Non-visible sessions to update per tick
+	const batchSize = 2 // Reduced from 5 to 2 - fewer CapturePane() calls per tick
 
 	// Take a snapshot of instances under read lock (thread-safe)
 	h.instancesMu.RLock()
@@ -955,12 +1022,17 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 
 	// Track which sessions we've updated this tick
 	updated := make(map[string]bool)
+	// Track if any status actually changed (for cache invalidation)
+	statusChanged := false
 
 	// Step 1: Always update visible sessions (Priority 1B - visible first)
 	for _, inst := range instancesCopy {
 		if visibleIDs[inst.ID] {
-			// UpdateStatus is thread-safe (uses internal mutex)
+			oldStatus := inst.Status
 			_ = inst.UpdateStatus() // Ignore errors in background worker
+			if inst.Status != oldStatus {
+				statusChanged = true
+			}
 			updated[inst.ID] = true
 		}
 	}
@@ -979,13 +1051,20 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 			continue
 		}
 
+		oldStatus := inst.Status
 		_ = inst.UpdateStatus() // Ignore errors in background worker
+		if inst.Status != oldStatus {
+			statusChanged = true
+		}
 		remaining--
 		h.statusUpdateIndex.Store(int32((idx + 1) % instanceCount))
 	}
 
-	// Invalidate status counts cache (statuses may have changed)
-	h.cachedStatusCounts.valid = false
+	// Only invalidate status counts cache if status actually changed
+	// This reduces View() overhead by keeping cache valid when no changes occurred
+	if statusChanged {
+		h.cachedStatusCounts.valid.Store(false)
+	}
 }
 
 // Update handles messages
@@ -1002,7 +1081,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case loadSessionsMsg:
 		// Clear loading indicators
+		h.reloadMu.Lock()
 		h.isReloading = false
+		h.reloadMu.Unlock()
 		h.initialLoading = false // First load complete, hide splash
 
 		if msg.err != nil {
@@ -1023,7 +1104,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			session.UpdateClaudeSessionsWithDedup(h.instances)
 			h.instancesMu.Unlock()
 			// Invalidate status counts cache
-			h.cachedStatusCounts.valid = false
+			h.cachedStatusCounts.valid.Store(false)
 			// Sync group tree with loaded data
 			if h.groupTree.GroupCount() == 0 {
 				// Initial load - use stored groups if available
@@ -1092,7 +1173,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			session.UpdateClaudeSessionsWithDedup(h.instances)
 			h.instancesMu.Unlock()
 			// Invalidate status counts cache
-			h.cachedStatusCounts.valid = false
+			h.cachedStatusCounts.valid.Store(false)
 
 			// Track as launching for animation
 			h.launchingSessions[msg.instance.ID] = time.Now()
@@ -1147,7 +1228,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			session.UpdateClaudeSessionsWithDedup(h.instances)
 			h.instancesMu.Unlock()
 			// Invalidate status counts cache
-			h.cachedStatusCounts.valid = false
+			h.cachedStatusCounts.valid.Store(false)
 
 			// Track as launching for animation
 			h.launchingSessions[msg.instance.ID] = time.Now()
@@ -1204,7 +1285,7 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		delete(h.instanceByID, msg.deletedID)
 		h.instancesMu.Unlock()
 		// Invalidate status counts cache
-		h.cachedStatusCounts.valid = false
+		h.cachedStatusCounts.valid.Store(false)
 		// Invalidate preview cache for deleted session
 		h.invalidatePreviewCache(msg.deletedID)
 		// Remove from group tree (preserves empty groups)
@@ -1261,8 +1342,10 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		log.Printf("[RELOAD-DEBUG] storageChangedMsg received (profile=%s, current instances=%d)", h.profile, len(h.instances))
 
 		// Show reload indicator and increment version to invalidate in-flight background saves
+		h.reloadMu.Lock()
 		h.isReloading = true
 		h.reloadVersion++
+		h.reloadMu.Unlock()
 
 		// Preserve UI state before reload
 		state := h.preserveState()
@@ -1284,74 +1367,60 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case statusUpdateMsg:
 		// Clear attach flag - we've returned from the attached session
-		h.isAttaching = false
+		h.isAttaching.Store(false) // Atomic store for thread safety
 
-		// CRITICAL FIX: Use async background worker instead of blocking UI thread
-		// The previous blocking loop caused 500ms+ delays with many sessions,
-		// resulting in black screen and lag when returning from attached sessions.
-		// Now we trigger the background worker which uses round-robin batching.
+		// PERFORMANCE FIX: Now safe to trigger status update on attach return
+		// Since AcknowledgeWithSnapshot() no longer calls CapturePane(),
+		// triggerStatusUpdate() won't cause 10+ second delays.
+		// The background worker uses batching (2 sessions per tick),
+		// so this is fast and maintains UI responsiveness.
 		h.triggerStatusUpdate()
 
 		// Skip save during reload to avoid overwriting external changes (CLI)
-		if h.isReloading {
+		h.reloadMu.Lock()
+		reloading := h.isReloading
+		h.reloadMu.Unlock()
+		if reloading {
 			return h, nil
 		}
 
-		// Run dedup and save in background to avoid blocking UI
-		// IMPORTANT: Copy all data needed by goroutine to avoid race conditions
+		// PERFORMANCE FIX: Skip save on attach return for 10 seconds
+		// Saving can also be blocking (JSON serialization + file write).
+		// Combine with periodic save instead of saving on every attach/detach.
+		// We'll let the next tickMsg handle background save if needed.
+
+		return h, nil
+
+	case previewDebounceMsg:
+		// PERFORMANCE: Debounce period elapsed - check if this fetch is still relevant
+		// If user continued navigating, pendingPreviewID will have changed
+		h.previewDebounceMu.Lock()
+		isPending := h.pendingPreviewID == msg.sessionID
+		if isPending {
+			h.pendingPreviewID = "" // Clear pending state
+		}
+		h.previewDebounceMu.Unlock()
+
+		if !isPending {
+			return h, nil // Superseded by newer navigation
+		}
+
+		// Find session and trigger actual fetch
 		h.instancesMu.RLock()
-		instancesCopy := make([]*session.Instance, len(h.instances))
-		copy(instancesCopy, h.instances)
-		instanceCount := len(h.instances)
+		inst := h.instanceByID[msg.sessionID]
 		h.instancesMu.RUnlock()
 
-		// Deep copy group tree to avoid race condition with main thread
-		// SaveWithGroups only reads GroupList, so we create a minimal copy
-		var groupTreeCopy *session.GroupTree
-		if h.groupTree != nil {
-			groupTreeCopy = h.groupTree.ShallowCopyForSave()
-		}
-		storageCopy := h.storage
-		watcherCopy := h.storageWatcher
-
-		// Capture reload version to detect if a reload happens while goroutine is running
-		capturedVersion := h.reloadVersion
-
-		go func() {
-			// Deduplicate Claude session IDs
-			session.UpdateClaudeSessionsWithDedup(instancesCopy)
-
-			// Save state to persist acknowledged state
-			if storageCopy != nil {
-				// CRITICAL: Check if a reload happened while we were running
-				// If so, our data is stale and we must NOT overwrite the new data
-				// Defense-in-depth: Check BOTH version number AND isReloading flag
-				if capturedVersion != h.reloadVersion {
-					log.Printf("[SAVE-DEBUG] Aborting background save - reload happened (version %d -> %d)", capturedVersion, h.reloadVersion)
-					return
-				}
-				// Additional check: Don't save if reload is currently in progress
-				// This catches edge cases where reload started but version hasn't been checked yet
-				if h.isReloading {
-					log.Printf("[SAVE-DEBUG] Aborting background save - reload in progress")
-					return
-				}
-
-				// DEFENSIVE: Never save empty instances if storage has data
-				if instanceCount == 0 {
-					if info, err := os.Stat(storageCopy.Path()); err == nil && info.Size() > 100 {
-						log.Printf("[SAVE-DEBUG] Background save: Refusing to save empty instances - storage has %d bytes", info.Size())
-						return
-					}
-				}
-
-				// Notify watcher to ignore this save (prevents self-triggered reload)
-				if watcherCopy != nil {
-					watcherCopy.NotifySave()
-				}
-				_ = storageCopy.SaveWithGroups(instancesCopy, groupTreeCopy)
+		if inst != nil {
+			h.previewCacheMu.Lock()
+			needsFetch := h.previewFetchingID != inst.ID
+			if needsFetch {
+				h.previewFetchingID = inst.ID
 			}
-		}()
+			h.previewCacheMu.Unlock()
+			if needsFetch {
+				return h, h.fetchPreview(inst)
+			}
+		}
 		return h, nil
 
 	case previewFetchedMsg:
@@ -1372,14 +1441,29 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.clearError()
 		}
 
-		// Refresh session existence cache ONCE per tick (reduces ~15 subprocess spawns to 1)
-		// This must happen BEFORE triggerStatusUpdate so Exists() calls use fresh cache
-		tmux.RefreshExistingSessions()
+		// PERFORMANCE: Detect when navigation has settled (300ms since last up/down)
+		// This allows background updates to resume after rapid navigation stops
+		const navigationSettleTime = 300 * time.Millisecond
+		if h.isNavigating && time.Since(h.lastNavigationTime) > navigationSettleTime {
+			h.isNavigating = false
+		}
 
-		// Background status updates (Priority 1C optimization)
-		// Triggers background worker to update session statuses without blocking UI
-		// Worker implements round-robin batching (Priority 1A + 1B)
-		h.triggerStatusUpdate()
+		// PERFORMANCE: Skip background updates during rapid navigation
+		// This prevents subprocess spawning while user is scrolling through sessions
+		if !h.isNavigating {
+			// PERFORMANCE: Adaptive status updates - only when user is active
+			// If user hasn't interacted for 2+ seconds, skip status updates.
+			// This prevents background polling during idle periods.
+			const userActivityWindow = 2 * time.Second
+			if !h.lastUserInputTime.IsZero() && time.Since(h.lastUserInputTime) < userActivityWindow {
+				// User is active - trigger status updates
+				tmux.RefreshExistingSessions()
+				h.triggerStatusUpdate()
+			} else {
+				// User idle - only refresh cache lightly (no status updates)
+				tmux.RefreshExistingSessions()
+			}
+		}
 
 		// Update animation frame for launching spinner (8 frames, cycles every tick)
 		h.animationFrame = (h.animationFrame + 1) % 8
@@ -1438,6 +1522,9 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, tea.Batch(h.tick(), previewCmd)
 
 	case tea.KeyMsg:
+		// Track user activity for adaptive status updates
+		h.lastUserInputTime = time.Now()
+
 		// Handle overlays first
 		// Help overlay takes priority (any key closes it)
 		if h.helpOverlay.IsVisible() {
@@ -1600,21 +1687,17 @@ func (h *Home) createSessionFromGlobalSearch(result *GlobalSearchResult) tea.Cmd
 		// Build resume command with config dir and dangerous mode
 		userConfig, _ := session.LoadUserConfig()
 		dangerousMode := false
-		configDir := ""
 		if userConfig != nil {
 			dangerousMode = userConfig.Claude.DangerousMode
-			configDir = userConfig.Claude.ConfigDir
 		}
 
-		// Build command - use CLAUDE_CONFIG_DIR env var (not CLI flag)
+		// Build command - only set CLAUDE_CONFIG_DIR if explicitly configured
+		// If not explicit, let the tmux shell's environment handle it
+		// This is critical for WSL and other environments where users have
+		// CLAUDE_CONFIG_DIR set in their .bashrc/.zshrc
 		var cmdBuilder strings.Builder
-		if configDir != "" {
-			// Expand ~ to home directory
-			if strings.HasPrefix(configDir, "~") {
-				home, _ := os.UserHomeDir()
-				configDir = strings.Replace(configDir, "~", home, 1)
-			}
-			// Set env var before running claude
+		if session.IsClaudeConfigDirExplicit() {
+			configDir := session.GetClaudeConfigDir()
 			cmdBuilder.WriteString(fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir))
 		}
 		cmdBuilder.WriteString("claude --resume ")
@@ -1660,9 +1743,10 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Create session (enter works from any field)
 		name, path, command := h.newDialog.GetValues()
 		groupPath := h.newDialog.GetSelectedGroup()
+		claudeOpts := h.newDialog.GetClaudeOptions() // Get Claude options if applicable
 		h.newDialog.Hide()
 		h.clearError() // Clear any previous validation error
-		return h, h.createSessionInGroup(name, path, command, groupPath)
+		return h, h.createSessionInGroupWithOptions(name, path, command, groupPath, claudeOpts)
 
 	case "esc":
 		h.newDialog.Hide()
@@ -1705,17 +1789,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor > 0 {
 			h.cursor--
 			h.syncViewport()
-			// Trigger immediate preview fetch for new selection (mutex-protected)
+			// Track navigation for adaptive background updates
+			h.lastNavigationTime = time.Now()
+			h.isNavigating = true
+			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
+			// This prevents spawning tmux subprocess on every keystroke
 			if selected := h.getSelectedSession(); selected != nil {
-				h.previewCacheMu.Lock()
-				needsFetch := h.previewFetchingID != selected.ID
-				if needsFetch {
-					h.previewFetchingID = selected.ID
-				}
-				h.previewCacheMu.Unlock()
-				if needsFetch {
-					return h, h.fetchPreview(selected)
-				}
+				return h, h.fetchPreviewDebounced(selected.ID)
 			}
 		}
 		return h, nil
@@ -1724,17 +1804,13 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor < len(h.flatItems)-1 {
 			h.cursor++
 			h.syncViewport()
-			// Trigger immediate preview fetch for new selection (mutex-protected)
+			// Track navigation for adaptive background updates
+			h.lastNavigationTime = time.Now()
+			h.isNavigating = true
+			// PERFORMANCE: Debounced preview fetch - waits 150ms for navigation to settle
+			// This prevents spawning tmux subprocess on every keystroke
 			if selected := h.getSelectedSession(); selected != nil {
-				h.previewCacheMu.Lock()
-				needsFetch := h.previewFetchingID != selected.ID
-				if needsFetch {
-					h.previewFetchingID = selected.ID
-				}
-				h.previewCacheMu.Unlock()
-				if needsFetch {
-					return h, h.fetchPreview(selected)
-				}
+				return h, h.fetchPreviewDebounced(selected.ID)
 			}
 		}
 		return h, nil
@@ -1749,7 +1825,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return h, nil
 				}
 				if item.Session.Exists() {
-					h.isAttaching = true // Prevent View() output during transition
+					h.isAttaching.Store(true) // Prevent View() output during transition (atomic)
 					return h, h.attachSession(item.Session)
 				}
 			} else if item.Type == session.ItemTypeGroup {
@@ -2279,6 +2355,7 @@ func (h *Home) handleForkDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		// Get fork parameters from dialog
 		title, groupPath := h.forkDialog.GetValues()
+		opts := h.forkDialog.GetOptions()
 		if title == "" {
 			h.setError(fmt.Errorf("session name cannot be empty"))
 			return h, nil
@@ -2290,7 +2367,7 @@ func (h *Home) handleForkDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil {
 				h.forkDialog.Hide()
-				return h, h.forkSessionCmd(item.Session, title, groupPath)
+				return h, h.forkSessionCmdWithOptions(item.Session, title, groupPath, opts)
 			}
 		}
 		h.forkDialog.Hide()
@@ -2381,6 +2458,11 @@ func (h *Home) getUsedClaudeSessionIDs() map[string]bool {
 
 // createSessionInGroup creates a new session in a specific group
 func (h *Home) createSessionInGroup(name, path, command, groupPath string) tea.Cmd {
+	return h.createSessionInGroupWithOptions(name, path, command, groupPath, nil)
+}
+
+// createSessionInGroupWithOptions creates a session with optional Claude options
+func (h *Home) createSessionInGroupWithOptions(name, path, command, groupPath string, claudeOpts *session.ClaudeOptions) tea.Cmd {
 	return func() tea.Msg {
 		// Check tmux availability before creating session
 		if err := tmux.IsTmuxAvailable(); err != nil {
@@ -2408,6 +2490,12 @@ func (h *Home) createSessionInGroup(name, path, command, groupPath string) tea.C
 			inst = session.NewInstanceWithTool(name, path, tool)
 		}
 		inst.Command = command
+
+		// Apply Claude options if provided
+		if tool == "claude" && claudeOpts != nil {
+			inst.SetClaudeOptions(claudeOpts)
+		}
+
 		if err := inst.Start(); err != nil {
 			return sessionCreatedMsg{err: err}
 		}
@@ -2439,6 +2527,12 @@ func (h *Home) forkSessionWithDialog(source *session.Instance) tea.Cmd {
 // forkSessionCmd creates a forked session with the given title and group
 // Shows immediate UI feedback by tracking the source session in forkingSessions
 func (h *Home) forkSessionCmd(source *session.Instance, title, groupPath string) tea.Cmd {
+	return h.forkSessionCmdWithOptions(source, title, groupPath, nil)
+}
+
+// forkSessionCmdWithOptions creates a forked session with the given title, group, and Claude options
+// Shows immediate UI feedback by tracking the source session in forkingSessions
+func (h *Home) forkSessionCmdWithOptions(source *session.Instance, title, groupPath string, opts *session.ClaudeOptions) tea.Cmd {
 	if source == nil {
 		return nil
 	}
@@ -2457,8 +2551,8 @@ func (h *Home) forkSessionCmd(source *session.Instance, title, groupPath string)
 			return sessionForkedMsg{err: fmt.Errorf("cannot fork session: %w", err), sourceID: sourceID}
 		}
 
-		// Use CreateForkedInstance to get the proper fork command
-		inst, _, err := source.CreateForkedInstance(title, groupPath)
+		// Use CreateForkedInstanceWithOptions to get the proper fork command with options
+		inst, _, err := source.CreateForkedInstanceWithOptions(title, groupPath, opts)
 		if err != nil {
 			return sessionForkedMsg{err: fmt.Errorf("cannot create forked instance: %w", err), sourceID: sourceID}
 		}
@@ -2529,7 +2623,11 @@ func (h *Home) attachSession(inst *session.Instance) tea.Cmd {
 	inst.MarkAccessed()
 
 	// Skip saving during reload to avoid overwriting external changes
-	if !h.isReloading && h.storage != nil {
+	// THREAD-SAFE: Read isReloading under mutex
+	h.reloadMu.Lock()
+	reloading := h.isReloading
+	h.reloadMu.Unlock()
+	if !reloading && h.storage != nil {
 		// Take snapshot under lock for defensive programming
 		h.instancesMu.RLock()
 		instancesCopy := make([]*session.Instance, len(h.instances))
@@ -2565,14 +2663,26 @@ skipSave:
 	// On return, immediately update all session statuses (don't reload from storage
 	// which would lose the tmux session state)
 	return tea.Exec(attachCmd{session: tmuxSess}, func(err error) tea.Msg {
+		// CRITICAL: Set isAttaching to false BEFORE returning the message
+		// This prevents a race condition where View() could be called with
+		// isAttaching=true before Update() processes statusUpdateMsg,
+		// causing a blank screen on return from attached session
+		h.isAttaching.Store(false) // Atomic store for thread safety
+
 		// Clear screen with synchronized output for atomic rendering
 		fmt.Print(syncOutputBegin + clearScreen + syncOutputEnd)
 
 		// Update last accessed time to detach time (more accurate than attach time)
 		inst.MarkAccessed()
 
-		// Baseline the content the user just saw to avoid a green flash on return
-		tmuxSess.AcknowledgeWithSnapshot()
+		// CRITICAL PERFORMANCE FIX: Run AcknowledgeWithSnapshot in background
+		// AcknowledgeWithSnapshot calls CapturePane() which is BLOCKING and can take
+		// 200-500ms per session. Running it inline causes 10+ second delays.
+		// It's safe to run async because it only updates internal state.
+		go func() {
+			tmuxSess.AcknowledgeWithSnapshot()
+		}()
+
 		return statusUpdateMsg{}
 	})
 }
@@ -2583,9 +2693,8 @@ type attachCmd struct {
 }
 
 func (a attachCmd) Run() error {
-	// Clear screen with synchronized output for atomic rendering (prevents flicker)
-	// Begin sync mode → clear screen → end sync mode ensures single-frame update
-	fmt.Print(syncOutputBegin + clearScreen + syncOutputEnd)
+	// NOTE: Screen clearing is ONLY done in the tea.Exec callback (after Attach returns)
+	// Removing clear screen here prevents double-clearing which corrupts terminal state
 
 	ctx := context.Background()
 	return a.session.Attach(ctx)
@@ -2619,9 +2728,14 @@ func (h *Home) importSessions() tea.Msg {
 
 // countSessionStatuses counts sessions by status for the logo display
 // Uses cache to avoid O(n) iteration on every View() call
+// Cache expires after 500ms to balance freshness with performance
+// PERFORMANCE: Increased from 100ms to 500ms - status changes are rare
+// during UI interaction, and longer cache reduces View() overhead
 func (h *Home) countSessionStatuses() (running, waiting, idle, errored int) {
-	// Return cached values if valid
-	if h.cachedStatusCounts.valid {
+	// Return cached values if valid and not expired
+	const cacheDuration = 500 * time.Millisecond
+	if h.cachedStatusCounts.valid.Load() &&
+		time.Since(h.cachedStatusCounts.timestamp) < cacheDuration {
 		return h.cachedStatusCounts.running, h.cachedStatusCounts.waiting,
 			h.cachedStatusCounts.idle, h.cachedStatusCounts.errored
 	}
@@ -2642,12 +2756,13 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, errored int) {
 	}
 	h.instancesMu.RUnlock()
 
-	// Cache results
+	// Cache results with timestamp
 	h.cachedStatusCounts.running = running
 	h.cachedStatusCounts.waiting = waiting
 	h.cachedStatusCounts.idle = idle
 	h.cachedStatusCounts.errored = errored
-	h.cachedStatusCounts.valid = true
+	h.cachedStatusCounts.valid.Store(true)
+	h.cachedStatusCounts.timestamp = time.Now()
 	return running, waiting, idle, errored
 }
 
@@ -2777,7 +2892,7 @@ func (h *Home) updateSizes() {
 func (h *Home) View() string {
 	// CRITICAL: Return empty during attach to prevent View() output leakage
 	// (Bubble Tea Issue #431 - View gets printed to stdout during tea.Exec)
-	if h.isAttaching {
+	if h.isAttaching.Load() { // Atomic read for thread safety
 		return ""
 	}
 
@@ -2933,49 +3048,27 @@ func (h *Home) View() string {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════
-	// MAIN CONTENT AREA
+	// MAIN CONTENT AREA - Responsive layout based on terminal width
 	// ═══════════════════════════════════════════════════════════════════
 	helpBarHeight := 2 // Help bar takes 2 lines (border + content)
 	// Height breakdown: -1 header, -filterBarHeight filter, -updateBannerHeight banner, -helpBarHeight help
 	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - filterBarHeight
 
-	// Calculate panel widths (35% left, 65% right for more preview space)
-	leftWidth := int(float64(h.width) * 0.35)
-	rightWidth := h.width - leftWidth - 3 // -3 for separator
+	// Route to appropriate layout based on terminal width
+	layoutMode := h.getLayoutMode()
 
-	// Panel title is exactly 2 lines (title + underline)
-	// Panel content gets the remaining space: contentHeight - 2
-	panelTitleLines := 2
-	panelContentHeight := contentHeight - panelTitleLines
-
-	// Build left panel (session list) with styled title
-	leftTitle := h.renderPanelTitle("SESSIONS", leftWidth)
-	leftContent := h.renderSessionList(leftWidth, panelContentHeight)
-	// CRITICAL: Ensure left content has exactly panelContentHeight lines
-	leftContent = ensureExactHeight(leftContent, panelContentHeight)
-	leftPanel := leftTitle + "\n" + leftContent
-
-	// Build right panel (preview) with styled title
-	rightTitle := h.renderPanelTitle("PREVIEW", rightWidth)
-	rightContent := h.renderPreviewPane(rightWidth, panelContentHeight)
-	// CRITICAL: Ensure right content has exactly panelContentHeight lines
-	rightContent = ensureExactHeight(rightContent, panelContentHeight)
-	rightPanel := rightTitle + "\n" + rightContent
-
-	// Build separator - must be exactly contentHeight lines
-	separatorStyle := lipgloss.NewStyle().Foreground(ColorBorder)
-	separatorLines := make([]string, contentHeight)
-	for i := range separatorLines {
-		separatorLines[i] = separatorStyle.Render(" │ ")
+	var mainContent string
+	switch layoutMode {
+	case LayoutModeSingle:
+		mainContent = h.renderSingleColumnLayout(contentHeight)
+	case LayoutModeStacked:
+		mainContent = h.renderStackedLayout(contentHeight)
+	default: // LayoutModeDual
+		mainContent = h.renderDualColumnLayout(contentHeight)
 	}
-	separator := strings.Join(separatorLines, "\n")
 
-	// CRITICAL: Ensure both panels have exactly contentHeight lines before joining
-	leftPanel = ensureExactHeight(leftPanel, contentHeight)
-	rightPanel = ensureExactHeight(rightPanel, contentHeight)
-
-	// Join panels horizontally - all components have exact heights now
-	mainContent := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, separator, rightPanel)
+	// Ensure mainContent has exact height
+	mainContent = ensureExactHeight(mainContent, contentHeight)
 	b.WriteString(mainContent)
 	b.WriteString("\n")
 
@@ -3285,6 +3378,110 @@ func ensureExactHeight(content string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// renderDualColumnLayout renders side-by-side panels for wide terminals (80+ cols)
+func (h *Home) renderDualColumnLayout(contentHeight int) string {
+	var b strings.Builder
+
+	// Calculate panel widths (35% left, 65% right for more preview space)
+	leftWidth := int(float64(h.width) * 0.35)
+	rightWidth := h.width - leftWidth - 3 // -3 for separator
+
+	// Panel title is exactly 2 lines (title + underline)
+	// Panel content gets the remaining space: contentHeight - 2
+	panelTitleLines := 2
+	panelContentHeight := contentHeight - panelTitleLines
+
+	// Build left panel (session list) with styled title
+	leftTitle := h.renderPanelTitle("SESSIONS", leftWidth)
+	leftContent := h.renderSessionList(leftWidth, panelContentHeight)
+	// CRITICAL: Ensure left content has exactly panelContentHeight lines
+	leftContent = ensureExactHeight(leftContent, panelContentHeight)
+	leftPanel := leftTitle + "\n" + leftContent
+
+	// Build right panel (preview) with styled title
+	rightTitle := h.renderPanelTitle("PREVIEW", rightWidth)
+	rightContent := h.renderPreviewPane(rightWidth, panelContentHeight)
+	// CRITICAL: Ensure right content has exactly panelContentHeight lines
+	rightContent = ensureExactHeight(rightContent, panelContentHeight)
+	rightPanel := rightTitle + "\n" + rightContent
+
+	// Build separator - must be exactly contentHeight lines
+	separatorStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	separatorLines := make([]string, contentHeight)
+	for i := range separatorLines {
+		separatorLines[i] = separatorStyle.Render(" │ ")
+	}
+	separator := strings.Join(separatorLines, "\n")
+
+	// CRITICAL: Ensure both panels have exactly contentHeight lines before joining
+	leftPanel = ensureExactHeight(leftPanel, contentHeight)
+	rightPanel = ensureExactHeight(rightPanel, contentHeight)
+
+	// Join panels horizontally - all components have exact heights now
+	mainContent := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, separator, rightPanel)
+	b.WriteString(mainContent)
+
+	return b.String()
+}
+
+// renderStackedLayout renders list above preview for medium terminals (50-79 cols)
+func (h *Home) renderStackedLayout(totalHeight int) string {
+	var b strings.Builder
+
+	// Split height: 60% list, 40% preview
+	listHeight := (totalHeight * 60) / 100
+	previewHeight := totalHeight - listHeight - 1 // -1 for separator
+
+	if listHeight < 5 {
+		listHeight = 5
+	}
+	if previewHeight < 3 {
+		previewHeight = 3
+	}
+
+	// Session list (full width)
+	listTitle := h.renderPanelTitle("SESSIONS", h.width)
+	listContent := h.renderSessionList(h.width, listHeight-2) // -2 for title
+	listContent = ensureExactHeight(listContent, listHeight-2)
+	b.WriteString(listTitle)
+	b.WriteString("\n")
+	b.WriteString(listContent)
+	b.WriteString("\n")
+
+	// Separator
+	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	b.WriteString(sepStyle.Render(strings.Repeat("─", h.width)))
+	b.WriteString("\n")
+
+	// Preview (full width)
+	previewTitle := h.renderPanelTitle("PREVIEW", h.width)
+	previewContent := h.renderPreviewPane(h.width, previewHeight-2) // -2 for title
+	previewContent = ensureExactHeight(previewContent, previewHeight-2)
+	b.WriteString(previewTitle)
+	b.WriteString("\n")
+	b.WriteString(previewContent)
+
+	return b.String()
+}
+
+// renderSingleColumnLayout renders list only for narrow terminals (<50 cols)
+func (h *Home) renderSingleColumnLayout(totalHeight int) string {
+	var b strings.Builder
+
+	// Full height for list
+	listHeight := totalHeight - 2 // -2 for title
+
+	listTitle := h.renderPanelTitle("SESSIONS", h.width)
+	listContent := h.renderSessionList(h.width, listHeight)
+	listContent = ensureExactHeight(listContent, listHeight)
+
+	b.WriteString(listTitle)
+	b.WriteString("\n")
+	b.WriteString(listContent)
+
+	return b.String()
+}
+
 // renderSectionDivider creates a modern section divider with optional centered label
 // Format: ─────────── Label ─────────── (lines extend to fill width)
 func renderSectionDivider(label string, width int) string {
@@ -3311,8 +3508,156 @@ func renderSectionDivider(label string, width int) string {
 		lineStyle.Render(strings.Repeat("─", sideWidth))
 }
 
-// renderHelpBar renders context-aware keyboard shortcuts with visual grouping
+// renderHelpBar renders context-aware keyboard shortcuts, adapting to terminal width
 func (h *Home) renderHelpBar() string {
+	// Route to appropriate tier based on width
+	switch {
+	case h.width < layoutBreakpointSingle:
+		return h.renderHelpBarTiny()
+	case h.width < 70:
+		return h.renderHelpBarMinimal()
+	case h.width < 100:
+		return h.renderHelpBarCompact()
+	default:
+		return h.renderHelpBarFull()
+	}
+}
+
+// renderHelpBarTiny renders minimal help for very narrow terminals (<50 cols)
+func (h *Home) renderHelpBarTiny() string {
+	borderStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	border := borderStyle.Render(strings.Repeat("─", h.width))
+
+	hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
+	hint := hintStyle.Render("? for help")
+
+	// Center the hint
+	padding := (h.width - lipgloss.Width(hint)) / 2
+	if padding < 0 {
+		padding = 0
+	}
+	content := strings.Repeat(" ", padding) + hint
+
+	return lipgloss.JoinVertical(lipgloss.Left, border, content)
+}
+
+// renderHelpBarMinimal renders keys-only help for narrow terminals (50-69 cols)
+func (h *Home) renderHelpBarMinimal() string {
+	borderStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	border := borderStyle.Render(strings.Repeat("─", h.width))
+
+	keyStyle := lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorAccent).
+		Bold(true)
+	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	sep := sepStyle.Render(" │ ")
+
+	// Context-specific keys (left side)
+	var contextKeys string
+	if len(h.flatItems) == 0 {
+		contextKeys = keyStyle.Render("n") + " " + keyStyle.Render("i") + " " + keyStyle.Render("g")
+	} else if h.cursor < len(h.flatItems) {
+		item := h.flatItems[h.cursor]
+		if item.Type == session.ItemTypeGroup {
+			contextKeys = keyStyle.Render("⏎") + " " + keyStyle.Render("n") + " " + keyStyle.Render("g")
+		} else {
+			contextKeys = keyStyle.Render("⏎") + " " + keyStyle.Render("n") + " " + keyStyle.Render("R")
+			if item.Session != nil && item.Session.CanFork() {
+				contextKeys += " " + keyStyle.Render("f")
+			}
+			if item.Session != nil && (item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
+				contextKeys += " " + keyStyle.Render("M")
+			}
+		}
+	}
+
+	// Global keys (right side)
+	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
+	globalKeys := globalStyle.Render("↑↓") + " " + globalStyle.Render("/") + " " +
+		globalStyle.Render("?") + " " + globalStyle.Render("q")
+
+	// Calculate padding
+	leftPart := contextKeys
+	rightPart := globalKeys
+	padding := h.width - lipgloss.Width(leftPart) - lipgloss.Width(rightPart) - 4
+	if padding < 2 {
+		padding = 2
+	}
+
+	content := leftPart + sep + strings.Repeat(" ", padding) + rightPart
+
+	return lipgloss.JoinVertical(lipgloss.Left, border, content)
+}
+
+// renderHelpBarCompact renders abbreviated help for medium terminals (70-99 cols)
+func (h *Home) renderHelpBarCompact() string {
+	borderStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	border := borderStyle.Render(strings.Repeat("─", h.width))
+
+	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+	sep := sepStyle.Render(" │ ")
+
+	// Abbreviated key+short desc
+	var contextHints []string
+	if len(h.flatItems) == 0 {
+		contextHints = []string{
+			h.helpKeyShort("n", "New"),
+			h.helpKeyShort("i", "Import"),
+		}
+	} else if h.cursor < len(h.flatItems) {
+		item := h.flatItems[h.cursor]
+		if item.Type == session.ItemTypeGroup {
+			contextHints = []string{
+				h.helpKeyShort("⏎", "Toggle"),
+				h.helpKeyShort("n", "New"),
+			}
+		} else {
+			contextHints = []string{
+				h.helpKeyShort("⏎", "Attach"),
+				h.helpKeyShort("n", "New"),
+				h.helpKeyShort("R", "Restart"),
+			}
+			if item.Session != nil && item.Session.CanFork() {
+				contextHints = append(contextHints, h.helpKeyShort("f", "Fork"))
+			}
+			if item.Session != nil && (item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
+				contextHints = append(contextHints, h.helpKeyShort("M", "MCP"))
+			}
+		}
+	}
+
+	// Global hints (abbreviated)
+	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
+	globalHints := globalStyle.Render("↑↓ Nav") + " " +
+		globalStyle.Render("/") + " " +
+		globalStyle.Render("?") + " " +
+		globalStyle.Render("q")
+
+	leftPart := strings.Join(contextHints, " ")
+	rightPart := globalHints
+	padding := h.width - lipgloss.Width(leftPart) - lipgloss.Width(rightPart) - 4
+	if padding < 2 {
+		padding = 2
+	}
+
+	content := leftPart + sep + strings.Repeat(" ", padding) + rightPart
+
+	return lipgloss.JoinVertical(lipgloss.Left, border, content)
+}
+
+// helpKeyShort formats a compact keyboard shortcut (no padding)
+func (h *Home) helpKeyShort(key, desc string) string {
+	keyStyle := lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorAccent).
+		Bold(true)
+	descStyle := lipgloss.NewStyle().Foreground(ColorText)
+	return keyStyle.Render(key) + descStyle.Render(desc)
+}
+
+// renderHelpBarFull renders context-aware keyboard shortcuts with visual grouping (100+ cols)
+func (h *Home) renderHelpBarFull() string {
 	// Separator style for grouping related actions
 	sepStyle := lipgloss.NewStyle().Foreground(ColorBorder)
 	sep := sepStyle.Render(" │ ")
@@ -3354,8 +3699,8 @@ func (h *Home) renderHelpBar() string {
 			if item.Session != nil && item.Session.CanFork() {
 				primaryHints = append(primaryHints, h.helpKey("f/F", "Fork"))
 			}
-			// Show MCP Manager hint for Claude sessions
-			if item.Session != nil && item.Session.Tool == "claude" {
+			// Show MCP Manager hint for Claude and Gemini sessions
+			if item.Session != nil && (item.Session.Tool == "claude" || item.Session.Tool == "gemini") {
 				primaryHints = append(primaryHints, h.helpKey("M", "MCP"))
 			}
 			secondaryHints = []string{
@@ -3498,6 +3843,7 @@ func (h *Home) renderItem(b *strings.Builder, item session.Item, selected bool, 
 }
 
 // renderGroupItem renders a group header
+// PERFORMANCE: Uses cached styles from styles.go to avoid allocations
 func (h *Home) renderGroupItem(b *strings.Builder, item session.Item, selected bool, itemIndex int) {
 	group := item.Group
 
@@ -3505,51 +3851,43 @@ func (h *Home) renderGroupItem(b *strings.Builder, item session.Item, selected b
 	// Uses spacingNormal (2 chars) per level for consistent hierarchy visualization
 	indent := strings.Repeat(strings.Repeat(" ", spacingNormal), item.Level)
 
-	// Expand/collapse indicator with filled triangles
-	expandStyle := lipgloss.NewStyle().Foreground(ColorText)
-	expandIcon := expandStyle.Render("▾") // Filled triangle for expanded
-	if !group.Expanded {
-		expandIcon = expandStyle.Render("▸") // Filled triangle for collapsed
+	// Expand/collapse indicator with filled triangles (using cached styles)
+	var expandIcon string
+	if selected {
+		if group.Expanded {
+			expandIcon = GroupExpandSelStyle.Render("▾")
+		} else {
+			expandIcon = GroupExpandSelStyle.Render("▸")
+		}
+	} else {
+		if group.Expanded {
+			expandIcon = GroupExpandStyle.Render("▾") // Filled triangle for expanded
+		} else {
+			expandIcon = GroupExpandStyle.Render("▸") // Filled triangle for collapsed
+		}
 	}
-
-	// Group name styling
-	nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorCyan)
-	countStyle := lipgloss.NewStyle().Foreground(ColorText)
 
 	// Hotkey indicator (subtle, only for root groups, hidden when selected)
 	// Uses pre-computed RootGroupNum from rebuildFlatItems() - O(1) lookup instead of O(n) loop
 	hotkeyStr := ""
 	if item.Level == 0 && !selected {
 		if item.RootGroupNum >= 1 && item.RootGroupNum <= 9 {
-			hotkeyStyle := lipgloss.NewStyle().Foreground(ColorComment)
-			hotkeyStr = hotkeyStyle.Render(fmt.Sprintf("%d·", item.RootGroupNum))
+			hotkeyStr = GroupHotkeyStyle.Render(fmt.Sprintf("%d·", item.RootGroupNum))
 		}
 	}
 
+	// Select appropriate cached styles based on selection state
+	nameStyle := GroupNameStyle
+	countStyle := GroupCountStyle
 	if selected {
-		nameStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(ColorBg).
-			Background(ColorAccent)
-		countStyle = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorAccent)
-		expandIcon = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorAccent).
-			Render("▾")
-		if !group.Expanded {
-			expandIcon = lipgloss.NewStyle().
-				Foreground(ColorBg).
-				Background(ColorAccent).
-				Render("▸")
-		}
+		nameStyle = GroupNameSelStyle
+		countStyle = GroupCountSelStyle
 	}
 
 	sessionCount := len(group.Sessions)
 	countStr := countStyle.Render(fmt.Sprintf(" (%d)", sessionCount))
 
-	// Status indicators (compact, on same line)
+	// Status indicators (compact, on same line) using cached styles
 	running := 0
 	waiting := 0
 	for _, sess := range group.Sessions {
@@ -3563,10 +3901,10 @@ func (h *Home) renderGroupItem(b *strings.Builder, item session.Item, selected b
 
 	statusStr := ""
 	if running > 0 {
-		statusStr += " " + lipgloss.NewStyle().Foreground(ColorGreen).Render(fmt.Sprintf("● %d", running))
+		statusStr += " " + GroupStatusRunning.Render(fmt.Sprintf("● %d", running))
 	}
 	if waiting > 0 {
-		statusStr += " " + lipgloss.NewStyle().Foreground(ColorYellow).Render(fmt.Sprintf("◐ %d", waiting))
+		statusStr += " " + GroupStatusWaiting.Render(fmt.Sprintf("◐ %d", waiting))
 	}
 
 	// Build the row: [indent][hotkey][expand] [name](count) [status]
@@ -3587,11 +3925,12 @@ const (
 )
 
 // renderSessionItem renders a single session item for the left panel
+// PERFORMANCE: Uses cached styles from styles.go to avoid allocations
 func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected bool) {
 	inst := item.Session
 
 	// Tree style for connectors - Use ColorText for clear visibility of box-drawing characters
-	treeStyle := lipgloss.NewStyle().Foreground(ColorText)
+	treeStyle := TreeConnectorStyle
 
 	// Calculate base indentation for parent levels
 	// Level 1 means direct child of root group, Level 2 means child of nested group, etc.
@@ -3629,67 +3968,54 @@ func (h *Home) renderSessionItem(b *strings.Builder, item session.Item, selected
 
 	// Status indicator with consistent sizing
 	var statusIcon string
-	var statusColor lipgloss.Color
+	var statusStyle lipgloss.Style
 	switch inst.Status {
 	case session.StatusRunning:
 		statusIcon = "●"
-		statusColor = ColorGreen
+		statusStyle = SessionStatusRunning
 	case session.StatusWaiting:
 		statusIcon = "◐"
-		statusColor = ColorYellow
+		statusStyle = SessionStatusWaiting
 	case session.StatusIdle:
 		statusIcon = "○"
-		statusColor = ColorTextDim
+		statusStyle = SessionStatusIdle
 	case session.StatusError:
 		statusIcon = "✕"
-		statusColor = ColorRed
+		statusStyle = SessionStatusError
 	default:
 		statusIcon = "○"
-		statusColor = ColorTextDim
+		statusStyle = SessionStatusIdle
 	}
 
-	statusStyle := lipgloss.NewStyle().Foreground(statusColor)
 	status := statusStyle.Render(statusIcon)
 
 	// Title styling - add bold/underline for accessibility (colorblind users)
-	titleStyle := lipgloss.NewStyle().Foreground(ColorText)
+	var titleStyle lipgloss.Style
 	switch inst.Status {
 	case session.StatusRunning, session.StatusWaiting:
 		// Bold for active states (distinguishable without color)
-		titleStyle = titleStyle.Bold(true)
+		titleStyle = SessionTitleActive
 	case session.StatusError:
 		// Underline for error (distinguishable without color)
-		titleStyle = titleStyle.Underline(true)
+		titleStyle = SessionTitleError
+	default:
+		titleStyle = SessionTitleDefault
 	}
 
 	// Tool badge with brand-specific color
 	// Claude=orange, Gemini=purple, Codex=cyan, Aider=red
-	toolColor := ToolColor(inst.Tool)
-	toolStyle := lipgloss.NewStyle().
-		Foreground(toolColor)
+	toolStyle := GetToolStyle(inst.Tool)
 
 	// Selection indicator
 	selectionPrefix := " "
 	if selected {
-		selectionPrefix = lipgloss.NewStyle().
-			Foreground(ColorAccent).
-			Bold(true).
-			Render("▶")
-		titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(ColorBg).
-			Background(ColorAccent)
-		toolStyle = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorAccent)
-		statusStyle = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorAccent)
+		selectionPrefix = SessionSelectionPrefix.Render("▶")
+		titleStyle = SessionTitleSelStyle
+		toolStyle = SessionStatusSelStyle
+		statusStyle = SessionStatusSelStyle
 		status = statusStyle.Render(statusIcon)
 		// Tree connector also gets selection styling
-		treeStyle = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorAccent)
+		treeStyle = TreeConnectorSelStyle
 		// Rebuild baseIndent with selection styling for sub-sessions
 		if item.IsSubSession && !item.ParentIsLastInGroup {
 			groupIndent := strings.Repeat(treeEmpty, item.Level-2)
@@ -4195,7 +4521,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 	// Special handling for error state - show guidance instead of output
 	if selected.Status == session.StatusError {
-		errorHeader := renderSectionDivider("Session Disconnected", width-4)
+		errorHeader := renderSectionDivider("Session Inactive", width-4)
 		b.WriteString(errorHeader)
 		b.WriteString("\n\n")
 
@@ -4204,25 +4530,29 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		dimStyle := lipgloss.NewStyle().Foreground(ColorText)
 		keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
 
-		b.WriteString(warnStyle.Render("⚠ The tmux session no longer exists"))
+		b.WriteString(warnStyle.Render("⚠ No tmux session running"))
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("This can happen if:"))
 		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("  • Session was added but not yet started"))
+		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("  • tmux server was restarted"))
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("  • Terminal app was closed"))
-		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("  • System was rebooted"))
+		b.WriteString(dimStyle.Render("  • Terminal was closed or system rebooted"))
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("Actions:"))
 		b.WriteString("\n")
 		b.WriteString("  ")
 		b.WriteString(keyStyle.Render("R"))
-		b.WriteString(dimStyle.Render(" Restart - recreate tmux session"))
+		b.WriteString(dimStyle.Render(" Start   - create and start tmux session"))
 		b.WriteString("\n")
 		b.WriteString("  ")
 		b.WriteString(keyStyle.Render("d"))
 		b.WriteString(dimStyle.Render(" Delete  - remove from list"))
+		b.WriteString("\n")
+		b.WriteString("  ")
+		b.WriteString(keyStyle.Render("Enter"))
+		b.WriteString(dimStyle.Render(" - attach (will auto-start)"))
 		b.WriteString("\n")
 
 		// Pad output to exact height to prevent layout shifts

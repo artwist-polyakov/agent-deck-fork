@@ -126,11 +126,25 @@ func ResolveSession(identifier string, instances []*session.Instance) (*session.
 			identifier, strings.Join(names, "\n  - ")), ErrCodeAmbiguous
 	}
 
-	// Try path match
+	// Try path match - collect all sessions at this path
+	var pathMatches []*session.Instance
 	for _, inst := range instances {
 		if inst.ProjectPath == identifier {
-			return inst, "", ""
+			pathMatches = append(pathMatches, inst)
 		}
+	}
+
+	if len(pathMatches) == 1 {
+		return pathMatches[0], "", ""
+	}
+
+	if len(pathMatches) > 1 {
+		var names []string
+		for _, m := range pathMatches {
+			names = append(names, fmt.Sprintf("%s (%s)", m.Title, m.ID[:12]))
+		}
+		return nil, fmt.Sprintf("path '%s' has multiple sessions:\n  - %s\nUse title or ID to specify.",
+			identifier, strings.Join(names, "\n  - ")), ErrCodeAmbiguous
 	}
 
 	return nil, fmt.Sprintf("session '%s' not found", identifier), ErrCodeNotFound

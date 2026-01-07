@@ -61,7 +61,8 @@ type MCPDialog struct {
 	localChanged  bool
 	globalChanged bool
 
-	err error
+	err         error
+	configError string // Error message from config parsing
 }
 
 // NewMCPDialog creates a new MCP management dialog
@@ -72,7 +73,11 @@ func NewMCPDialog() *MCPDialog {
 // Show displays the MCP dialog for a project
 func (m *MCPDialog) Show(projectPath string, sessionID string, tool string) error {
 	// Reload config to pick up any changes to config.toml
-	_, _ = session.ReloadUserConfig()
+	// Capture any parse errors to display in dialog
+	m.configError = ""
+	if _, err := session.ReloadUserConfig(); err != nil {
+		m.configError = err.Error()
+	}
 
 	// Store session ID and tool for restart
 	m.sessionID = sessionID
@@ -551,14 +556,33 @@ func (m *MCPDialog) View() string {
 	// Assemble dialog
 	titleStyle := DialogTitleStyle.Width(titleWidth)
 
+	// Check if we should show empty state help instead of columns
+	showEmptyHelp := len(m.localAttached) == 0 && len(m.localAvailable) == 0 &&
+		len(m.globalAttached) == 0 && len(m.globalAvailable) == 0 &&
+		m.configError == ""
+
 	parts := []string{
 		titleStyle.Render(title),
 		"",
 		tabs,
 		scopeDesc,
 		"",
-		columns,
 	}
+
+	// Show config error prominently if present
+	if m.configError != "" {
+		errorStyle := lipgloss.NewStyle().Foreground(ColorRed)
+		parts = append(parts, errorStyle.Render("⚠ "+m.configError))
+		parts = append(parts, "")
+	}
+
+	// Show empty state help or columns
+	if showEmptyHelp {
+		parts = append(parts, m.renderEmptyStateHelp())
+	} else {
+		parts = append(parts, columns)
+	}
+
 	if errText != "" {
 		parts = append(parts, "", errText)
 	}
@@ -579,6 +603,29 @@ func (m *MCPDialog) View() string {
 		lipgloss.Center,
 		dialog,
 	)
+}
+
+// renderEmptyStateHelp returns a helpful message when no MCPs are configured
+func (m *MCPDialog) renderEmptyStateHelp() string {
+	helpStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+	highlightStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+	pathStyle := lipgloss.NewStyle().Foreground(ColorCyan)
+
+	lines := []string{
+		"",
+		highlightStyle.Render("No MCPs configured"),
+		"",
+		helpStyle.Render("To add MCPs, edit:"),
+		pathStyle.Render("  ~/.agent-deck/config.toml"),
+		"",
+		helpStyle.Render("Example:"),
+		helpStyle.Render("  [mcps.example]"),
+		helpStyle.Render("  command = \"npx\""),
+		helpStyle.Render("  args = [\"-y\", \"@example/mcp\"]"),
+		"",
+		helpStyle.Render("Then press M again to see them here."),
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
 // renderColumn renders a single column (Attached or Available)

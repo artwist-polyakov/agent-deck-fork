@@ -42,7 +42,24 @@ type SocketProxy struct {
 	logFile   string
 	logWriter io.WriteCloser
 
-	Status ServerStatus
+	Status       ServerStatus
+	statusMu     sync.RWMutex // Protects Status field
+	lastRestart  time.Time    // For rate limiting restarts
+	restartCount int          // Track restart attempts
+}
+
+// SetStatus safely updates the proxy status
+func (p *SocketProxy) SetStatus(s ServerStatus) {
+	p.statusMu.Lock()
+	p.Status = s
+	p.statusMu.Unlock()
+}
+
+// GetStatus safely reads the proxy status
+func (p *SocketProxy) GetStatus() ServerStatus {
+	p.statusMu.RLock()
+	defer p.statusMu.RUnlock()
+	return p.Status
 }
 
 type JSONRPCRequest struct {
@@ -117,7 +134,7 @@ func NewSocketProxy(ctx context.Context, name, command string, args []string, en
 
 func (p *SocketProxy) Start() error {
 	// If already running (reusing external socket), skip process creation
-	if p.Status == StatusRunning {
+	if p.GetStatus() == StatusRunning {
 		log.Printf("[Pool] %s: Reusing existing socket, no process to start", p.name)
 		return nil
 	}
@@ -168,7 +185,7 @@ func (p *SocketProxy) Start() error {
 	go p.acceptConnections()
 	go p.broadcastResponses()
 
-	p.Status = StatusRunning
+	p.SetStatus(StatusRunning)
 	return nil
 }
 
@@ -243,6 +260,16 @@ func (p *SocketProxy) broadcastResponses() {
 			p.broadcastToAll(line)
 		}
 	}
+
+	// Log error when scanner exits
+	if err := scanner.Err(); err != nil {
+		log.Printf("[Pool] %s: broadcastResponses scanner error: %v", p.name, err)
+	} else {
+		log.Printf("[Pool] %s: broadcastResponses exited (MCP stdout closed)", p.name)
+	}
+
+	// Mark proxy as failed so health monitor can restart it
+	p.SetStatus(StatusFailed)
 }
 
 func (p *SocketProxy) routeToClient(responseID interface{}, line []byte) {
@@ -279,25 +306,45 @@ func (p *SocketProxy) broadcastToAll(line []byte) {
 }
 
 func (p *SocketProxy) Stop() error {
-	p.cancel()
+	// cancel may be nil for external socket proxies (discovered from another instance)
+	if p.cancel != nil {
+		p.cancel()
+	}
+
+	// Close all client connections first
+	p.clientsMu.Lock()
+	for sessionID, conn := range p.clients {
+		conn.Close()
+		log.Printf("[Pool] %s: Closed client connection: %s", p.name, sessionID)
+	}
+	p.clients = make(map[string]net.Conn)
+	p.clientsMu.Unlock()
+
+	// Clear request map to prevent memory leak
+	p.requestMu.Lock()
+	p.requestMap = make(map[interface{}]string)
+	p.requestMu.Unlock()
+
 	if p.listener != nil {
 		p.listener.Close()
 	}
+
 	// Only kill process and remove socket if we OWN it (mcpProcess != nil)
-	// If mcpProcess is nil, we're just reusing an external socket
 	if p.mcpProcess != nil {
 		p.mcpStdin.Close()
 		_ = p.mcpProcess.Process.Signal(syscall.SIGTERM)
 		_ = p.mcpProcess.Wait()
-		os.Remove(p.socketPath) // Only remove socket if we created it
+		os.Remove(p.socketPath)
 		log.Printf("[Pool] %s: Stopped owned process and removed socket", p.name)
 	} else {
 		log.Printf("[Pool] %s: Disconnected from external socket (not removing)", p.name)
 	}
+
 	if p.logWriter != nil {
 		p.logWriter.Close()
 	}
-	p.Status = StatusStopped
+
+	p.SetStatus(StatusStopped)
 	return nil
 }
 

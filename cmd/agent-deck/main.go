@@ -23,7 +23,7 @@ import (
 	"github.com/muesli/termenv"
 )
 
-const Version = "0.8.4"
+const Version = "0.8.14"
 
 // Table column widths for list command output
 const (
@@ -87,7 +87,7 @@ func promptForUpdate() bool {
 	fmt.Print("Update now? [Y/n]: ")
 
 	var response string
-	fmt.Scanln(&response)
+	_, _ = fmt.Scanln(&response)
 	response = strings.TrimSpace(strings.ToLower(response))
 
 	// Default to yes (empty or "y" or "yes")
@@ -214,6 +214,9 @@ func main() {
 		case "group":
 			handleGroup(profile, args[1:])
 			return
+		case "uninstall":
+			handleUninstall(args[1:])
+			return
 		}
 	}
 
@@ -314,6 +317,104 @@ func extractProfileFlag(args []string) (string, []string) {
 	return profile, remaining
 }
 
+// reorderArgsForFlagParsing moves the path argument to the end of args
+// so Go's flag package can parse all flags correctly.
+// Go's flag package stops parsing at the first non-flag argument,
+// so "add . -c claude" would fail to parse -c without this fix.
+// This reorders to "add -c claude ." which parses correctly.
+func reorderArgsForFlagParsing(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+
+	// Known flags that take a value (need to skip their values)
+	valueFlags := map[string]bool{
+		"-t": true, "--title": true,
+		"-g": true, "--group": true,
+		"-c": true, "--cmd": true,
+		"-p": true, "--parent": true,
+		"--mcp": true,
+	}
+
+	var flags []string
+	var positional []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		// Check if it's a flag
+		if strings.HasPrefix(arg, "-") {
+			flags = append(flags, arg)
+
+			// Check if this flag takes a value (and value is separate)
+			// Handle both "-c value" and "-c=value" formats
+			if !strings.Contains(arg, "=") && valueFlags[arg] && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		} else {
+			// Non-flag argument (path)
+			positional = append(positional, arg)
+		}
+	}
+
+	// Return flags first, then positional args
+	return append(flags, positional...)
+}
+
+// isDuplicateSession checks if a session with the same title AND path already exists.
+// Returns (isDuplicate, existingInstance)
+// Paths are normalized by removing trailing slashes for comparison.
+func isDuplicateSession(instances []*session.Instance, title, path string) (bool, *session.Instance) {
+	// Normalize path by removing trailing slash (except for root "/")
+	normalizedPath := strings.TrimSuffix(path, "/")
+	if normalizedPath == "" {
+		normalizedPath = "/"
+	}
+
+	for _, inst := range instances {
+		// Normalize existing path for comparison
+		existingPath := strings.TrimSuffix(inst.ProjectPath, "/")
+		if existingPath == "" {
+			existingPath = "/"
+		}
+
+		if existingPath == normalizedPath && inst.Title == title {
+			return true, inst
+		}
+	}
+	return false, nil
+}
+
+// generateUniqueTitle generates a unique title for sessions at the same path.
+// If "project" exists at path, returns "project (2)", then "project (3)", etc.
+func generateUniqueTitle(instances []*session.Instance, baseTitle, path string) string {
+	// Check if base title is available at this path
+	titleExists := func(title string) bool {
+		for _, inst := range instances {
+			if inst.ProjectPath == path && inst.Title == title {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !titleExists(baseTitle) {
+		return baseTitle
+	}
+
+	// Find next available number
+	for i := 2; i <= 100; i++ { // Cap at 100 to prevent infinite loop
+		candidate := fmt.Sprintf("%s (%d)", baseTitle, i)
+		if !titleExists(candidate) {
+			return candidate
+		}
+	}
+
+	// Fallback: use timestamp
+	return fmt.Sprintf("%s (%d)", baseTitle, time.Now().Unix())
+}
+
 // handleAdd adds a new session from CLI
 func handleAdd(profile string, args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
@@ -354,12 +455,18 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
 	}
 
+	// Reorder args: move path to end so flags are parsed correctly
+	// Go's flag package stops parsing at first non-flag argument
+	// This allows: "add . -c claude" to work same as "add -c claude ."
+	args = reorderArgsForFlagParsing(args)
+
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
 
 	// Get path argument (defaults to current directory)
 	// Fix: sanitize input to remove surrounding quotes that cause issues
+	// Users sometimes pass paths like '"/path/with spaces"' which stores literal quotes
 	path := strings.Trim(fs.Arg(0), "'\"")
 	if path == "" || path == "." {
 		var err error
@@ -430,10 +537,16 @@ func handleAdd(profile string, args []string) {
 		sessionGroup = parentInstance.GroupPath
 	}
 
-	// Check for duplicate (same path)
-	for _, inst := range instances {
-		if inst.ProjectPath == path {
-			fmt.Printf("Session already exists: %s (%s)\n", inst.Title, inst.ID)
+	// Track if user provided explicit title or we auto-generated from folder name
+	userProvidedTitle := (mergeFlags(*title, *titleShort) != "")
+
+	if !userProvidedTitle {
+		// User didn't provide title - auto-generate unique title for this path
+		sessionTitle = generateUniqueTitle(instances, sessionTitle, path)
+	} else {
+		// User provided explicit title - check for exact duplicate (same title AND path)
+		if isDupe, existingInst := isDuplicateSession(instances, sessionTitle, path); isDupe {
+			fmt.Printf("Session already exists with same title and path: %s (%s)\n", existingInst.Title, existingInst.ID)
 			os.Exit(0)
 		}
 	}
@@ -509,6 +622,12 @@ func handleAdd(profile string, args []string) {
 	if parentInstance != nil {
 		fmt.Printf("  Parent:  %s (%s)\n", parentInstance.Title, parentInstance.ID[:8])
 	}
+
+	// Show helpful next steps
+	fmt.Println()
+	fmt.Println("Next steps:")
+	fmt.Printf("  agent-deck session start %s   # Start the session\n", sessionTitle)
+	fmt.Printf("  agent-deck                         # Open TUI and press Enter to attach\n")
 }
 
 // handleList lists all sessions
@@ -1045,12 +1164,11 @@ func handleProfileSetDefault(name string) {
 func handleUpdate(args []string) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	checkOnly := fs.Bool("check", false, "Only check for updates, don't install")
-	forceCheck := fs.Bool("force", false, "Force check (ignore cache)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck update [options]")
 		fmt.Println()
-		fmt.Println("Check for and install updates.")
+		fmt.Println("Check for and install updates (always checks GitHub for latest).")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -1067,7 +1185,9 @@ func handleUpdate(args []string) {
 	fmt.Printf("Agent Deck v%s\n", Version)
 	fmt.Println("Checking for updates...")
 
-	info, err := update.CheckForUpdate(Version, *forceCheck)
+	// Always force check when user explicitly runs 'update' command
+	// Cache is only useful for background checks (TUI startup), not explicit requests
+	info, err := update.CheckForUpdate(Version, true)
 	if err != nil {
 		fmt.Printf("Error checking for updates: %v\n", err)
 		os.Exit(1)
@@ -1126,6 +1246,7 @@ func printHelp() {
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
+	fmt.Println("  uninstall        Uninstall Agent Deck")
 	fmt.Println("  version          Show version")
 	fmt.Println("  help             Show this help")
 	fmt.Println()
@@ -1303,4 +1424,377 @@ func releaseLock(profile string) {
 			os.Remove(lockPath)
 		}
 	}
+}
+
+// handleUninstall removes agent-deck from the system
+func handleUninstall(args []string) {
+	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
+	keepData := fs.Bool("keep-data", false, "Keep ~/.agent-deck/ (sessions, config, logs)")
+	keepTmuxConfig := fs.Bool("keep-tmux-config", false, "Keep tmux configuration")
+	dryRun := fs.Bool("dry-run", false, "Show what would be removed without removing")
+	yes := fs.Bool("y", false, "Skip confirmation prompts")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck uninstall [options]")
+		fmt.Println()
+		fmt.Println("Uninstall Agent Deck from your system.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fmt.Println("  --dry-run           Show what would be removed without removing")
+		fmt.Println("  --keep-data         Keep ~/.agent-deck/ (sessions, config, logs)")
+		fmt.Println("  --keep-tmux-config  Keep tmux configuration")
+		fmt.Println("  -y                  Skip confirmation prompts")
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck uninstall              # Interactive uninstall")
+		fmt.Println("  agent-deck uninstall --dry-run    # Preview what would be removed")
+		fmt.Println("  agent-deck uninstall --keep-data  # Remove binary only, keep sessions")
+		fmt.Println("  agent-deck uninstall -y           # Uninstall without prompts")
+	}
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	fmt.Println("╔════════════════════════════════════════╗")
+	fmt.Println("║       Agent Deck Uninstaller           ║")
+	fmt.Println("╚════════════════════════════════════════╝")
+	fmt.Println()
+
+	if *dryRun {
+		fmt.Println("DRY RUN MODE - Nothing will be removed")
+		fmt.Println()
+	}
+
+	homeDir, _ := os.UserHomeDir()
+	dataDir := filepath.Join(homeDir, ".agent-deck")
+
+	// Track what we find
+	type foundItem struct {
+		itemType    string
+		path        string
+		description string
+	}
+	var foundItems []foundItem
+
+	// Check for Homebrew installation
+	homebrewInstalled := false
+	if _, err := exec.LookPath("brew"); err == nil {
+		cmd := exec.Command("brew", "list", "agent-deck")
+		if cmd.Run() == nil {
+			homebrewInstalled = true
+			foundItems = append(foundItems, foundItem{"homebrew", "", "Homebrew package: agent-deck"})
+			fmt.Println("Found: Homebrew installation")
+		}
+	}
+
+	// Check common binary locations
+	binaryLocations := []string{
+		filepath.Join(homeDir, ".local", "bin", "agent-deck"),
+		"/usr/local/bin/agent-deck",
+		filepath.Join(homeDir, "bin", "agent-deck"),
+	}
+
+	for _, loc := range binaryLocations {
+		info, err := os.Lstat(loc)
+		if err != nil {
+			continue
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, _ := os.Readlink(loc)
+			foundItems = append(foundItems, foundItem{"binary-symlink", loc, fmt.Sprintf("Binary (symlink) → %s", target)})
+			fmt.Printf("Found: Binary (symlink) at %s\n", loc)
+			fmt.Printf("       → %s\n", target)
+		} else {
+			foundItems = append(foundItems, foundItem{"binary", loc, "Binary"})
+			fmt.Printf("Found: Binary at %s\n", loc)
+		}
+	}
+
+	// Check for data directory
+	if info, err := os.Stat(dataDir); err == nil && info.IsDir() {
+		// Count sessions and profiles
+		sessionCount := 0
+		profileCount := 0
+		profilesDir := filepath.Join(dataDir, "profiles")
+		if entries, err := os.ReadDir(profilesDir); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					profileCount++
+					sessionsFile := filepath.Join(profilesDir, entry.Name(), "sessions.json")
+					if data, err := os.ReadFile(sessionsFile); err == nil {
+						sessionCount += strings.Count(string(data), `"id"`)
+					}
+				}
+			}
+		}
+
+		// Get total size
+		var totalSize int64
+		filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() {
+				totalSize += info.Size()
+			}
+			return nil
+		})
+		sizeStr := formatSize(totalSize)
+
+		foundItems = append(foundItems, foundItem{"data", dataDir, fmt.Sprintf("%d profiles, %d sessions, %s", profileCount, sessionCount, sizeStr)})
+		fmt.Printf("Found: Data directory at %s\n", dataDir)
+		fmt.Printf("       %d profiles, %d sessions, %s\n", profileCount, sessionCount, sizeStr)
+	}
+
+	// Check for tmux config
+	tmuxConf := filepath.Join(homeDir, ".tmux.conf")
+	if data, err := os.ReadFile(tmuxConf); err == nil {
+		if strings.Contains(string(data), "# agent-deck configuration") {
+			foundItems = append(foundItems, foundItem{"tmux", tmuxConf, "tmux configuration block"})
+			fmt.Println("Found: tmux configuration in ~/.tmux.conf")
+		}
+	}
+
+	fmt.Println()
+
+	// Nothing found?
+	if len(foundItems) == 0 {
+		fmt.Println("Agent Deck does not appear to be installed.")
+		fmt.Println()
+		fmt.Println("Checked locations:")
+		for _, loc := range binaryLocations {
+			fmt.Printf("  - %s\n", loc)
+		}
+		fmt.Printf("  - %s\n", dataDir)
+		fmt.Printf("  - %s (for agent-deck config)\n", tmuxConf)
+		return
+	}
+
+	// Summary of what will be removed
+	fmt.Println("The following will be removed:")
+	fmt.Println()
+
+	for _, item := range foundItems {
+		switch item.itemType {
+		case "homebrew":
+			fmt.Println("  • Homebrew package: agent-deck")
+		case "binary", "binary-symlink":
+			fmt.Printf("  • Binary: %s\n", item.path)
+		case "data":
+			if *keepData {
+				fmt.Printf("  ○ Data directory: %s (keeping)\n", item.path)
+			} else {
+				fmt.Printf("  • Data directory: %s\n", item.path)
+				fmt.Println("    Including: sessions, logs, config")
+			}
+		case "tmux":
+			if *keepTmuxConfig {
+				fmt.Println("  ○ tmux config: ~/.tmux.conf (keeping)")
+			} else {
+				fmt.Println("  • tmux config block in ~/.tmux.conf")
+			}
+		}
+	}
+
+	fmt.Println()
+
+	// Confirm unless -y flag
+	if !*yes && !*dryRun {
+		fmt.Print("Proceed with uninstall? [y/N] ")
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(response) != "y" {
+			fmt.Println("Uninstall cancelled.")
+			return
+		}
+		fmt.Println()
+	}
+
+	// Dry run stops here
+	if *dryRun {
+		fmt.Println("Dry run complete. No changes made.")
+		return
+	}
+
+	fmt.Println("Uninstalling...")
+	fmt.Println()
+
+	// Track the current binary path for self-deletion at the end
+	currentBinary, _ := os.Executable()
+	currentBinary, _ = filepath.EvalSymlinks(currentBinary)
+
+	// 1. Homebrew
+	if homebrewInstalled {
+		fmt.Println("Removing Homebrew package...")
+		cmd := exec.Command("brew", "uninstall", "agent-deck")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("Warning: failed to uninstall via Homebrew: %v\n", err)
+		} else {
+			fmt.Println("✓ Homebrew package removed")
+		}
+	}
+
+	// 2. Binary files
+	for _, item := range foundItems {
+		if item.itemType != "binary" && item.itemType != "binary-symlink" {
+			continue
+		}
+
+		fmt.Printf("Removing binary at %s...\n", item.path)
+
+		// Resolve symlink to check if it points to current binary
+		realPath, _ := filepath.EvalSymlinks(item.path)
+
+		// Check if we need sudo
+		dir := filepath.Dir(item.path)
+		testFile := filepath.Join(dir, ".agent-deck-write-test")
+		if f, err := os.Create(testFile); err != nil {
+			// Need elevated permissions
+			fmt.Printf("Requires sudo to remove %s\n", item.path)
+			cmd := exec.Command("sudo", "rm", "-f", item.path)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Printf("Warning: failed to remove %s: %v\n", item.path, err)
+			} else {
+				fmt.Printf("✓ Binary removed: %s\n", item.path)
+			}
+		} else {
+			f.Close()
+			os.Remove(testFile)
+
+			// Skip if this is our own binary (delete last)
+			if realPath == currentBinary {
+				continue
+			}
+
+			if err := os.Remove(item.path); err != nil {
+				fmt.Printf("Warning: failed to remove %s: %v\n", item.path, err)
+			} else {
+				fmt.Printf("✓ Binary removed: %s\n", item.path)
+			}
+		}
+	}
+
+	// 3. tmux config
+	if !*keepTmuxConfig {
+		for _, item := range foundItems {
+			if item.itemType != "tmux" {
+				continue
+			}
+
+			fmt.Println("Removing tmux configuration...")
+
+			data, err := os.ReadFile(tmuxConf)
+			if err != nil {
+				fmt.Printf("Warning: failed to read tmux config: %v\n", err)
+				continue
+			}
+
+			// Create backup
+			backupPath := tmuxConf + ".bak.agentdeck-uninstall"
+			if err := os.WriteFile(backupPath, data, 0644); err != nil {
+				fmt.Printf("Warning: failed to create backup: %v\n", err)
+			}
+
+			// Remove the agent-deck config block
+			content := string(data)
+			startMarker := "# agent-deck configuration"
+			endMarker := "# End agent-deck configuration"
+
+			startIdx := strings.Index(content, startMarker)
+			endIdx := strings.Index(content, endMarker)
+
+			if startIdx != -1 && endIdx != -1 {
+				// Include the end marker line in removal
+				endIdx += len(endMarker)
+				// Also remove trailing newline
+				if endIdx < len(content) && content[endIdx] == '\n' {
+					endIdx++
+				}
+
+				newContent := content[:startIdx] + content[endIdx:]
+				// Clean up multiple blank lines
+				for strings.Contains(newContent, "\n\n\n") {
+					newContent = strings.ReplaceAll(newContent, "\n\n\n", "\n\n")
+				}
+				newContent = strings.TrimRight(newContent, "\n") + "\n"
+
+				if err := os.WriteFile(tmuxConf, []byte(newContent), 0644); err != nil {
+					fmt.Printf("Warning: failed to update tmux config: %v\n", err)
+				} else {
+					fmt.Printf("✓ tmux configuration removed (backup: %s)\n", backupPath)
+				}
+			}
+		}
+	}
+
+	// 4. Data directory
+	if !*keepData {
+		for _, item := range foundItems {
+			if item.itemType != "data" {
+				continue
+			}
+
+			// Offer backup unless -y flag
+			if !*yes {
+				fmt.Print("Create backup of data before removing? [Y/n] ")
+				var response string
+				fmt.Scanln(&response)
+				if strings.ToLower(response) != "n" {
+					backupFile := filepath.Join(homeDir, fmt.Sprintf("agent-deck-backup-%s.tar.gz", time.Now().Format("20060102-150405")))
+					fmt.Printf("Creating backup at %s...\n", backupFile)
+
+					cmd := exec.Command("tar", "-czf", backupFile, "-C", homeDir, ".agent-deck")
+					if err := cmd.Run(); err != nil {
+						fmt.Printf("Warning: failed to create backup: %v\n", err)
+					} else {
+						fmt.Printf("✓ Backup created: %s\n", backupFile)
+					}
+				}
+			}
+
+			fmt.Println("Removing data directory...")
+			if err := os.RemoveAll(dataDir); err != nil {
+				fmt.Printf("Warning: failed to remove data directory: %v\n", err)
+			} else {
+				fmt.Printf("✓ Data directory removed: %s\n", dataDir)
+			}
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("╔════════════════════════════════════════╗")
+	fmt.Println("║     Uninstall complete!                ║")
+	fmt.Println("╚════════════════════════════════════════╝")
+	fmt.Println()
+
+	if *keepData {
+		fmt.Printf("Note: Data directory preserved at %s\n", dataDir)
+		fmt.Println("      Remove manually with: rm -rf ~/.agent-deck")
+	}
+
+	if *keepTmuxConfig {
+		fmt.Println("Note: tmux config preserved in ~/.tmux.conf")
+		fmt.Println("      Remove the '# agent-deck configuration' block manually if desired")
+	}
+
+	fmt.Println()
+	fmt.Println("Thank you for using Agent Deck!")
+	fmt.Println("Feedback: https://github.com/asheshgoplani/agent-deck/issues")
+}
+
+// formatSize formats bytes into human-readable size
+func formatSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }

@@ -228,6 +228,29 @@ func GetClaudeConfigDir() string {
 	return filepath.Join(home, ".claude")
 }
 
+// IsClaudeConfigDirExplicit returns true if the Claude config directory is
+// explicitly configured (via CLAUDE_CONFIG_DIR env var or config.toml setting).
+// When false, the user is using the default path and we should NOT override
+// CLAUDE_CONFIG_DIR in commands, allowing the shell's environment to be respected.
+//
+// This is critical for WSL and other environments where users may have
+// CLAUDE_CONFIG_DIR set in their .bashrc/.zshrc - agent-deck should not
+// override that with a hardcoded default path.
+func IsClaudeConfigDirExplicit() bool {
+	// Check env var
+	if os.Getenv("CLAUDE_CONFIG_DIR") != "" {
+		return true
+	}
+
+	// Check user config
+	userConfig, _ := LoadUserConfig()
+	if userConfig != nil && userConfig.Claude.ConfigDir != "" {
+		return true
+	}
+
+	return false
+}
+
 // GetClaudeSessionID returns the ACTIVE session ID for a project path
 // It first tries to find the currently running session by checking recently
 // modified .jsonl files, then falls back to lastSessionId from config

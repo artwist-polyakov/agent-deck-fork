@@ -681,3 +681,208 @@ func TestGetParentPath(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractGroupName(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"root", "root"},
+		{"parent/child", "child"},
+		{"a/b/c", "c"},
+		{"", ""},
+		{"my-sessions", "my-sessions"},
+		{"ard/innotrade", "innotrade"},
+	}
+
+	for _, tt := range tests {
+		result := extractGroupName(tt.path)
+		if result != tt.expected {
+			t.Errorf("extractGroupName(%s) = %s, want %s", tt.path, result, tt.expected)
+		}
+	}
+}
+
+func TestNewGroupTreeWithHierarchicalPath(t *testing.T) {
+	// Simulate session created with hierarchical group path
+	instances := []*Instance{
+		{ID: "1", Title: "session-1", GroupPath: "parent/child"},
+	}
+
+	tree := NewGroupTree(instances)
+
+	// Group should exist with correct name
+	group := tree.Groups["parent/child"]
+	if group == nil {
+		t.Fatal("parent/child group not found")
+	}
+
+	// Name should be just "child", not "parent/child"
+	if group.Name != "child" {
+		t.Errorf("Expected name 'child', got '%s'", group.Name)
+	}
+
+	// Path should be full path
+	if group.Path != "parent/child" {
+		t.Errorf("Expected path 'parent/child', got '%s'", group.Path)
+	}
+}
+
+func TestNewGroupTreeWithGroupsHierarchicalPath(t *testing.T) {
+	// Session has hierarchical group path not in stored groups
+	instances := []*Instance{
+		{ID: "1", Title: "session-1", GroupPath: "ard/innotrade"},
+	}
+
+	// Stored groups don't include the new hierarchical group
+	storedGroups := []*GroupData{
+		{Name: "ard", Path: "ard", Expanded: true, Order: 0},
+	}
+
+	tree := NewGroupTreeWithGroups(instances, storedGroups)
+
+	// New group should be auto-created with correct name
+	group := tree.Groups["ard/innotrade"]
+	if group == nil {
+		t.Fatal("ard/innotrade group not found")
+	}
+
+	// Name should be just "innotrade", not "ard/innotrade"
+	if group.Name != "innotrade" {
+		t.Errorf("Expected name 'innotrade', got '%s'", group.Name)
+	}
+}
+
+func TestAddSessionWithHierarchicalPath(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Create parent group first
+	tree.CreateGroup("parent")
+
+	// Add session with hierarchical path
+	inst := &Instance{ID: "1", Title: "session-1", GroupPath: "parent/child"}
+	tree.AddSession(inst)
+
+	// New group should be auto-created with correct name
+	group := tree.Groups["parent/child"]
+	if group == nil {
+		t.Fatal("parent/child group not found")
+	}
+
+	// Name should be just "child", not "parent/child"
+	if group.Name != "child" {
+		t.Errorf("Expected name 'child', got '%s'", group.Name)
+	}
+
+	// Session should be in the group
+	if len(group.Sessions) != 1 {
+		t.Errorf("Expected 1 session, got %d", len(group.Sessions))
+	}
+}
+
+func TestSyncWithInstancesHierarchicalPath(t *testing.T) {
+	// Start with empty tree
+	tree := NewGroupTree([]*Instance{})
+
+	// Sync with instances that have hierarchical paths
+	instances := []*Instance{
+		{ID: "1", Title: "session-1", GroupPath: "projects/backend"},
+	}
+	tree.SyncWithInstances(instances)
+
+	// Group should be created with correct name
+	group := tree.Groups["projects/backend"]
+	if group == nil {
+		t.Fatal("projects/backend group not found")
+	}
+
+	// Name should be just "backend", not "projects/backend"
+	if group.Name != "backend" {
+		t.Errorf("Expected name 'backend', got '%s'", group.Name)
+	}
+}
+
+func TestEnsureParentGroupsExist(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Call internal function to ensure parents exist
+	tree.ensureParentGroupsExist("a/b/c")
+
+	// All parent groups should exist
+	if tree.Groups["a"] == nil {
+		t.Error("Parent group 'a' should exist")
+	}
+	if tree.Groups["a/b"] == nil {
+		t.Error("Parent group 'a/b' should exist")
+	}
+	// Note: "a/b/c" itself is NOT created by this function
+
+	// Names should be correct
+	if tree.Groups["a"].Name != "a" {
+		t.Errorf("Expected name 'a', got '%s'", tree.Groups["a"].Name)
+	}
+	if tree.Groups["a/b"].Name != "b" {
+		t.Errorf("Expected name 'b', got '%s'", tree.Groups["a/b"].Name)
+	}
+}
+
+func TestEnsureParentGroupsExistRootLevel(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// For root-level paths, no parents needed
+	tree.ensureParentGroupsExist("root")
+
+	// No groups should be created
+	if len(tree.Groups) != 0 {
+		t.Errorf("Expected 0 groups for root-level path, got %d", len(tree.Groups))
+	}
+}
+
+func TestEnsureParentGroupsExistIdempotent(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Create parent group first
+	tree.CreateGroup("existing")
+
+	// Call ensureParentGroupsExist with a child path
+	tree.ensureParentGroupsExist("existing/child")
+
+	// Parent should still exist with original name (not overwritten)
+	if tree.Groups["existing"] == nil {
+		t.Error("Parent group 'existing' should still exist")
+	}
+	if tree.Groups["existing"].Name != "existing" {
+		t.Errorf("Expected name 'existing', got '%s'", tree.Groups["existing"].Name)
+	}
+}
+
+func TestNewGroupTreeAutoCreatesParents(t *testing.T) {
+	// Session with deep hierarchical path - parents don't exist
+	instances := []*Instance{
+		{ID: "1", Title: "session-1", GroupPath: "projects/backend/api"},
+	}
+
+	tree := NewGroupTree(instances)
+
+	// All groups should exist
+	if tree.Groups["projects"] == nil {
+		t.Error("Parent group 'projects' should be auto-created")
+	}
+	if tree.Groups["projects/backend"] == nil {
+		t.Error("Parent group 'projects/backend' should be auto-created")
+	}
+	if tree.Groups["projects/backend/api"] == nil {
+		t.Error("Group 'projects/backend/api' should exist")
+	}
+
+	// Names should be correct
+	if tree.Groups["projects"].Name != "projects" {
+		t.Errorf("Expected name 'projects', got '%s'", tree.Groups["projects"].Name)
+	}
+	if tree.Groups["projects/backend"].Name != "backend" {
+		t.Errorf("Expected name 'backend', got '%s'", tree.Groups["projects/backend"].Name)
+	}
+	if tree.Groups["projects/backend/api"].Name != "api" {
+		t.Errorf("Expected name 'api', got '%s'", tree.Groups["projects/backend/api"].Name)
+	}
+}

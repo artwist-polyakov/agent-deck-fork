@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -373,5 +375,298 @@ func TestHomeGlobalSearchEscape(t *testing.T) {
 	}
 	if h.globalSearch.IsVisible() {
 		t.Error("Global search should be hidden after pressing Escape")
+	}
+}
+
+func TestGetLayoutMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		width    int
+		expected string
+	}{
+		{"narrow phone", 45, "single"},
+		{"phone landscape", 65, "stacked"},
+		{"tablet", 85, "dual"},
+		{"desktop", 120, "dual"},
+		{"exact boundary 50", 50, "stacked"},
+		{"exact boundary 80", 80, "dual"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := NewHome()
+			home.width = tt.width
+			got := home.getLayoutMode()
+			if got != tt.expected {
+				t.Errorf("getLayoutMode() at width %d = %q, want %q", tt.width, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRenderHelpBarTiny(t *testing.T) {
+	home := NewHome()
+	home.width = 45 // Tiny mode (<50 cols)
+	home.height = 30
+
+	result := home.renderHelpBar()
+
+	// Should contain minimal hint
+	if !strings.Contains(result, "?") {
+		t.Error("Tiny help bar should contain ? for help")
+	}
+	// Should NOT contain full shortcuts
+	if strings.Contains(result, "Attach") {
+		t.Error("Tiny help bar should not contain 'Attach'")
+	}
+	if strings.Contains(result, "Global") {
+		t.Error("Tiny help bar should not contain 'Global'")
+	}
+}
+
+func TestRenderHelpBarMinimal(t *testing.T) {
+	home := NewHome()
+	home.width = 55 // Minimal mode (50-69)
+	home.height = 30
+
+	result := home.renderHelpBar()
+
+	// Should contain key-only hints
+	if !strings.Contains(result, "?") {
+		t.Error("Minimal help bar should contain ?")
+	}
+	if !strings.Contains(result, "q") {
+		t.Error("Minimal help bar should contain q")
+	}
+	// Should NOT contain full descriptions
+	if strings.Contains(result, "Attach") {
+		t.Error("Minimal help bar should not contain full descriptions")
+	}
+}
+
+func TestRenderHelpBarMinimalWithSession(t *testing.T) {
+	home := NewHome()
+	home.width = 55 // Minimal mode (50-69)
+	home.height = 30
+
+	// Add a session to test context-specific keys
+	testSession := &session.Instance{
+		ID:    "test-123",
+		Title: "Test Session",
+		Tool:  "claude",
+	}
+	home.flatItems = []session.Item{
+		{Type: session.ItemTypeSession, Session: testSession},
+	}
+	home.cursor = 0
+
+	result := home.renderHelpBar()
+
+	// Should contain key indicators
+	if !strings.Contains(result, "n") {
+		t.Error("Minimal help bar should contain n key")
+	}
+	if !strings.Contains(result, "R") {
+		t.Error("Minimal help bar should contain R key for restart")
+	}
+	// Should NOT contain full descriptions
+	if strings.Contains(result, "Attach") {
+		t.Error("Minimal help bar should not contain full descriptions")
+	}
+}
+
+func TestRenderHelpBarCompact(t *testing.T) {
+	home := NewHome()
+	home.width = 85 // Compact mode (70-99)
+	home.height = 30
+
+	result := home.renderHelpBar()
+
+	// Should contain abbreviated hints
+	if !strings.Contains(result, "?") {
+		t.Error("Compact help bar should contain ?")
+	}
+	// Should contain some descriptions but abbreviated
+	if strings.Contains(result, "Global") {
+		t.Error("Compact help bar should not contain 'Global'")
+	}
+}
+
+func TestRenderHelpBarCompactWithSession(t *testing.T) {
+	home := NewHome()
+	home.width = 85 // Compact mode (70-99)
+	home.height = 30
+
+	// Add a session with fork capability
+	// ClaudeDetectedAt must be recent for CanFork() to return true
+	testSession := &session.Instance{
+		ID:               "test-123",
+		Title:            "Test Session",
+		Tool:             "claude",
+		ClaudeSessionID:  "session-abc",
+		ClaudeDetectedAt: time.Now(), // Must be recent for CanFork()
+	}
+	home.flatItems = []session.Item{
+		{Type: session.ItemTypeSession, Session: testSession},
+	}
+	home.cursor = 0
+
+	result := home.renderHelpBar()
+
+	// Should have abbreviated descriptions
+	if !strings.Contains(result, "New") {
+		t.Error("Compact help bar should contain 'New'")
+	}
+	if !strings.Contains(result, "Restart") {
+		t.Error("Compact help bar should contain 'Restart'")
+	}
+	// Should have fork since session can fork
+	if !strings.Contains(result, "Fork") {
+		t.Error("Compact help bar should contain 'Fork' for forkable session")
+	}
+	// Should NOT contain full verbose text
+	if strings.Contains(result, "Global") {
+		t.Error("Compact help bar should not contain 'Global'")
+	}
+}
+
+func TestRenderHelpBarCompactWithGroup(t *testing.T) {
+	home := NewHome()
+	home.width = 85 // Compact mode (70-99)
+	home.height = 30
+
+	// Add a group
+	home.flatItems = []session.Item{
+		{Type: session.ItemTypeGroup, Path: "test-group", Level: 0},
+	}
+	home.cursor = 0
+
+	result := home.renderHelpBar()
+
+	// Should have toggle hint for groups
+	if !strings.Contains(result, "Toggle") {
+		t.Error("Compact help bar should contain 'Toggle' for groups")
+	}
+}
+
+func TestHomeViewNarrowTerminal(t *testing.T) {
+	tests := []struct {
+		name          string
+		width, height int
+		shouldRender  bool
+	}{
+		{"too narrow", 35, 20, false},
+		{"minimum width", 40, 12, true},
+		{"narrow but ok", 50, 15, true},
+		{"issue #2 case", 79, 70, true},
+		{"normal", 100, 30, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := NewHome()
+			home.width = tt.width
+			home.height = tt.height
+
+			view := home.View()
+
+			if tt.shouldRender {
+				if strings.Contains(view, "Terminal too small") {
+					t.Errorf("width=%d height=%d should render, got 'too small' message", tt.width, tt.height)
+				}
+			} else {
+				if !strings.Contains(view, "Terminal too small") {
+					t.Errorf("width=%d height=%d should show 'too small', got normal render", tt.width, tt.height)
+				}
+			}
+		})
+	}
+}
+
+func TestHomeViewStackedLayout(t *testing.T) {
+	home := NewHome()
+	home.width = 65 // Stacked mode (50-79)
+	home.height = 40
+	home.initialLoading = false
+
+	// Add a test session so we have content
+	inst := &session.Instance{ID: "test1", Title: "Test Session", Tool: "claude", Status: session.StatusIdle}
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instancesMu.Unlock()
+	home.groupTree = session.NewGroupTree(home.instances)
+	home.rebuildFlatItems()
+
+	view := home.View()
+
+	// In stacked mode, we should NOT see side-by-side separator
+	// The view should render without panicking
+	if view == "" {
+		t.Error("View should not be empty")
+	}
+	if strings.Contains(view, "Terminal too small") {
+		t.Error("65-col terminal should not show 'too small' error")
+	}
+}
+
+func TestHomeViewSingleColumnLayout(t *testing.T) {
+	home := NewHome()
+	home.width = 45 // Single column mode (<50)
+	home.height = 30
+	home.initialLoading = false
+
+	// Add a test session
+	inst := &session.Instance{ID: "test1", Title: "Test Session", Tool: "claude", Status: session.StatusIdle}
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instancesMu.Unlock()
+	home.groupTree = session.NewGroupTree(home.instances)
+	home.rebuildFlatItems()
+
+	view := home.View()
+
+	// In single column mode, should show list only (no preview)
+	if view == "" {
+		t.Error("View should not be empty")
+	}
+	if strings.Contains(view, "Terminal too small") {
+		t.Error("45-col terminal should not show 'too small' error")
+	}
+}
+
+func TestHomeViewAllLayoutModes(t *testing.T) {
+	testCases := []struct {
+		name       string
+		width      int
+		height     int
+		layoutMode string
+	}{
+		{"single column", 45, 30, "single"},
+		{"stacked", 65, 40, "stacked"},
+		{"dual column", 100, 40, "dual"},
+		{"issue #2 exact", 79, 70, "stacked"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := NewHome()
+			home.width = tc.width
+			home.height = tc.height
+			home.initialLoading = false
+
+			// Verify layout mode detection
+			if got := home.getLayoutMode(); got != tc.layoutMode {
+				t.Errorf("getLayoutMode() = %q, want %q", got, tc.layoutMode)
+			}
+
+			// Verify view renders without error
+			view := home.View()
+			if view == "" {
+				t.Error("View should not be empty")
+			}
+			if strings.Contains(view, "Terminal too small") {
+				t.Errorf("Terminal %dx%d should render, got 'too small'", tc.width, tc.height)
+			}
+		})
 	}
 }

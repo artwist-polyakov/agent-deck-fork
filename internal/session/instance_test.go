@@ -1,6 +1,7 @@
 package session
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -93,6 +94,20 @@ func TestInstance_UpdateClaudeSession(t *testing.T) {
 
 // TestInstance_Fork tests the Fork method
 func TestInstance_Fork(t *testing.T) {
+	// Isolate from user's environment to ensure CLAUDE_CONFIG_DIR is NOT explicit
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir())
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
 	inst := NewInstance("test", "/tmp/test")
 
 	// Cannot fork without session ID
@@ -109,26 +124,62 @@ func TestInstance_Fork(t *testing.T) {
 		t.Errorf("Fork() failed: %v", err)
 	}
 
-	// Command should use capture-resume pattern with fork
-	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
-		t.Errorf("Fork() should set CLAUDE_CONFIG_DIR, got: %s", cmd)
+	// Command should use --session-id pattern (avoids capture-resume with "." prompt)
+	// When not explicitly configured, CLAUDE_CONFIG_DIR should NOT be set
+	// (allows shell environment to take precedence)
+	if strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
+		t.Errorf("Fork() should NOT set CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "--resume abc-123 --fork-session") {
-		t.Errorf("Fork() should include resume and fork-session flags for capture, got: %s", cmd)
+		t.Errorf("Fork() should include resume and fork-session flags, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, `--output-format json`) {
-		t.Errorf("Fork() should use --output-format json for capture, got: %s", cmd)
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork() should generate UUID with uuidgen, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
 		t.Errorf("Fork() should store session ID in tmux env, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Fork() should resume the captured session, got: %s", cmd)
+	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork() should pass session ID to claude CLI, got: %s", cmd)
+	}
+}
+
+// TestInstance_Fork_ExplicitConfig tests Fork with explicit CLAUDE_CONFIG_DIR
+func TestInstance_Fork_ExplicitConfig(t *testing.T) {
+	os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/test-claude-config")
+	defer os.Unsetenv("CLAUDE_CONFIG_DIR")
+
+	inst := NewInstance("test", "/tmp/test")
+	inst.ClaudeSessionID = "abc-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	cmd, err := inst.Fork("forked-test", "")
+	if err != nil {
+		t.Errorf("Fork() failed: %v", err)
+	}
+
+	// When explicitly configured, CLAUDE_CONFIG_DIR SHOULD be set
+	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=/tmp/test-claude-config") {
+		t.Errorf("Fork() should set CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
 	}
 }
 
 // TestInstance_CreateForkedInstance tests the CreateForkedInstance method
 func TestInstance_CreateForkedInstance(t *testing.T) {
+	// Isolate from user's environment to ensure CLAUDE_CONFIG_DIR is NOT explicit
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir())
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
 	inst := NewInstance("original", "/tmp/test")
 	inst.GroupPath = "projects"
 
@@ -146,9 +197,10 @@ func TestInstance_CreateForkedInstance(t *testing.T) {
 		t.Errorf("CreateForkedInstance() failed: %v", err)
 	}
 
-	// Verify command includes config dir and fork flags
-	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
-		t.Errorf("Command should set CLAUDE_CONFIG_DIR, got: %s", cmd)
+	// Verify command includes fork flags
+	// When not explicitly configured, CLAUDE_CONFIG_DIR should NOT be set
+	if strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
+		t.Errorf("Command should NOT set CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "--resume abc-123 --fork-session") {
 		t.Errorf("Command should include resume and fork flags, got: %s", cmd)
@@ -181,6 +233,26 @@ func TestInstance_CreateForkedInstance(t *testing.T) {
 	}
 }
 
+// TestInstance_CreateForkedInstance_ExplicitConfig tests CreateForkedInstance with explicit config
+func TestInstance_CreateForkedInstance_ExplicitConfig(t *testing.T) {
+	os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/test-claude-config")
+	defer os.Unsetenv("CLAUDE_CONFIG_DIR")
+
+	inst := NewInstance("original", "/tmp/test")
+	inst.ClaudeSessionID = "abc-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	_, cmd, err := inst.CreateForkedInstance("forked", "")
+	if err != nil {
+		t.Errorf("CreateForkedInstance() failed: %v", err)
+	}
+
+	// When explicitly configured, CLAUDE_CONFIG_DIR SHOULD be set
+	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=/tmp/test-claude-config") {
+		t.Errorf("Command should set CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
+	}
+}
+
 // TestNewInstanceWithTool tests that tools are set correctly without pre-assigned session IDs
 func TestNewInstanceWithTool(t *testing.T) {
 	// Shell tool should not have session ID (never will)
@@ -205,14 +277,31 @@ func TestNewInstanceWithTool(t *testing.T) {
 
 // TestBuildClaudeCommand tests that claude command is built with capture-resume pattern
 func TestBuildClaudeCommand(t *testing.T) {
+	// Isolate from user's environment to ensure CLAUDE_CONFIG_DIR is NOT explicit
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir()) // Use temp dir so config.toml isn't found
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
 	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
 
 	// Test with simple "claude" command
 	cmd := inst.buildClaudeCommand("claude")
 
-	// Should contain CLAUDE_CONFIG_DIR (appears twice: once for capture, once for resume)
-	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
-		t.Errorf("Should contain CLAUDE_CONFIG_DIR, got: %s", cmd)
+	// When CLAUDE_CONFIG_DIR is NOT explicitly configured (no env var, no config),
+	// the command should NOT include CLAUDE_CONFIG_DIR - let the shell handle it
+	// This is critical for WSL and other environments where users have
+	// CLAUDE_CONFIG_DIR set in their .bashrc/.zshrc
+	if strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
+		t.Errorf("Should NOT contain CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
 
 	// Should use capture-resume pattern: -p "." --output-format json
@@ -233,6 +322,19 @@ func TestBuildClaudeCommand(t *testing.T) {
 		t.Errorf("Should resume the captured session ID, got: %s", cmd)
 	}
 
+	// Should have fallback when capture fails (Issue #19: WSL jq parse error)
+	if !strings.Contains(cmd, `|| session_id=""`) {
+		t.Errorf("Should have fallback when capture fails, got: %s", cmd)
+	}
+	// Should check for null jq output
+	if !strings.Contains(cmd, `!= "null"`) {
+		t.Errorf("Should check for null session_id from jq, got: %s", cmd)
+	}
+	// Should have else branch to start Claude without session
+	if !strings.Contains(cmd, "else claude") {
+		t.Errorf("Should have else branch to start Claude without session, got: %s", cmd)
+	}
+
 	// Note: --dangerously-skip-permissions is conditional on user config (dangerous_mode)
 	// The command should work with or without it depending on config
 
@@ -244,9 +346,25 @@ func TestBuildClaudeCommand(t *testing.T) {
 	}
 }
 
-// TestCreateForkedInstance_CaptureResumePattern tests that forked sessions
-// use the capture-resume pattern to reliably get the new session ID
-func TestCreateForkedInstance_CaptureResumePattern(t *testing.T) {
+// TestBuildClaudeCommand_ExplicitConfig tests that CLAUDE_CONFIG_DIR is set when explicitly configured
+func TestBuildClaudeCommand_ExplicitConfig(t *testing.T) {
+	// Set environment variable to explicitly configure
+	os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/test-claude-config")
+	defer os.Unsetenv("CLAUDE_CONFIG_DIR")
+
+	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	// When CLAUDE_CONFIG_DIR IS explicitly configured via env var,
+	// the command SHOULD include it
+	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=/tmp/test-claude-config") {
+		t.Errorf("Should contain CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
+	}
+}
+
+// TestCreateForkedInstance_SessionIDPattern tests that forked sessions
+// use the --session-id pattern with pre-generated UUID (avoids "." prompt)
+func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 	inst := NewInstance("original", "/tmp/test")
 	inst.ClaudeSessionID = "parent-abc-123"
 	inst.ClaudeDetectedAt = time.Now()
@@ -256,12 +374,15 @@ func TestCreateForkedInstance_CaptureResumePattern(t *testing.T) {
 		t.Fatalf("CreateForkedInstance() failed: %v", err)
 	}
 
-	// Command SHOULD use capture-resume pattern
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Errorf("Fork command should use --output-format json for capture, got: %s", cmd)
+	// Command SHOULD use --session-id pattern (not capture-resume with ".")
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command should generate UUID with uuidgen, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "--resume parent-abc-123 --fork-session") {
 		t.Errorf("Fork command should contain --resume with parent ID and --fork-session, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("Fork command should use --session-id to specify UUID, got: %s", cmd)
 	}
 	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
 		t.Errorf("Fork command should store session ID in tmux env, got: %s", cmd)
@@ -586,6 +707,19 @@ func TestBuildGeminiCommand(t *testing.T) {
 		t.Error("Should resume captured session")
 	}
 
+	// Should have fallback when capture fails (Issue #19: WSL jq parse error)
+	if !strings.Contains(cmd, `|| session_id=""`) {
+		t.Error("Should have fallback when capture fails")
+	}
+	// Should check for null jq output
+	if !strings.Contains(cmd, `!= "null"`) {
+		t.Error("Should check for null session_id from jq")
+	}
+	// Should start Gemini even without session ID (fallback path)
+	if !strings.Contains(cmd, "else gemini; fi") {
+		t.Error("Should have else branch to start Gemini fresh")
+	}
+
 	// With session ID, should use simple resume
 	inst.GeminiSessionID = "abc-123-def"
 	cmd = inst.buildGeminiCommand("gemini")
@@ -775,4 +909,99 @@ func TestInstance_CanRestart_Gemini(t *testing.T) {
 	if !inst.CanRestart() {
 		t.Error("CanRestart() should work with stale session ID")
 	}
+}
+
+// TestInstance_Fork_PathWithSpaces tests that Fork() properly quotes paths with spaces
+// Issue #16: Fork command breaks for project paths with spaces
+func TestInstance_Fork_PathWithSpaces(t *testing.T) {
+	inst := &Instance{
+		ID:              "test-123",
+		Title:           "test-session",
+		ProjectPath:     "/tmp/Test Path With Spaces",
+		Tool:            "claude",
+		ClaudeSessionID: "session-abc-123",
+		ClaudeDetectedAt: time.Now(),
+	}
+
+	cmd, err := inst.Fork("forked-session", "")
+	if err != nil {
+		t.Fatalf("Fork() error = %v", err)
+	}
+
+	// The cd command should have quoted path
+	if !strings.Contains(cmd, `cd '/tmp/Test Path With Spaces'`) {
+		t.Errorf("Fork command should quote path with spaces using single quotes.\nGot: %s", cmd)
+	}
+
+	// Should NOT contain unquoted path that would break
+	if strings.Contains(cmd, "cd /tmp/Test Path With Spaces &&") {
+		t.Errorf("Fork command should not have unquoted path.\nGot: %s", cmd)
+	}
+}
+
+// TestInstance_Fork_RespectsDangerousMode tests that Fork() respects dangerous_mode config
+// Issue #8: Fork command ignores dangerous_mode configuration
+func TestInstance_Fork_RespectsDangerousMode(t *testing.T) {
+	inst := &Instance{
+		ID:              "test-456",
+		Title:           "test-session",
+		ProjectPath:     "/tmp/test",
+		Tool:            "claude",
+		ClaudeSessionID: "session-xyz-789",
+		ClaudeDetectedAt: time.Now(),
+	}
+
+	// Test with dangerous_mode = false
+	t.Run("dangerous_mode=false", func(t *testing.T) {
+		// Set up config with dangerous_mode = false
+		userConfigCacheMu.Lock()
+		userConfigCache = &UserConfig{
+			Claude: ClaudeSettings{
+				DangerousMode: false,
+			},
+		}
+		userConfigCacheMu.Unlock()
+		defer func() {
+			userConfigCacheMu.Lock()
+			userConfigCache = nil
+			userConfigCacheMu.Unlock()
+		}()
+
+		cmd, err := inst.Fork("forked", "")
+		if err != nil {
+			t.Fatalf("Fork() error = %v", err)
+		}
+
+		// Should NOT have --dangerously-skip-permissions when config is false
+		if strings.Contains(cmd, "--dangerously-skip-permissions") {
+			t.Errorf("Fork command should NOT include --dangerously-skip-permissions when dangerous_mode=false.\nGot: %s", cmd)
+		}
+	})
+
+	// Test with dangerous_mode = true
+	t.Run("dangerous_mode=true", func(t *testing.T) {
+		// Set up config with dangerous_mode = true
+		userConfigCacheMu.Lock()
+		userConfigCache = &UserConfig{
+			Claude: ClaudeSettings{
+				DangerousMode: true,
+			},
+		}
+		userConfigCacheMu.Unlock()
+		defer func() {
+			userConfigCacheMu.Lock()
+			userConfigCache = nil
+			userConfigCacheMu.Unlock()
+		}()
+
+		cmd, err := inst.Fork("forked", "")
+		if err != nil {
+			t.Fatalf("Fork() error = %v", err)
+		}
+
+		// SHOULD have --dangerously-skip-permissions when config is true
+		if !strings.Contains(cmd, "--dangerously-skip-permissions") {
+			t.Errorf("Fork command should include --dangerously-skip-permissions when dangerous_mode=true.\nGot: %s", cmd)
+		}
+	})
 }

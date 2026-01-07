@@ -92,6 +92,9 @@ func InitializeGlobalPool(ctx context.Context, config *UserConfig, sessions []*I
 
 	log.Printf("[Pool] Started %d socket proxies, reused %d from other instance", startedCount, skippedCount)
 
+	// Start health monitor for auto-restart of failed proxies
+	pool.StartHealthMonitor()
+
 	globalPool = pool
 	return pool, nil
 }
