@@ -327,11 +327,6 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 		if opts.UseChrome {
 			flags = append(flags, "--chrome")
 		}
-		if opts.AppendSystemPrompt != "" {
-			// Escape the prompt for shell
-			escaped := strings.ReplaceAll(opts.AppendSystemPrompt, "'", "'\"'\"'")
-			flags = append(flags, fmt.Sprintf("--append-system-prompt '%s'", escaped))
-		}
 	}
 
 	if len(flags) == 0 {

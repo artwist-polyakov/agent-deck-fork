@@ -2081,10 +2081,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Get Gemini YOLO mode from dialog
 		geminiYoloMode := h.newDialog.IsGeminiYoloMode()
 
-		// Get Claude options from dialog
-		claudeOpts := h.newDialog.GetClaudeOptions()
-
-		// Create session with worktree info and options
+		// Create session with worktree info and options (claudeOpts already obtained above)
 		return h, h.createSessionInGroupWithWorktreeAndOptions(name, path, command, groupPath, worktreePath, worktreeRepoRoot, branchName, geminiYoloMode, claudeOpts)
 
 	case "esc":
