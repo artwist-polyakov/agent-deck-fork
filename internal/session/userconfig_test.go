@@ -239,3 +239,102 @@ func TestGetTheme_Light(t *testing.T) {
 		t.Errorf("GetTheme: got %q, want %q", theme, "light")
 	}
 }
+
+func TestWorktreeConfig(t *testing.T) {
+	// Create temp config with worktree settings
+	tmpDir := t.TempDir()
+	configContent := `
+[worktree]
+default_location = "subdirectory"
+auto_cleanup = false
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	// Test parsing
+	var config UserConfig
+	_, err := toml.DecodeFile(configPath, &config)
+	if err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if config.Worktree.DefaultLocation != "subdirectory" {
+		t.Errorf("Expected DefaultLocation 'subdirectory', got %q", config.Worktree.DefaultLocation)
+	}
+	if config.Worktree.AutoCleanup {
+		t.Error("Expected AutoCleanup to be false")
+	}
+}
+
+func TestWorktreeConfigDefaults(t *testing.T) {
+	// Config without worktree section should parse with zero values
+	// (defaults are applied by GetWorktreeSettings, not parsing)
+	tmpDir := t.TempDir()
+	configContent := `default_tool = "claude"`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	_, err := toml.DecodeFile(configPath, &config)
+	if err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	// When parsing directly without GetWorktreeSettings, values should be zero
+	if config.Worktree.DefaultLocation != "" {
+		t.Errorf("Expected empty DefaultLocation (zero value), got %q", config.Worktree.DefaultLocation)
+	}
+	if config.Worktree.AutoCleanup {
+		t.Error("AutoCleanup should be false when not specified (zero value)")
+	}
+}
+
+func TestGetWorktreeSettings(t *testing.T) {
+	// Setup: use temp directory with no config
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	// With no config, should return defaults
+	settings := GetWorktreeSettings()
+	if settings.DefaultLocation != "sibling" {
+		t.Errorf("GetWorktreeSettings DefaultLocation: got %q, want %q", settings.DefaultLocation, "sibling")
+	}
+	if !settings.AutoCleanup {
+		t.Error("GetWorktreeSettings AutoCleanup: should default to true")
+	}
+}
+
+func TestGetWorktreeSettings_FromConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	// Create config with custom worktree settings
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+	config := &UserConfig{
+		Worktree: WorktreeSettings{
+			DefaultLocation: "subdirectory",
+			AutoCleanup:     false,
+		},
+	}
+	_ = SaveUserConfig(config)
+	ClearUserConfigCache()
+
+	settings := GetWorktreeSettings()
+	if settings.DefaultLocation != "subdirectory" {
+		t.Errorf("GetWorktreeSettings DefaultLocation: got %q, want %q", settings.DefaultLocation, "subdirectory")
+	}
+	if settings.AutoCleanup {
+		t.Error("GetWorktreeSettings AutoCleanup: should be false from config")
+	}
+}

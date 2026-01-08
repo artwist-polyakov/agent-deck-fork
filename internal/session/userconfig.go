@@ -36,6 +36,9 @@ type UserConfig struct {
 	// Claude defines Claude Code integration settings
 	Claude ClaudeSettings `toml:"claude"`
 
+	// Worktree defines git worktree preferences
+	Worktree WorktreeSettings `toml:"worktree"`
+
 	// GlobalSearch defines global conversation search settings
 	GlobalSearch GlobalSearchSettings `toml:"global_search"`
 
@@ -135,6 +138,14 @@ type ClaudeSettings struct {
 	DangerousMode bool `toml:"dangerous_mode"`
 }
 
+// WorktreeSettings contains git worktree preferences
+type WorktreeSettings struct {
+	// DefaultLocation: "sibling" (next to repo) or "subdirectory" (inside .worktrees/)
+	DefaultLocation string `toml:"default_location"`
+	// AutoCleanup: remove worktree when session is deleted
+	AutoCleanup bool `toml:"auto_cleanup"`
+}
+
 // GlobalSearchSettings defines global conversation search configuration
 type GlobalSearchSettings struct {
 	// Enabled enables/disables global search feature (default: true when loaded via LoadUserConfig)
@@ -194,6 +205,10 @@ type MCPDef struct {
 	// Transport specifies the MCP transport type: "stdio" (default), "http", or "sse"
 	// Only needed when URL is set; defaults to "http" if URL is present
 	Transport string `toml:"transport"`
+
+	// Headers is optional HTTP headers for HTTP/SSE MCPs (e.g., for authentication)
+	// Example: { Authorization = "Bearer token123" }
+	Headers map[string]string `toml:"headers"`
 }
 
 // Default user config (empty maps)
@@ -465,6 +480,31 @@ func GetLogSettings() LogSettings {
 	return settings
 }
 
+// GetWorktreeSettings returns worktree settings with defaults applied
+func GetWorktreeSettings() WorktreeSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return WorktreeSettings{
+			DefaultLocation: "sibling",
+			AutoCleanup:     true,
+		}
+	}
+
+	settings := config.Worktree
+
+	// Apply defaults for unset values
+	if settings.DefaultLocation == "" {
+		settings.DefaultLocation = "sibling"
+	}
+	// AutoCleanup defaults to true (Go zero value is false)
+	// We detect if section was not present by checking if DefaultLocation is empty
+	if config.Worktree.DefaultLocation == "" {
+		settings.AutoCleanup = true
+	}
+
+	return settings
+}
+
 // GetUpdateSettings returns update settings with defaults applied
 func GetUpdateSettings() UpdateSettings {
 	config, err := LoadUserConfig()
@@ -660,6 +700,13 @@ notify_in_cli = true
 # url = "http://localhost:8000/mcp"
 # transport = "http"
 # description = "My custom HTTP MCP server"
+
+# Example: HTTP MCP with authentication headers
+# [mcps.authenticated-api]
+# url = "https://api.example.com/mcp"
+# transport = "http"
+# headers = { Authorization = "Bearer your-token-here", "X-API-Key" = "your-api-key" }
+# description = "HTTP MCP with auth headers"
 
 # Example: SSE MCP server
 # [mcps.remote-sse]
