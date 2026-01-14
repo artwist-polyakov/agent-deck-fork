@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/asheshgoplani/agent-deck/internal/platform"
@@ -531,18 +530,6 @@ func GetUpdateSettings() UpdateSettings {
 	}
 
 	return settings
-}
-
-// GetSocketWaitTimeout returns the configured socket wait timeout (default 5 seconds)
-func GetSocketWaitTimeout() time.Duration {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil {
-		return 5 * time.Second // Default
-	}
-	if config.MCPPool.SocketWaitTimeout <= 0 {
-		return 5 * time.Second // Default
-	}
-	return time.Duration(config.MCPPool.SocketWaitTimeout) * time.Second
 }
 
 // getMCPPoolConfigSection returns the MCP pool config section based on platform
