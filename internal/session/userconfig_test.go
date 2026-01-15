@@ -364,7 +364,7 @@ show_analytics = false
 		t.Fatalf("Failed to decode: %v", err)
 	}
 
-	if !config.Preview.ShowOutput {
+	if config.Preview.ShowOutput == nil || !*config.Preview.ShowOutput {
 		t.Error("Expected Preview.ShowOutput to be true")
 	}
 	if config.Preview.ShowAnalytics == nil {
@@ -377,9 +377,9 @@ show_analytics = false
 func TestPreviewSettingsDefaults(t *testing.T) {
 	cfg := &UserConfig{}
 
-	// Default: output OFF, analytics ON
-	if cfg.GetShowOutput() {
-		t.Error("GetShowOutput should default to false")
+	// Default: output ON, analytics ON (both default to true when not set)
+	if !cfg.GetShowOutput() {
+		t.Error("GetShowOutput should default to true")
 	}
 	if !cfg.GetShowAnalytics() {
 		t.Error("GetShowAnalytics should default to true")
@@ -450,10 +450,10 @@ func TestGetPreviewSettings(t *testing.T) {
 	defer os.Setenv("HOME", originalHome)
 	ClearUserConfigCache()
 
-	// With no config, should return defaults
+	// With no config, should return defaults (both true)
 	settings := GetPreviewSettings()
-	if settings.ShowOutput {
-		t.Error("GetPreviewSettings ShowOutput: should default to false")
+	if !settings.GetShowOutput() {
+		t.Error("GetPreviewSettings ShowOutput: should default to true")
 	}
 	if !settings.GetShowAnalytics() {
 		t.Error("GetPreviewSettings ShowAnalytics: should default to true")
@@ -484,7 +484,7 @@ show_analytics = false
 	ClearUserConfigCache()
 
 	settings := GetPreviewSettings()
-	if !settings.ShowOutput {
+	if !settings.GetShowOutput() {
 		t.Error("GetPreviewSettings ShowOutput: should be true from config")
 	}
 	if settings.GetShowAnalytics() {

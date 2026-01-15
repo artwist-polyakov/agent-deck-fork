@@ -225,7 +225,8 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	config.GlobalSearch.RecentDays = s.recentDays
 
 	// Preview settings
-	config.Preview.ShowOutput = s.showOutput
+	showOutput := s.showOutput
+	config.Preview.ShowOutput = &showOutput
 	showAnalytics := s.showAnalytics
 	config.Preview.ShowAnalytics = &showAnalytics
 

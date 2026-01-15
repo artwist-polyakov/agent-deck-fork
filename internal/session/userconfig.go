@@ -131,9 +131,9 @@ type UpdateSettings struct {
 
 // PreviewSettings defines preview pane configuration
 type PreviewSettings struct {
-	// ShowOutput shows terminal output in preview pane
-	// Default: false (analytics-only mode)
-	ShowOutput bool `toml:"show_output"`
+	// ShowOutput shows terminal output in preview pane (including launch animation)
+	// Default: true (pointer to distinguish "not set" from "explicitly false")
+	ShowOutput *bool `toml:"show_output"`
 
 	// ShowAnalytics shows session analytics panel for Claude sessions
 	// Default: true (pointer to distinguish "not set" from "explicitly false")
@@ -148,9 +148,17 @@ func (p *PreviewSettings) GetShowAnalytics() bool {
 	return *p.ShowAnalytics
 }
 
+// GetShowOutput returns whether to show terminal output, defaulting to true
+func (p *PreviewSettings) GetShowOutput() bool {
+	if p.ShowOutput == nil {
+		return true // Default: output ON (shows launch animation)
+	}
+	return *p.ShowOutput
+}
+
 // GetShowOutput returns whether to show terminal output in preview
 func (c *UserConfig) GetShowOutput() bool {
-	return c.Preview.ShowOutput
+	return c.Preview.GetShowOutput()
 }
 
 // GetShowAnalytics returns whether to show analytics panel, defaulting to true
@@ -598,8 +606,8 @@ func GetPreviewSettings() PreviewSettings {
 	config, err := LoadUserConfig()
 	if err != nil || config == nil {
 		return PreviewSettings{
-			ShowOutput:    false, // Default: output OFF
-			ShowAnalytics: nil,   // nil means "default to true"
+			ShowOutput:    nil, // nil means "default to true"
+			ShowAnalytics: nil, // nil means "default to true"
 		}
 	}
 
