@@ -1,16 +1,27 @@
-# CLI Reference
+# CLI Command Reference
 
-## Global Flags
+Complete reference for all agent-deck CLI commands.
+
+## Table of Contents
+
+- [Global Options](#global-options)
+- [Basic Commands](#basic-commands)
+- [Session Commands](#session-commands)
+- [MCP Commands](#mcp-commands)
+- [Group Commands](#group-commands)
+- [Profile Commands](#profile-commands)
+
+## Global Options
 
 ```bash
--p <profile>, --profile=<profile>   # Use specific profile
---json                               # JSON output
--q, --quiet                          # Minimal output
+-p, --profile <name>    Use specific profile
+--json                  JSON output
+-q, --quiet             Minimal output
 ```
 
-## Commands
+## Basic Commands
 
-### add
+### add - Create session
 
 ```bash
 agent-deck add [path] [options]
@@ -20,7 +31,7 @@ agent-deck add [path] [options]
 |------|-------------|
 | `-t, --title` | Session title |
 | `-g, --group` | Group path |
-| `-c, --cmd` | Command (claude, gemini, etc.) |
+| `-c, --cmd` | Command (claude, gemini, opencode, codex, custom) |
 | `--parent` | Parent session (creates child) |
 | `--mcp` | Attach MCP (repeatable) |
 
@@ -30,74 +41,232 @@ agent-deck add -t "Child" --parent "Parent" -c claude /tmp/x
 agent-deck add -t "Research" -c claude --mcp exa --mcp firecrawl /tmp/r
 ```
 
-### session
+### list - List sessions
 
 ```bash
-agent-deck session <command> [options] <name>
+agent-deck list [--json] [--all]
+agent-deck ls  # Alias
 ```
 
-| Command | Description |
-|---------|-------------|
-| `start` | Start session (creates tmux) |
-| `stop` | Stop session |
-| `restart` | Restart (reloads MCPs) |
-| `attach` | Attach to tmux (Ctrl+Q to detach) |
-| `send "msg"` | Send message |
-| `output` | Get last response |
-| `show` | Show details |
-| `current` | Detect current session |
-| `fork` | Fork Claude session |
+### remove - Remove session
 
 ```bash
-agent-deck session start "My Project"
-agent-deck session send "My Project" "Hello"
-agent-deck session output "My Project"
-agent-deck session current -q              # Just name
-agent-deck session current --json          # Full JSON
+agent-deck remove <id|title>
+agent-deck rm  # Alias
 ```
 
-### mcp
+### status - Status summary
 
 ```bash
-agent-deck mcp <command> [options]
+agent-deck status [-v|-q|--json]
 ```
 
-| Command | Description |
-|---------|-------------|
-| `list` | Show available MCPs |
-| `attached <name>` | Show attached MCPs |
-| `attach <name> <mcp>` | Attach MCP |
-| `detach <name> <mcp>` | Detach MCP |
+- Default: `2 waiting - 5 running - 3 idle`
+- `-v`: Detailed list by status
+- `-q`: Just waiting count (for scripts)
 
-**Note:** Run `session restart` after attach/detach.
+## Session Commands
 
-### group
+### session start
 
 ```bash
-agent-deck group <command> [options]
+agent-deck session start <id|title> [-m "message"] [--json] [-q]
 ```
 
-| Command | Description |
-|---------|-------------|
-| `list` | List groups |
-| `create <name>` | Create group |
-| `delete <name>` | Delete group |
-| `move <session> <group>` | Move session |
+`-m` sends initial message after agent is ready.
 
-### Other
+**CRITICAL:** Flags MUST come BEFORE session name!
+```bash
+# Correct
+agent-deck session start -m "Hello" my-project
+
+# WRONG - flag ignored!
+agent-deck session start my-project -m "Hello"
+```
+
+### session stop
 
 ```bash
-agent-deck list [--json]     # List sessions
-agent-deck status [-v|-q]    # Status summary
-agent-deck remove <name>     # Remove session
+agent-deck session stop <id|title>
+```
+
+### session restart
+
+```bash
+agent-deck session restart <id|title>
+```
+
+Reloads MCPs without losing conversation (Claude/Gemini).
+
+### session fork (Claude only)
+
+```bash
+agent-deck session fork <id|title> [-t "title"] [-g "group"]
+```
+
+Creates new session with same Claude conversation.
+
+**Requirements:**
+- Session must be Claude tool
+- Must have valid Claude session ID
+
+### session attach
+
+```bash
+agent-deck session attach <id|title>
+```
+
+Interactive PTY mode. Press `Ctrl+Q` to detach.
+
+### session show
+
+```bash
+agent-deck session show [id|title] [--json] [-q]
+```
+
+Auto-detects current session if no ID provided.
+
+**JSON output includes:**
+- Session details (id, title, status, path, group, tool)
+- Claude/Gemini session ID
+- Attached MCPs (local, global, project)
+- tmux session name
+
+### session current
+
+```bash
+agent-deck session current [--json] [-q]
+```
+
+Auto-detect current session and profile from tmux environment.
+
+```bash
+# Human-readable
+agent-deck session current
+# Session: test, Profile: work, ID: c5bfd4b4, Status: running
+
+# For scripts
+agent-deck session current -q
+# test
+
+# JSON
+agent-deck session current --json
+# {"session":"test","profile":"work","id":"c5bfd4b4",...}
+```
+
+**Profile auto-detection priority:**
+1. `AGENTDECK_PROFILE` env var
+2. Parse from `CLAUDE_CONFIG_DIR` (`~/.claude-work` -> `work`)
+3. Config default or `default`
+
+### session set
+
+```bash
+agent-deck session set <id|title> <field> <value>
+```
+
+**Fields:** title, path, command, tool, claude-session-id, gemini-session-id
+
+### session send
+
+```bash
+agent-deck session send <id|title> "message" [--no-wait] [-q] [--json]
+```
+
+Default: Waits for agent readiness before sending.
+
+### session output
+
+```bash
+agent-deck session output [id|title] [--json] [-q]
+```
+
+Get last response from Claude/Gemini session.
+
+### session set-parent / unset-parent
+
+```bash
+agent-deck session set-parent <session> <parent>
+agent-deck session unset-parent <session>
+```
+
+## MCP Commands
+
+### mcp list
+
+```bash
+agent-deck mcp list [--json] [-q]
+```
+
+### mcp attached
+
+```bash
+agent-deck mcp attached [id|title] [--json] [-q]
+```
+
+Shows MCPs from LOCAL, GLOBAL, PROJECT scopes.
+
+### mcp attach
+
+```bash
+agent-deck mcp attach <session> <mcp> [--global] [--restart]
+```
+
+- `--global`: Write to Claude config (all projects)
+- `--restart`: Restart session immediately
+
+### mcp detach
+
+```bash
+agent-deck mcp detach <session> <mcp> [--global] [--restart]
+```
+
+## Group Commands
+
+### group list
+
+```bash
+agent-deck group list [--json] [-q]
+```
+
+### group create
+
+```bash
+agent-deck group create <name> [--parent <group>]
+```
+
+### group delete
+
+```bash
+agent-deck group delete <name> [--force]
+```
+
+`--force`: Move sessions to parent and delete.
+
+### group move
+
+```bash
+agent-deck group move <session> <group>
+```
+
+Use `""` or `root` to move to default group.
+
+## Profile Commands
+
+```bash
+agent-deck profile list
+agent-deck profile create <name>
+agent-deck profile delete <name>
+agent-deck profile default [name]
 ```
 
 ## Session Resolution
 
 Commands accept:
-- **Title:** `"My Project"`
-- **ID prefix:** `abc123` (≥6 chars)
+- **Title:** `"My Project"` (exact match)
+- **ID prefix:** `abc123` (6+ chars)
 - **Path:** `/path/to/project`
+- **Current:** Omit ID in tmux (uses env var)
 
 ## Exit Codes
 

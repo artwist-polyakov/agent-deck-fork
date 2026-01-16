@@ -315,11 +315,49 @@ fi
 configure_tmux() {
     local TMUX_CONF="$HOME/.tmux.conf"
     local MARKER="# agent-deck configuration"
+    local VERSION_MARKER="# agent-deck-tmux-config-version:"
+    local CURRENT_VERSION="2"  # Bump this when config changes
+    local NEEDS_UPDATE=false
+    local HAS_CONFIG=false
 
-    # Check if already configured
+    # Check if already configured and if update is needed
     if [[ -f "$TMUX_CONF" ]] && grep -q "$MARKER" "$TMUX_CONF" 2>/dev/null; then
-        echo -e "${GREEN}tmux already configured for agent-deck${NC}"
-        return 0
+        HAS_CONFIG=true
+        # Check version
+        local INSTALLED_VERSION=$(grep "$VERSION_MARKER" "$TMUX_CONF" 2>/dev/null | sed "s/.*$VERSION_MARKER//" | tr -d ' ')
+        if [[ -z "$INSTALLED_VERSION" || "$INSTALLED_VERSION" -lt "$CURRENT_VERSION" ]]; then
+            NEEDS_UPDATE=true
+            echo ""
+            echo -e "${YELLOW}tmux config update available!${NC}"
+            if [[ -z "$INSTALLED_VERSION" ]]; then
+                echo "Your current agent-deck tmux config is from an older version."
+            else
+                echo "Installed version: $INSTALLED_VERSION, Available: $CURRENT_VERSION"
+            fi
+            echo ""
+            echo -e "${BLUE}What's new in this update:${NC}"
+            echo "  • Fixed mouse scrolling issues on WSL"
+            echo "  • Added auto-enter copy-mode on scroll up"
+            echo "  • Added explicit scroll bindings for copy-mode"
+            echo "  • Improved terminal compatibility"
+            echo ""
+            read -p "Update tmux configuration? [Y/n] " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Nn]$ ]]; then
+                echo "Skipping tmux config update."
+                return 0
+            fi
+            # Remove old config block
+            echo "Removing old configuration..."
+            # Use temp file for compatibility (BSD sed vs GNU sed)
+            local TEMP_CONF=$(mktemp)
+            sed "/$MARKER/,/# End agent-deck configuration/d" "$TMUX_CONF" > "$TEMP_CONF"
+            mv "$TEMP_CONF" "$TMUX_CONF"
+            echo -e "${GREEN}Old config removed${NC}"
+        else
+            echo -e "${GREEN}tmux already configured for agent-deck (v$INSTALLED_VERSION)${NC}"
+            return 0
+        fi
     fi
 
     echo ""
@@ -327,26 +365,32 @@ configure_tmux() {
     echo "Agent Deck works best with mouse scroll and clipboard support."
     echo ""
 
-    if [[ -f "$TMUX_CONF" ]]; then
+    if [[ -f "$TMUX_CONF" ]] && [[ "$NEEDS_UPDATE" != "true" ]]; then
         echo -e "Found existing config: ${YELLOW}~/.tmux.conf${NC}"
         echo "The following settings will be APPENDED (your existing config is preserved):"
+    elif [[ "$NEEDS_UPDATE" == "true" ]]; then
+        echo "Installing updated configuration..."
     else
         echo "No ~/.tmux.conf found. The following settings will be created:"
     fi
 
     echo ""
-    echo -e "${BLUE}  • Mouse scrolling & drag-to-copy${NC}"
+    echo -e "${BLUE}  • Mouse scrolling & drag-to-copy (WSL compatible)${NC}"
+    echo -e "${BLUE}  • Auto copy-mode on scroll up${NC}"
     echo -e "${BLUE}  • Clipboard integration (copy to system clipboard)${NC}"
     echo -e "${BLUE}  • 256-color terminal support${NC}"
     echo -e "${BLUE}  • 10,000 line history${NC}"
     echo ""
 
-    read -p "Configure tmux for agent-deck? [Y/n] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Nn]$ ]]; then
-        echo "Skipping tmux configuration."
-        echo "You can manually add the config later (see: agent-deck docs)"
-        return 0
+    # Skip prompt if we're updating (user already confirmed)
+    if [[ "$NEEDS_UPDATE" != "true" ]]; then
+        read -p "Configure tmux for agent-deck? [Y/n] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+            echo "Skipping tmux configuration."
+            echo "You can manually add the config later (see: agent-deck docs)"
+            return 0
+        fi
     fi
 
     # Determine clipboard command based on OS
@@ -373,24 +417,36 @@ configure_tmux() {
     fi
 
     # Create the config block
+    # Note: WSL requires explicit scroll bindings; set-clipboard external doesn't work with clip.exe
     local CONFIG_BLOCK="
 $MARKER
+$VERSION_MARKER $CURRENT_VERSION
 # Added by agent-deck installer - $(date +%Y-%m-%d)
 # https://github.com/asheshgoplani/agent-deck
 
 # Terminal with true color support
 set -g default-terminal \"tmux-256color\"
+set -ag terminal-overrides \",xterm*:Tc:smcup@:rmcup@\"
 set -ag terminal-overrides \",*256col*:Tc\"
 
 # Performance
 set -sg escape-time 0
-set -g history-limit 10000
+set -g history-limit 50000
 
 # Mouse support (scroll + drag-to-copy)
 set -g mouse on
 
-# Clipboard integration
-set -s set-clipboard external
+# Auto-enter copy-mode when scrolling up (critical for WSL compatibility)
+# This handles: 1) apps with mouse support, 2) already in copy-mode, 3) normal pane
+bind-key -n WheelUpPane if-shell -F -t = \"#{mouse_any_flag}\" \"send-keys -M\" \"if -Ft= '#{pane_in_mode}' 'send-keys -M' 'copy-mode -e'\"
+
+# Scroll bindings in copy-mode (both vi and emacs modes)
+bind-key -T copy-mode-vi WheelUpPane send-keys -X scroll-up
+bind-key -T copy-mode-vi WheelDownPane send-keys -X scroll-down
+bind-key -T copy-mode WheelUpPane send-keys -X scroll-up
+bind-key -T copy-mode WheelDownPane send-keys -X scroll-down
+
+# Clipboard integration (drag-to-copy)
 bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel \"$CLIPBOARD_CMD\"
 bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel \"$CLIPBOARD_CMD\"
 # End agent-deck configuration
@@ -465,6 +521,15 @@ if "$INSTALL_DIR/$BINARY_NAME" version &> /dev/null; then
         echo "  • Clipboard works with Windows (via clip.exe)"
         echo "  • Run in Windows Terminal for best experience"
         echo "  • Mouse scrolling works out of the box"
+        echo ""
+        # Check WSL version for socket pooling info
+        if grep -qi "microsoft-standard" /proc/version 2>/dev/null; then
+            echo -e "  ${GREEN}•${NC} WSL2 detected: MCP socket pooling supported"
+        else
+            echo -e "  ${YELLOW}•${NC} WSL1 detected: MCP socket pooling disabled"
+            echo "    MCPs work fine in stdio mode (just uses more memory)"
+            echo "    Upgrade to WSL2 for socket pooling: wsl --set-version <distro> 2"
+        fi
     fi
 else
     echo -e "${RED}Warning: Installation completed but verification failed${NC}"

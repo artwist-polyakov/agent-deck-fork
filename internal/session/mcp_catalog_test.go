@@ -228,3 +228,4 @@ func TestGetProjectMCPNames(t *testing.T) {
 		t.Errorf("Expected nil for non-existent project, got %v", names2)
 	}
 }
+

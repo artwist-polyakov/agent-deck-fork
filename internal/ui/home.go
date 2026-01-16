@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/update"
@@ -55,6 +56,10 @@ const (
 	// logMaintenanceInterval - how often to do full log maintenance (orphan cleanup, etc)
 	// Prevents runaway log growth that can crash the system
 	logMaintenanceInterval = 5 * time.Minute
+
+	// analyticsCacheTTL - how long analytics data remains valid before refresh
+	// Analytics don't change frequently, so 5s is a good balance between freshness and performance
+	analyticsCacheTTL = 5 * time.Second
 )
 
 // UI spacing constants (2-char grid system)
@@ -125,7 +130,17 @@ type Home struct {
 	forkDialog    *ForkDialog    // For forking sessions
 	confirmDialog *ConfirmDialog // For confirming destructive actions
 	helpOverlay   *HelpOverlay   // For showing keyboard shortcuts
-	mcpDialog     *MCPDialog     // For managing MCPs
+	mcpDialog      *MCPDialog      // For managing MCPs
+	setupWizard    *SetupWizard    // For first-run setup
+	settingsPanel  *SettingsPanel  // For editing settings
+	analyticsPanel *AnalyticsPanel // For displaying session analytics
+
+	// Analytics cache (async fetching with TTL)
+	currentAnalytics     *session.SessionAnalytics    // Current analytics for selected session
+	analyticsSessionID   string                       // Session ID for current analytics
+	analyticsFetchingID  string                       // ID currently being fetched (prevents duplicates)
+	analyticsCache       map[string]*session.SessionAnalytics // TTL cache: sessionID -> analytics
+	analyticsCacheTime   map[string]time.Time                 // TTL cache: sessionID -> cache timestamp
 
 	// State
 	cursor        int            // Selected item index in flatItems
@@ -273,6 +288,13 @@ type previewDebounceMsg struct {
 	sessionID string
 }
 
+// analyticsFetchedMsg is sent when async analytics parsing is complete
+type analyticsFetchedMsg struct {
+	sessionID string
+	analytics *session.SessionAnalytics
+	err       error
+}
+
 // statusUpdateRequest is sent to the background worker with current viewport info
 type statusUpdateRequest struct {
 	viewOffset    int   // Current scroll position
@@ -315,6 +337,9 @@ func NewHomeWithProfile(profile string) *Home {
 		confirmDialog:     NewConfirmDialog(),
 		helpOverlay:       NewHelpOverlay(),
 		mcpDialog:         NewMCPDialog(),
+		setupWizard:       NewSetupWizard(),
+		settingsPanel:     NewSettingsPanel(),
+		analyticsPanel:    NewAnalyticsPanel(),
 		cursor:            0,
 		initialLoading:    true, // Show splash until sessions load
 		ctx:               ctx,
@@ -325,6 +350,8 @@ func NewHomeWithProfile(profile string) *Home {
 		flatItems:         []session.Item{},
 		previewCache:       make(map[string]string),
 		previewCacheTime:   make(map[string]time.Time),
+		analyticsCache:     make(map[string]*session.SessionAnalytics),
+		analyticsCacheTime: make(map[string]time.Time),
 		launchingSessions:  make(map[string]time.Time),
 		resumingSessions:   make(map[string]time.Time),
 		mcpLoadingSessions: make(map[string]time.Time),
@@ -596,8 +623,29 @@ func (h *Home) syncViewport() {
 	// contentHeight = total height for main content area
 	// -1 for header line, -helpBarHeight for help bar, -updateBannerHeight, -filterBarHeight
 	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - filterBarHeight
-	// panelContentHeight = space available for session list (excluding title)
-	panelContentHeight := contentHeight - panelTitleLines
+
+	// CRITICAL: Calculate panelContentHeight based on current layout mode
+	// This MUST match the calculations in renderStackedLayout/renderDualColumnLayout/renderSingleColumnLayout
+	var panelContentHeight int
+	layoutMode := h.getLayoutMode()
+	switch layoutMode {
+	case LayoutModeStacked:
+		// Stacked layout: list gets 60% of height, minus title (2 lines)
+		// Must match: listHeight := (totalHeight * 60) / 100; listContent height = listHeight - 2
+		listHeight := (contentHeight * 60) / 100
+		if listHeight < 5 {
+			listHeight = 5
+		}
+		panelContentHeight = listHeight - panelTitleLines
+	case LayoutModeSingle:
+		// Single column: list gets full height minus title
+		// Must match: listHeight := totalHeight - 2
+		panelContentHeight = contentHeight - panelTitleLines
+	default: // LayoutModeDual
+		// Dual layout: list panel gets full contentHeight minus title
+		panelContentHeight = contentHeight - panelTitleLines
+	}
+
 	// maxVisible = how many items can be shown (reserving 1 for "more below" indicator)
 	maxVisible := panelContentHeight - 1
 	if maxVisible < 1 {
@@ -674,9 +722,16 @@ func (h *Home) jumpToRootGroup(n int) {
 
 // Init initializes the model
 func (h *Home) Init() tea.Cmd {
+	// Check for first run (no config.toml exists)
+	configPath, _ := session.GetUserConfigPath()
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		h.setupWizard.Show()
+		h.setupWizard.SetSize(h.width, h.height)
+	}
+
 	cmds := []tea.Cmd{
 		h.loadSessions,
-		
+
 		h.tick(),
 		h.checkForUpdate(),
 	}
@@ -918,6 +973,63 @@ func (h *Home) fetchPreviewDebounced(sessionID string) tea.Cmd {
 	}
 }
 
+// getAnalyticsForSession returns cached analytics if still valid (within TTL)
+// Returns nil if cache miss or expired, triggering async fetch
+func (h *Home) getAnalyticsForSession(inst *session.Instance) *session.SessionAnalytics {
+	if inst == nil {
+		return nil
+	}
+
+	// Check cache
+	if cached, ok := h.analyticsCache[inst.ID]; ok {
+		if time.Since(h.analyticsCacheTime[inst.ID]) < analyticsCacheTTL {
+			return cached
+		}
+	}
+
+	return nil // Will trigger async fetch
+}
+
+// fetchAnalytics returns a command that asynchronously parses session analytics
+// This keeps View() pure (no blocking I/O) as per Bubble Tea best practices
+func (h *Home) fetchAnalytics(inst *session.Instance) tea.Cmd {
+	if inst == nil || inst.Tool != "claude" {
+		return nil
+	}
+	sessionID := inst.ID
+	claudeSessionID := inst.ClaudeSessionID
+
+	return func() tea.Msg {
+		// Get JSONL path for this session
+		jsonlPath := inst.GetJSONLPath()
+		if jsonlPath == "" {
+			// No JSONL path available - return empty analytics
+			return analyticsFetchedMsg{
+				sessionID: sessionID,
+				analytics: nil,
+				err:       nil,
+			}
+		}
+
+		// Parse the JSONL file
+		analytics, err := session.ParseSessionJSONL(jsonlPath)
+		if err != nil {
+			log.Printf("Failed to parse analytics for session %s (claude session %s): %v", sessionID, claudeSessionID, err)
+			return analyticsFetchedMsg{
+				sessionID: sessionID,
+				analytics: nil,
+				err:       err,
+			}
+		}
+
+		return analyticsFetchedMsg{
+			sessionID: sessionID,
+			analytics: analytics,
+			err:       nil,
+		}
+	}
+}
+
 // getSelectedSession returns the currently selected session, or nil if a group is selected
 func (h *Home) getSelectedSession() *session.Instance {
 	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
@@ -1002,6 +1114,11 @@ func (h *Home) triggerStatusUpdate() {
 func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 	const batchSize = 2 // Reduced from 5 to 2 - fewer CapturePane() calls per tick
 
+	// CRITICAL FIX: Refresh session cache in background worker, NOT main goroutine
+	// This prevents UI freezing when subprocess spawning is slow (high system load)
+	// The cache refresh spawns `tmux list-sessions` which can block for 50-200ms
+	tmux.RefreshExistingSessions()
+
 	// Take a snapshot of instances under read lock (thread-safe)
 	h.instancesMu.RLock()
 	if len(h.instances) == 0 {
@@ -1077,6 +1194,8 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.height = msg.Height
 		h.updateSizes()
 		h.syncViewport() // Recalculate viewport when window size changes
+		h.setupWizard.SetSize(msg.Width, msg.Height)
+		h.settingsPanel.SetSize(msg.Width, msg.Height)
 		return h, nil
 
 	case loadSessionsMsg:
@@ -1411,14 +1530,42 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.instancesMu.RUnlock()
 
 		if inst != nil {
+			var cmds []tea.Cmd
+
+			// Preview fetch
 			h.previewCacheMu.Lock()
-			needsFetch := h.previewFetchingID != inst.ID
-			if needsFetch {
+			needsPreviewFetch := h.previewFetchingID != inst.ID
+			if needsPreviewFetch {
 				h.previewFetchingID = inst.ID
 			}
 			h.previewCacheMu.Unlock()
-			if needsFetch {
-				return h, h.fetchPreview(inst)
+			if needsPreviewFetch {
+				cmds = append(cmds, h.fetchPreview(inst))
+			}
+
+			// Analytics fetch (for Claude sessions with analytics enabled)
+			// Use TTL cache - only fetch if cache miss/expired and not already fetching
+			if inst.Tool == "claude" && h.analyticsFetchingID != inst.ID {
+				cached := h.getAnalyticsForSession(inst)
+				if cached != nil {
+					// Use cached analytics
+					if h.analyticsSessionID != inst.ID {
+						h.currentAnalytics = cached
+						h.analyticsSessionID = inst.ID
+						h.analyticsPanel.SetAnalytics(cached)
+					}
+				} else {
+					// Cache miss or expired - fetch new analytics
+					config, _ := session.LoadUserConfig()
+					if config != nil && config.GetShowAnalytics() {
+						h.analyticsFetchingID = inst.ID
+						cmds = append(cmds, h.fetchAnalytics(inst))
+					}
+				}
+			}
+
+			if len(cmds) > 0 {
+				return h, tea.Batch(cmds...)
 			}
 		}
 		return h, nil
@@ -1433,6 +1580,21 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.previewCacheTime[msg.sessionID] = time.Now()
 		}
 		h.previewCacheMu.Unlock()
+		return h, nil
+
+	case analyticsFetchedMsg:
+		// Async analytics parsing complete - update TTL cache
+		h.analyticsFetchingID = ""
+		if msg.err == nil && msg.analytics != nil && msg.sessionID != "" {
+			// Store in TTL cache
+			h.analyticsCache[msg.sessionID] = msg.analytics
+			h.analyticsCacheTime[msg.sessionID] = time.Now()
+			// Update current analytics for display
+			h.currentAnalytics = msg.analytics
+			h.analyticsSessionID = msg.sessionID
+			// Update analytics panel with new data
+			h.analyticsPanel.SetAnalytics(msg.analytics)
+		}
 		return h, nil
 
 	case tickMsg:
@@ -1457,12 +1619,11 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			const userActivityWindow = 2 * time.Second
 			if !h.lastUserInputTime.IsZero() && time.Since(h.lastUserInputTime) < userActivityWindow {
 				// User is active - trigger status updates
-				tmux.RefreshExistingSessions()
+				// NOTE: RefreshExistingSessions() moved to background worker (processStatusUpdate)
+				// to avoid blocking the main goroutine with subprocess calls
 				h.triggerStatusUpdate()
-			} else {
-				// User idle - only refresh cache lightly (no status updates)
-				tmux.RefreshExistingSessions()
 			}
+			// User idle - no updates needed (cache refresh happens in background worker)
 		}
 
 		// Update animation frame for launching spinner (8 frames, cycles every tick)
@@ -1524,6 +1685,50 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		// Track user activity for adaptive status updates
 		h.lastUserInputTime = time.Now()
+
+		// Handle setup wizard first (modal, blocks everything)
+		if h.setupWizard.IsVisible() {
+			var cmd tea.Cmd
+			h.setupWizard, cmd = h.setupWizard.Update(msg)
+			// Check if user pressed Enter on final step
+			if msg.String() == "enter" && h.setupWizard.IsComplete() {
+				// Save config and close wizard
+				config := h.setupWizard.GetConfig()
+				if err := session.SaveUserConfig(config); err != nil {
+					h.err = err
+					h.errTime = time.Now()
+				}
+				h.setupWizard.Hide()
+				// Reload config cache
+				_, _ = session.ReloadUserConfig()
+				// Apply default tool to new dialog
+				if defaultTool := session.GetDefaultTool(); defaultTool != "" {
+					h.newDialog.SetDefaultTool(defaultTool)
+				}
+			}
+			return h, cmd
+		}
+
+		// Handle settings panel
+		if h.settingsPanel.IsVisible() {
+			var cmd tea.Cmd
+			var shouldSave bool
+			h.settingsPanel, cmd, shouldSave = h.settingsPanel.Update(msg)
+			if shouldSave {
+				// Auto-save on every change
+				config := h.settingsPanel.GetConfig()
+				if err := session.SaveUserConfig(config); err != nil {
+					h.err = err
+					h.errTime = time.Now()
+				}
+				_, _ = session.ReloadUserConfig()
+				// Apply default tool to new dialog
+				if defaultTool := session.GetDefaultTool(); defaultTool != "" {
+					h.newDialog.SetDefaultTool(defaultTool)
+				}
+			}
+			return h, cmd
+		}
 
 		// Handle overlays first
 		// Help overlay takes priority (any key closes it)
@@ -1740,13 +1945,46 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return h, nil
 		}
 
-		// Create session (enter works from any field)
-		name, path, command := h.newDialog.GetValues()
+		// Get values including worktree settings
+		name, path, command, branchName, worktreeEnabled := h.newDialog.GetValuesWithWorktree()
 		groupPath := h.newDialog.GetSelectedGroup()
 		claudeOpts := h.newDialog.GetClaudeOptions() // Get Claude options if applicable
+
+		// Handle worktree creation if enabled
+		var worktreePath, worktreeRepoRoot string
+		if worktreeEnabled && branchName != "" {
+			// Validate path is a git repo
+			if !git.IsGitRepo(path) {
+				h.setError(fmt.Errorf("path is not a git repository"))
+				return h, nil
+			}
+
+			repoRoot, err := git.GetRepoRoot(path)
+			if err != nil {
+				h.setError(fmt.Errorf("failed to get repo root: %w", err))
+				return h, nil
+			}
+
+			// Generate worktree path
+			worktreePath = git.GenerateWorktreePath(repoRoot, branchName)
+
+			// Create worktree
+			if err := git.CreateWorktree(repoRoot, worktreePath, branchName); err != nil {
+				h.setError(fmt.Errorf("failed to create worktree: %w", err))
+				return h, nil
+			}
+
+			// Store repo root for later use
+			worktreeRepoRoot = repoRoot
+			// Update path to worktree for session creation
+			path = worktreePath
+		}
+
 		h.newDialog.Hide()
 		h.clearError() // Clear any previous validation error
-		return h, h.createSessionInGroupWithOptions(name, path, command, groupPath, claudeOpts)
+
+		// Create session with all options
+		return h, h.createSessionInGroupWithAllOptions(name, path, command, groupPath, claudeOpts, worktreePath, worktreeRepoRoot, branchName)
 
 	case "esc":
 		h.newDialog.Hide()
@@ -1950,16 +2188,43 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "g":
-		// Create new group (or subgroup if a group is selected)
+		// Create new group based on context:
+		// - Session in a group → create subgroup in session's group
+		// - Group selected → create peer group (sibling at same level)
+		// - Root level → create root-level group
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeGroup {
-				// Create subgroup under selected group
-				h.groupDialog.ShowCreateSubgroup(item.Group.Path, item.Group.Name)
+				// Group selected: create peer group (sibling)
+				// Get parent path by removing last segment
+				parentPath := ""
+				parentName := ""
+				if idx := strings.LastIndex(item.Group.Path, "/"); idx > 0 {
+					parentPath = item.Group.Path[:idx]
+					// Get parent name from parent path
+					if lastIdx := strings.LastIndex(parentPath, "/"); lastIdx >= 0 {
+						parentName = parentPath[lastIdx+1:]
+					} else {
+						parentName = parentPath
+					}
+					h.groupDialog.ShowCreateSubgroup(parentPath, parentName)
+				} else {
+					// Top-level group: create another root-level group
+					h.groupDialog.Show()
+				}
+				return h, nil
+			} else if item.Type == session.ItemTypeSession && item.Session != nil && item.Session.GroupPath != "" {
+				// Session in a group: create subgroup in session's group
+				groupPath := item.Session.GroupPath
+				groupName := groupPath
+				if idx := strings.LastIndex(groupPath, "/"); idx >= 0 {
+					groupName = groupPath[idx+1:]
+				}
+				h.groupDialog.ShowCreateSubgroup(groupPath, groupName)
 				return h, nil
 			}
 		}
-		// Create root-level group
+		// Create root-level group (no selection or session at root)
 		h.groupDialog.Show()
 		return h, nil
 
@@ -1988,6 +2253,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		h.helpOverlay.SetSize(h.width, h.height)
 		h.helpOverlay.Show()
+		return h, nil
+
+	case "S":
+		// Open settings panel
+		h.settingsPanel.Show()
+		h.settingsPanel.SetSize(h.width, h.height)
 		return h, nil
 
 	case "n":
@@ -2246,6 +2517,8 @@ func (h *Home) handleMCPDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				log.Printf("[MCP-DEBUG] Calling restartSession for: %s (with MCP loading animation)", targetInst.ID)
 				// Track as MCP loading for animation in preview pane
 				h.mcpLoadingSessions[targetInst.ID] = time.Now()
+				// Set flag to skip MCP regeneration (Apply just wrote the config)
+				targetInst.SkipMCPRegenerate = true
 				// Restart the session to apply MCP changes
 				h.mcpDialog.Hide()
 				return h, h.restartSession(targetInst)
@@ -2458,11 +2731,21 @@ func (h *Home) getUsedClaudeSessionIDs() map[string]bool {
 
 // createSessionInGroup creates a new session in a specific group
 func (h *Home) createSessionInGroup(name, path, command, groupPath string) tea.Cmd {
-	return h.createSessionInGroupWithOptions(name, path, command, groupPath, nil)
+	return h.createSessionInGroupWithAllOptions(name, path, command, groupPath, nil, "", "", "")
 }
 
 // createSessionInGroupWithOptions creates a session with optional Claude options
 func (h *Home) createSessionInGroupWithOptions(name, path, command, groupPath string, claudeOpts *session.ClaudeOptions) tea.Cmd {
+	return h.createSessionInGroupWithAllOptions(name, path, command, groupPath, claudeOpts, "", "", "")
+}
+
+// createSessionInGroupWithWorktree creates a new session in a specific group with optional worktree settings
+func (h *Home) createSessionInGroupWithWorktree(name, path, command, groupPath, worktreePath, worktreeRepoRoot, worktreeBranch string) tea.Cmd {
+	return h.createSessionInGroupWithAllOptions(name, path, command, groupPath, nil, worktreePath, worktreeRepoRoot, worktreeBranch)
+}
+
+// createSessionInGroupWithAllOptions creates a new session with all optional settings (Claude options and worktree)
+func (h *Home) createSessionInGroupWithAllOptions(name, path, command, groupPath string, claudeOpts *session.ClaudeOptions, worktreePath, worktreeRepoRoot, worktreeBranch string) tea.Cmd {
 	return func() tea.Msg {
 		// Check tmux availability before creating session
 		if err := tmux.IsTmuxAvailable(); err != nil {
@@ -2494,6 +2777,13 @@ func (h *Home) createSessionInGroupWithOptions(name, path, command, groupPath st
 		// Apply Claude options if provided
 		if tool == "claude" && claudeOpts != nil {
 			inst.SetClaudeOptions(claudeOpts)
+		}
+
+		// Set worktree fields if provided
+		if worktreePath != "" {
+			inst.WorktreePath = worktreePath
+			inst.WorktreeRepoRoot = worktreeRepoRoot
+			inst.WorktreeBranch = worktreeBranch
 		}
 
 		if err := inst.Start(); err != nil {
@@ -2918,6 +3208,16 @@ func (h *Home) View() string {
 	// Show loading splash during initial session load
 	if h.initialLoading {
 		return renderLoadingSplash(h.width, h.height, h.animationFrame)
+	}
+
+	// Setup wizard takes over entire screen
+	if h.setupWizard.IsVisible() {
+		return h.setupWizard.View()
+	}
+
+	// Settings panel is modal
+	if h.settingsPanel.IsVisible() {
+		return h.settingsPanel.View()
 	}
 
 	// Overlays take full screen
@@ -3378,6 +3678,53 @@ func ensureExactHeight(content string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// ensureExactWidth ensures each line in content has exactly the specified visual width.
+// This is essential for proper horizontal panel alignment in lipgloss.JoinHorizontal.
+//
+// Behavior:
+//   - Strips ANSI codes to measure true visual width
+//   - Pads short lines with spaces to reach target width
+//   - Truncates long lines with "..." suffix
+//   - Preserves ANSI styling where possible
+//
+// This fixes the "bleeding" issue where right panel content appears in left panel
+// due to inconsistent line widths causing JoinHorizontal misalignment.
+func ensureExactWidth(content string, width int) string {
+	if width <= 0 {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	result := make([]string, len(lines))
+
+	for i, line := range lines {
+		// Measure visual width (excluding ANSI codes)
+		cleanLine := tmux.StripANSI(line)
+		displayWidth := runewidth.StringWidth(cleanLine)
+
+		if displayWidth == width {
+			// Already correct width
+			result[i] = line
+		} else if displayWidth < width {
+			// Pad with spaces to reach target width
+			padding := width - displayWidth
+			result[i] = line + strings.Repeat(" ", padding)
+		} else {
+			// Line too wide - truncate the clean version
+			// Note: This loses ANSI styling but prevents layout corruption
+			truncated := runewidth.Truncate(cleanLine, width-3, "...")
+			// Pad if truncation made it shorter
+			truncWidth := runewidth.StringWidth(truncated)
+			if truncWidth < width {
+				truncated += strings.Repeat(" ", width-truncWidth)
+			}
+			result[i] = truncated
+		}
+	}
+
+	return strings.Join(result, "\n")
+}
+
 // renderDualColumnLayout renders side-by-side panels for wide terminals (80+ cols)
 func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	var b strings.Builder
@@ -3417,7 +3764,12 @@ func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	leftPanel = ensureExactHeight(leftPanel, contentHeight)
 	rightPanel = ensureExactHeight(rightPanel, contentHeight)
 
-	// Join panels horizontally - all components have exact heights now
+	// CRITICAL: Ensure both panels have exactly the correct width for proper alignment
+	// Without this, variable-width lines cause JoinHorizontal to misalign content
+	leftPanel = ensureExactWidth(leftPanel, leftWidth)
+	rightPanel = ensureExactWidth(rightPanel, rightWidth)
+
+	// Join panels horizontally - all components have exact heights AND widths now
 	mainContent := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, separator, rightPanel)
 	b.WriteString(mainContent)
 
@@ -4248,6 +4600,70 @@ func (h *Home) renderForkingState(inst *session.Instance, width int, startTime t
 	return b.String()
 }
 
+// renderSessionInfoCard renders a simple session info card as fallback view
+// Used when both show_output and show_analytics are disabled
+func (h *Home) renderSessionInfoCard(inst *session.Instance, width, height int) string {
+	if inst == nil {
+		dimStyle := lipgloss.NewStyle().Foreground(ColorTextDim).Italic(true)
+		return dimStyle.Render("No session selected")
+	}
+
+	var b strings.Builder
+
+	// Header with tool icon
+	icon := ToolIcon(inst.Tool)
+	header := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(ColorAccent).
+		Render(fmt.Sprintf("%s %s", icon, inst.Title))
+	b.WriteString(header)
+	b.WriteString("\n")
+	b.WriteString(strings.Repeat("─", min(width-4, 40)))
+	b.WriteString("\n\n")
+
+	labelStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+	valueStyle := lipgloss.NewStyle().Foreground(ColorText)
+
+	// Path
+	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Path:"), valueStyle.Render(inst.ProjectPath)))
+
+	// Status with color
+	var statusColor lipgloss.Color
+	switch inst.Status {
+	case session.StatusRunning:
+		statusColor = ColorGreen
+	case session.StatusWaiting:
+		statusColor = ColorYellow
+	case session.StatusError:
+		statusColor = ColorRed
+	default:
+		statusColor = ColorTextDim
+	}
+	statusStyle := lipgloss.NewStyle().Foreground(statusColor)
+	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Status:"), statusStyle.Render(string(inst.Status))))
+
+	// Tool
+	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Tool:"), valueStyle.Render(inst.Tool)))
+
+	// Session ID (if available) - Claude or Gemini
+	sessionID := inst.ClaudeSessionID
+	if sessionID == "" {
+		sessionID = inst.GeminiSessionID
+	}
+	if sessionID != "" {
+		shortID := sessionID
+		if len(shortID) > 12 {
+			shortID = shortID[:12] + "..."
+		}
+		b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Session:"), valueStyle.Render(shortID)))
+	}
+
+	// Created date
+	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Created:"), valueStyle.Render(inst.CreatedAt.Format("Jan 2 15:04"))))
+
+	return b.String()
+}
+
 // renderPreviewPane renders the right panel with live preview
 func (h *Home) renderPreviewPane(width, height int) string {
 	var b strings.Builder
@@ -4570,6 +4986,63 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			content = content[:len(content)-1]
 		}
 
+		return content
+	}
+
+	// Check preview settings for what to show
+	config, _ := session.LoadUserConfig()
+	showAnalytics := config != nil && config.GetShowAnalytics() && selected.Tool == "claude"
+	showOutput := config == nil || config.GetShowOutput() // Default to true if config fails
+
+	// Check if session is launching/resuming (for animation priority)
+	_, isSessionLaunching := h.launchingSessions[selected.ID]
+	_, isSessionResuming := h.resumingSessions[selected.ID]
+	_, isSessionForking := h.forkingSessions[selected.ID]
+	isStartingUp := isSessionLaunching || isSessionResuming || isSessionForking
+
+	// Analytics panel (for Claude sessions with analytics enabled)
+	// Skip showing "Loading analytics..." during startup - let the launch animation take focus
+	if showAnalytics && !isStartingUp {
+		analyticsHeader := renderSectionDivider("Analytics", width-4)
+		b.WriteString(analyticsHeader)
+		b.WriteString("\n")
+
+		// Check if we have analytics for this session
+		if h.analyticsSessionID == selected.ID && h.currentAnalytics != nil {
+			h.analyticsPanel.SetSize(width-4, height/2)
+			b.WriteString(h.analyticsPanel.View())
+			b.WriteString("\n")
+		} else {
+			// Analytics not yet loaded
+			loadingStyle := lipgloss.NewStyle().
+				Foreground(ColorText).
+				Italic(true)
+			b.WriteString(loadingStyle.Render("Loading analytics..."))
+			b.WriteString("\n\n")
+		}
+	}
+
+	// If output is disabled, return early
+	if !showOutput {
+		// If analytics was also not shown, display session info card as fallback
+		if !showAnalytics {
+			infoCard := h.renderSessionInfoCard(selected, width, height)
+			b.WriteString("\n")
+			b.WriteString(infoCard)
+		}
+
+		// Pad output to exact height to prevent layout shifts
+		content := b.String()
+		lines := strings.Split(content, "\n")
+		lineCount := len(lines)
+		if lineCount < height {
+			for i := lineCount; i < height; i++ {
+				content += "\n"
+			}
+		}
+		if len(content) > 0 && content[len(content)-1] == '\n' {
+			content = content[:len(content)-1]
+		}
 		return content
 	}
 

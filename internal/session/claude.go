@@ -251,6 +251,18 @@ func IsClaudeConfigDirExplicit() bool {
 	return false
 }
 
+// GetClaudeCommand returns the configured Claude command/alias
+// Priority: 1) UserConfig setting, 2) Default "claude"
+// This allows users to configure an alias like "cdw" or "cdp" that sets
+// CLAUDE_CONFIG_DIR automatically, avoiding the need for config_dir setting
+func GetClaudeCommand() string {
+	userConfig, _ := LoadUserConfig()
+	if userConfig != nil && userConfig.Claude.Command != "" {
+		return userConfig.Claude.Command
+	}
+	return "claude"
+}
+
 // GetClaudeSessionID returns the ACTIVE session ID for a project path
 // It first tries to find the currently running session by checking recently
 // modified .jsonl files, then falls back to lastSessionId from config
@@ -463,12 +475,27 @@ func isMCPEnabled(name string, settings *ProjectMCPSettings, mode MCPMode) bool 
 	}
 }
 
-// ClearMCPCache invalidates the MCP cache for a project path
+// ClearMCPCache invalidates the MCP cache for a project path and all parent directories
+// This is important because getMCPInfoUncached walks up parent directories to find .mcp.json
 func ClearMCPCache(projectPath string) {
 	mcpInfoCacheMu.Lock()
+	defer mcpInfoCacheMu.Unlock()
+
+	// Clear the exact path
 	delete(mcpInfoCache, projectPath)
 	delete(mcpCacheTimes, projectPath)
-	mcpInfoCacheMu.Unlock()
+
+	// Also clear all parent directories (MCP lookup walks up the tree)
+	currentPath := projectPath
+	for {
+		parent := filepath.Dir(currentPath)
+		if parent == currentPath || parent == "/" || parent == "." {
+			break
+		}
+		delete(mcpInfoCache, parent)
+		delete(mcpCacheTimes, parent)
+		currentPath = parent
+	}
 }
 
 // ToggleLocalMCP toggles a Local MCP on/off

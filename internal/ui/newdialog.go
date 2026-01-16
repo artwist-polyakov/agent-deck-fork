@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -28,6 +29,10 @@ type NewDialog struct {
 	parentGroupName      string
 	pathSuggestions      []string // stores all available path suggestions
 	pathSuggestionCursor int      // tracks selected suggestion in dropdown
+	suggestionNavigated  bool     // tracks if user explicitly navigated suggestions
+	// Worktree support
+	worktreeEnabled bool
+	branchInput     textinput.Model
 }
 
 // NewNewDialog creates a new NewDialog instance
@@ -58,17 +63,25 @@ func NewNewDialog() *NewDialog {
 	commandInput.CharLimit = 100
 	commandInput.Width = 40
 
+	// Create branch input for worktree
+	branchInput := textinput.New()
+	branchInput.Placeholder = "feature/branch-name"
+	branchInput.CharLimit = 100
+	branchInput.Width = 40
+
 	return &NewDialog{
 		nameInput:       nameInput,
 		pathInput:       pathInput,
 		commandInput:    commandInput,
 		claudeOptions:   NewClaudeOptionsPanel(),
+		branchInput:     branchInput,
 		focusIndex:      0,
 		visible:         false,
 		presetCommands:  []string{"", "claude", "gemini", "opencode", "codex"},
 		commandCursor:   0,
 		parentGroupPath: "default",
 		parentGroupName: "default",
+		worktreeEnabled: false,
 	}
 }
 
@@ -86,7 +99,12 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName string) {
 	d.nameInput.Focus()
 	d.pathInput.Blur()
 	d.claudeOptions.Blur()
+	d.suggestionNavigated = false // reset on show
+	d.pathSuggestionCursor = 0    // reset cursor too
 	// Keep commandCursor at previously set default (don't reset to 0)
+	// Reset worktree fields
+	d.worktreeEnabled = false
+	d.branchInput.SetValue("")
 
 	// Initialize Claude options with defaults from config
 	if config, err := session.LoadUserConfig(); err == nil {
@@ -197,6 +215,24 @@ func (d *NewDialog) isClaudeSelected() bool {
 	return d.commandCursor < len(d.presetCommands) && d.presetCommands[d.commandCursor] == "claude"
 }
 
+// ToggleWorktree toggles the worktree checkbox
+func (d *NewDialog) ToggleWorktree() {
+	d.worktreeEnabled = !d.worktreeEnabled
+}
+
+// IsWorktreeEnabled returns whether worktree mode is enabled
+func (d *NewDialog) IsWorktreeEnabled() bool {
+	return d.worktreeEnabled
+}
+
+// GetValuesWithWorktree returns all values including worktree settings
+func (d *NewDialog) GetValuesWithWorktree() (name, path, command, branch string, worktreeEnabled bool) {
+	name, path, command = d.GetValues()
+	branch = strings.TrimSpace(d.branchInput.Value())
+	worktreeEnabled = d.worktreeEnabled
+	return
+}
+
 // Validate checks if the dialog values are valid and returns an error message if not
 func (d *NewDialog) Validate() string {
 	name := strings.TrimSpace(d.nameInput.Value())
@@ -218,6 +254,17 @@ func (d *NewDialog) Validate() string {
 		return "Project path cannot be empty"
 	}
 
+	// Validate worktree branch if enabled
+	if d.worktreeEnabled {
+		branch := strings.TrimSpace(d.branchInput.Value())
+		if branch == "" {
+			return "Branch name required for worktree"
+		}
+		if err := git.ValidateBranchName(branch); err != nil {
+			return err.Error()
+		}
+	}
+
 	return "" // Valid
 }
 
@@ -227,6 +274,7 @@ func (d *NewDialog) updateFocus() {
 	d.pathInput.Blur()
 	d.commandInput.Blur()
 	d.claudeOptions.Blur()
+	d.branchInput.Blur()
 
 	switch d.focusIndex {
 	case 0:
@@ -238,8 +286,15 @@ func (d *NewDialog) updateFocus() {
 		if d.commandCursor == 0 { // shell
 			d.commandInput.Focus()
 		}
+	case 3:
+		// Branch input (when worktree is enabled) or Claude options
+		if d.worktreeEnabled {
+			d.branchInput.Focus()
+		} else if d.isClaudeSelected() {
+			d.claudeOptions.Focus()
+		}
 	default:
-		// Claude options (focusIndex >= 3)
+		// Claude options (focusIndex >= 4 when worktree is enabled)
 		if d.isClaudeSelected() {
 			d.claudeOptions.Focus()
 		}
@@ -248,10 +303,17 @@ func (d *NewDialog) updateFocus() {
 
 // getMaxFocusIndex returns the maximum focus index based on current state
 func (d *NewDialog) getMaxFocusIndex() int {
+	base := 2 // 0=name, 1=path, 2=command
+	if d.worktreeEnabled {
+		base = 3 // Add branch field at index 3
+	}
 	if d.isClaudeSelected() {
+		if d.worktreeEnabled {
+			return 4 // 0=name, 1=path, 2=command, 3=branch, 4=claude options
+		}
 		return 3 // 0=name, 1=path, 2=command, 3=claude options
 	}
-	return 2 // 0=name, 1=path, 2=command
+	return base
 }
 
 // Update handles key messages
@@ -267,8 +329,8 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "tab":
-			// On path field: apply selected suggestion, then move to next field
-			if d.focusIndex == 1 && len(d.pathSuggestions) > 0 {
+			// On path field: apply selected suggestion ONLY if user explicitly navigated to one
+			if d.focusIndex == 1 && d.suggestionNavigated && len(d.pathSuggestions) > 0 {
 				if d.pathSuggestionCursor < len(d.pathSuggestions) {
 					d.pathInput.SetValue(d.pathSuggestions[d.pathSuggestionCursor])
 				}
@@ -285,12 +347,17 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				d.focusIndex = 0
 				d.updateFocus()
 			}
+			// Reset navigation flag when leaving path field
+			if d.focusIndex != 1 {
+				d.suggestionNavigated = false
+			}
 			return d, cmd
 
 		case "ctrl+n":
 			// Next suggestion (when on path field)
 			if d.focusIndex == 1 && len(d.pathSuggestions) > 0 {
 				d.pathSuggestionCursor = (d.pathSuggestionCursor + 1) % len(d.pathSuggestions)
+				d.suggestionNavigated = true // user explicitly navigated
 				return d, nil
 			}
 
@@ -301,6 +368,7 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				if d.pathSuggestionCursor < 0 {
 					d.pathSuggestionCursor = len(d.pathSuggestions) - 1
 				}
+				d.suggestionNavigated = true // user explicitly navigated
 				return d, nil
 			}
 
@@ -364,6 +432,18 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 				return d, cmd
 			}
 
+		case "w":
+			// Toggle worktree when on command field (focusIndex == 2)
+			if d.focusIndex == 2 {
+				d.ToggleWorktree()
+				// If enabling worktree, move to branch field
+				if d.worktreeEnabled {
+					d.focusIndex = 3
+					d.updateFocus()
+				}
+				return d, nil
+			}
+
 		case " ":
 			// Space toggles checkboxes in claude options
 			if d.focusIndex >= 3 && d.isClaudeSelected() {
@@ -378,14 +458,27 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 	case 0:
 		d.nameInput, cmd = d.nameInput.Update(msg)
 	case 1:
+		oldValue := d.pathInput.Value()
 		d.pathInput, cmd = d.pathInput.Update(msg)
+		// Reset navigation if user typed something new
+		if d.pathInput.Value() != oldValue {
+			d.suggestionNavigated = false
+			d.pathSuggestionCursor = 0
+		}
 	case 2:
 		// Update custom command input when shell is selected
 		if d.commandCursor == 0 { // shell
 			d.commandInput, cmd = d.commandInput.Update(msg)
 		}
+	case 3:
+		// Branch input (when worktree is enabled)
+		if d.worktreeEnabled {
+			d.branchInput, cmd = d.branchInput.Update(msg)
+		} else if d.isClaudeSelected() {
+			d.claudeOptions, cmd = d.claudeOptions.Update(msg)
+		}
 	default:
-		if d.focusIndex >= 3 && d.isClaudeSelected() {
+		if d.focusIndex >= 4 && d.isClaudeSelected() {
 			d.claudeOptions, cmd = d.claudeOptions.Update(msg)
 		}
 	}
@@ -469,17 +562,37 @@ func (d *NewDialog) View() string {
 			Foreground(ColorCyan).
 			Bold(true)
 
-		// Show up to 5 suggestions
+		// Show up to 5 suggestions in a scrolling window around the cursor
 		maxShow := 5
-		if len(d.pathSuggestions) < maxShow {
-			maxShow = len(d.pathSuggestions)
+		total := len(d.pathSuggestions)
+
+		// Calculate visible window that follows the cursor
+		startIdx := 0
+		endIdx := total // Start with all suggestions
+		if total > maxShow {
+			// Need scrolling - center the cursor in the window
+			startIdx = d.pathSuggestionCursor - maxShow/2
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			endIdx = startIdx + maxShow
+			if endIdx > total {
+				endIdx = total
+				startIdx = endIdx - maxShow
+			}
 		}
 
 		content.WriteString("  ")
 		content.WriteString(lipgloss.NewStyle().Foreground(ColorComment).Render("─ recent paths (Tab: accept, Ctrl+N/P: cycle) ─"))
 		content.WriteString("\n")
 
-		for i := 0; i < maxShow; i++ {
+		// Show "more above" indicator
+		if startIdx > 0 {
+			content.WriteString(suggestionStyle.Render(fmt.Sprintf("    ↑ %d more above", startIdx)))
+			content.WriteString("\n")
+		}
+
+		for i := startIdx; i < endIdx; i++ {
 			style := suggestionStyle
 			prefix := "    "
 			if i == d.pathSuggestionCursor {
@@ -490,8 +603,9 @@ func (d *NewDialog) View() string {
 			content.WriteString("\n")
 		}
 
-		if len(d.pathSuggestions) > maxShow {
-			content.WriteString(suggestionStyle.Render(fmt.Sprintf("    ... and %d more", len(d.pathSuggestions)-maxShow)))
+		// Show "more below" indicator
+		if endIdx < total {
+			content.WriteString(suggestionStyle.Render(fmt.Sprintf("    ↓ %d more below", total-endIdx)))
 			content.WriteString("\n")
 		}
 	}
@@ -547,6 +661,40 @@ func (d *NewDialog) View() string {
 		content.WriteString("\n\n")
 	}
 
+	// Worktree checkbox (show when on command field or below)
+	checkboxStyle := lipgloss.NewStyle().Foreground(ColorText)
+	checkboxActiveStyle := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true)
+
+	// Checkbox display
+	checkbox := "[ ]"
+	if d.worktreeEnabled {
+		checkbox = "[x]"
+	}
+
+	// Show worktree option with hint
+	if d.focusIndex == 2 {
+		// When on command field, show as actionable
+		content.WriteString(checkboxActiveStyle.Render(fmt.Sprintf("  %s Create in worktree (press w)", checkbox)))
+	} else {
+		content.WriteString(checkboxStyle.Render(fmt.Sprintf("  %s Create in worktree", checkbox)))
+	}
+	content.WriteString("\n")
+
+	// Branch input (only visible when worktree is enabled)
+	if d.worktreeEnabled {
+		content.WriteString("\n")
+		if d.focusIndex == 3 {
+			content.WriteString(activeLabelStyle.Render("▶ Branch:"))
+		} else {
+			content.WriteString(labelStyle.Render("  Branch:"))
+		}
+		content.WriteString("\n")
+		content.WriteString("  ")
+		content.WriteString(d.branchInput.View())
+		content.WriteString("\n")
+	}
+	content.WriteString("\n")
+
 	// Claude options (only if Claude is selected)
 	if d.isClaudeSelected() {
 		content.WriteString("\n")
@@ -557,11 +705,13 @@ func (d *NewDialog) View() string {
 	helpStyle := lipgloss.NewStyle().
 		Foreground(ColorComment). // Use consistent theme color
 		MarginTop(1)
-	if d.isClaudeSelected() {
-		content.WriteString(helpStyle.Render("Tab next │ ↑↓ navigate │ Space toggle │ Enter create │ Esc cancel"))
-	} else {
-		content.WriteString(helpStyle.Render("Tab next/accept │ ↑↓ navigate │ Enter create │ Esc cancel"))
+	helpText := "Tab next/accept │ ↑↓ navigate │ Enter create │ Esc cancel"
+	if d.focusIndex == 2 {
+		helpText = "←→ command │ w worktree │ Tab next │ Enter create │ Esc cancel"
+	} else if d.isClaudeSelected() {
+		helpText = "Tab next │ ↑↓ navigate │ Space toggle │ Enter create │ Esc cancel"
 	}
+	content.WriteString(helpStyle.Render(helpText))
 
 	// Wrap in dialog box
 	dialog := dialogStyle.Render(content.String())

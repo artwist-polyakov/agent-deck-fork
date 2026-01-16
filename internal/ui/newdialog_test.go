@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestNewNewDialog(t *testing.T) {
@@ -231,5 +233,402 @@ func TestNewDialog_MalformedPathFix(t *testing.T) {
 				t.Errorf("GetValues() path = %q, want %q", path, tt.expected)
 			}
 		})
+	}
+}
+
+// TestNewDialog_TabDoesNotOverwriteCustomPath tests Issue #22:
+// When user enters a new folder path and presses Tab to move to agent selection,
+// the custom path should NOT be overwritten by a suggestion.
+func TestNewDialog_TabDoesNotOverwriteCustomPath(t *testing.T) {
+	d := NewNewDialog()
+	d.Show() // Dialog must be visible for Update to process keys
+
+	// Set up suggestions (simulating previously used paths)
+	suggestions := []string{
+		"/Users/test/old-project-1",
+		"/Users/test/old-project-2",
+	}
+	d.SetPathSuggestions(suggestions)
+
+	// User is on path field (focusIndex 1)
+	d.focusIndex = 1
+	d.updateFocus()
+
+	// User types a completely NEW path that doesn't match any suggestion
+	customPath := "/Users/test/brand-new-project"
+	d.pathInput.SetValue(customPath)
+
+	// User presses Tab to move to command selection
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	// The custom path should be PRESERVED, not overwritten
+	_, path, _ := d.GetValues()
+
+	if path != customPath {
+		t.Errorf("Tab overwrote custom path!\nGot: %q\nWant: %q\nThis is the bug from Issue #22", path, customPath)
+	}
+
+	// Focus should have moved to command field
+	if d.focusIndex != 2 {
+		t.Errorf("focusIndex = %d, want 2 (command field)", d.focusIndex)
+	}
+}
+
+// TestNewDialog_TabAppliesSuggestionWhenNavigated tests that Tab DOES apply
+// the suggestion when the user explicitly navigated to one using Ctrl+N/P.
+func TestNewDialog_TabAppliesSuggestionWhenNavigated(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	suggestions := []string{
+		"/Users/test/project-1",
+		"/Users/test/project-2",
+	}
+	d.SetPathSuggestions(suggestions)
+
+	// User is on path field
+	d.focusIndex = 1
+	d.updateFocus()
+
+	// User types something, then navigates to suggestion with Ctrl+N
+	d.pathInput.SetValue("/some/partial")
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+
+	// Now Tab should apply the suggestion
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	_, path, _ := d.GetValues()
+
+	// Should be the second suggestion (Ctrl+N moved from 0 to 1)
+	if path != "/Users/test/project-2" {
+		t.Errorf("Tab should apply suggestion after Ctrl+N navigation\nGot: %q\nWant: %q", path, "/Users/test/project-2")
+	}
+}
+
+// TestNewDialog_TypingResetsSuggestionNavigation tests that typing after
+// navigating suggestions resets the navigation state.
+func TestNewDialog_TypingResetsSuggestionNavigation(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	suggestions := []string{
+		"/Users/test/project-1",
+		"/Users/test/project-2",
+	}
+	d.SetPathSuggestions(suggestions)
+
+	d.focusIndex = 1
+	d.updateFocus()
+
+	// User navigates to a suggestion
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+
+	// Verify navigation flag is set
+	if !d.suggestionNavigated {
+		t.Error("suggestionNavigated should be true after Ctrl+N")
+	}
+
+	// User then types something new - simulate by sending a key
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+
+	// Flag should be reset
+	if d.suggestionNavigated {
+		t.Error("suggestionNavigated should be false after typing")
+	}
+
+	// Set a custom path and press Tab
+	d.pathInput.SetValue("/my/new/path")
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	_, path, _ := d.GetValues()
+
+	if path != "/my/new/path" {
+		t.Errorf("Typing should reset suggestion navigation\nGot: %q\nWant: %q", path, "/my/new/path")
+	}
+}
+
+// ===== Worktree Support Tests =====
+
+func TestNewDialog_WorktreeToggle(t *testing.T) {
+	dialog := NewNewDialog()
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled by default")
+	}
+	dialog.ToggleWorktree()
+	if !dialog.worktreeEnabled {
+		t.Error("Worktree should be enabled after toggle")
+	}
+	dialog.ToggleWorktree()
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled after second toggle")
+	}
+}
+
+func TestNewDialog_IsWorktreeEnabled(t *testing.T) {
+	dialog := NewNewDialog()
+	if dialog.IsWorktreeEnabled() {
+		t.Error("IsWorktreeEnabled should return false by default")
+	}
+	dialog.worktreeEnabled = true
+	if !dialog.IsWorktreeEnabled() {
+		t.Error("IsWorktreeEnabled should return true when enabled")
+	}
+}
+
+func TestNewDialog_GetValuesWithWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/test")
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+
+	name, path, command, branch, enabled := dialog.GetValuesWithWorktree()
+
+	if !enabled {
+		t.Error("worktreeEnabled should be true")
+	}
+	if branch != "feature/test" {
+		t.Errorf("Branch: got %q, want %q", branch, "feature/test")
+	}
+	if name != "test-session" {
+		t.Errorf("Name: got %q, want %q", name, "test-session")
+	}
+	if path != "/tmp/project" {
+		t.Errorf("Path: got %q, want %q", path, "/tmp/project")
+	}
+	// command should be empty or shell when commandCursor is 0
+	_ = command
+}
+
+func TestNewDialog_GetValuesWithWorktree_Disabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = false
+	dialog.branchInput.SetValue("feature/test")
+
+	_, _, _, branch, enabled := dialog.GetValuesWithWorktree()
+
+	if enabled {
+		t.Error("worktreeEnabled should be false")
+	}
+	// Branch value is still returned even when disabled
+	if branch != "feature/test" {
+		t.Errorf("Branch: got %q, want %q", branch, "feature/test")
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_EmptyBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("")
+
+	err := dialog.Validate()
+	if err == "" {
+		t.Error("Validation should fail when worktree enabled but branch is empty")
+	}
+	if err != "Branch name required for worktree" {
+		t.Errorf("Unexpected error message: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_InvalidBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature..test") // Invalid: contains ..
+
+	err := dialog.Validate()
+	if err == "" {
+		t.Error("Validation should fail for invalid branch name")
+	}
+	if err != "branch name cannot contain '..'" {
+		t.Errorf("Unexpected error message: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_ValidBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/test-branch")
+
+	err := dialog.Validate()
+	if err != "" {
+		t.Errorf("Validation should pass for valid branch, got: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeDisabled_IgnoresBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = false
+	dialog.branchInput.SetValue("") // Empty branch, but worktree disabled
+
+	err := dialog.Validate()
+	if err != "" {
+		t.Errorf("Validation should pass when worktree disabled, got: %q", err)
+	}
+}
+
+func TestNewDialog_ShowInGroup_ResetsWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/old-branch")
+
+	dialog.ShowInGroup("projects", "Projects")
+
+	if dialog.worktreeEnabled {
+		t.Error("worktreeEnabled should be reset to false on ShowInGroup")
+	}
+	if dialog.branchInput.Value() != "" {
+		t.Errorf("branchInput should be reset, got: %q", dialog.branchInput.Value())
+	}
+}
+
+func TestNewDialog_BranchInputInitialized(t *testing.T) {
+	dialog := NewNewDialog()
+
+	// Verify branch input is properly initialized
+	if dialog.branchInput.Placeholder != "feature/branch-name" {
+		t.Errorf("branchInput placeholder: got %q, want %q",
+			dialog.branchInput.Placeholder, "feature/branch-name")
+	}
+}
+
+func TestNewDialog_WorktreeToggle_ViaKeyPress(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.focusIndex = 2 // Command field
+
+	// Press 'w' to toggle worktree
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+
+	if !dialog.worktreeEnabled {
+		t.Error("Worktree should be enabled after pressing 'w' on command field")
+	}
+
+	// Focus should move to branch field
+	if dialog.focusIndex != 3 {
+		t.Errorf("Focus should move to branch field (3), got %d", dialog.focusIndex)
+	}
+
+	// Press 'w' again to disable (need to be on command field)
+	dialog.focusIndex = 2
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled after pressing 'w' again")
+	}
+}
+
+func TestNewDialog_TabNavigationWithWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.focusIndex = 0
+	dialog.worktreeEnabled = true
+
+	// Tab through all fields: 0 -> 1 -> 2 -> 3 -> 0
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 1 {
+		t.Errorf("After first Tab, focusIndex = %d, want 1", dialog.focusIndex)
+	}
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 2 {
+		t.Errorf("After second Tab, focusIndex = %d, want 2", dialog.focusIndex)
+	}
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 3 {
+		t.Errorf("After third Tab, focusIndex = %d, want 3 (branch field)", dialog.focusIndex)
+	}
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 0 {
+		t.Errorf("After fourth Tab, focusIndex = %d, want 0 (wrap around)", dialog.focusIndex)
+	}
+}
+
+func TestNewDialog_TabNavigationWithoutWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.focusIndex = 0
+	dialog.worktreeEnabled = false
+
+	// Tab through fields: 0 -> 1 -> 2 -> 0 (no branch field)
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 1 {
+		t.Errorf("After first Tab, focusIndex = %d, want 1", dialog.focusIndex)
+	}
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 2 {
+		t.Errorf("After second Tab, focusIndex = %d, want 2", dialog.focusIndex)
+	}
+
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 0 {
+		t.Errorf("After third Tab, focusIndex = %d, want 0 (wrap around, skip branch)", dialog.focusIndex)
+	}
+}
+
+func TestNewDialog_View_ShowsWorktreeCheckbox(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.focusIndex = 2 // Command field
+
+	view := dialog.View()
+
+	// Should show worktree checkbox
+	if !strings.Contains(view, "Create in worktree") {
+		t.Error("View should contain 'Create in worktree' checkbox")
+	}
+
+	// Should show hint when on command field
+	if !strings.Contains(view, "press w") {
+		t.Error("View should contain 'press w' hint when on command field")
+	}
+}
+
+func TestNewDialog_View_ShowsBranchInputWhenEnabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.worktreeEnabled = true
+
+	view := dialog.View()
+
+	// Should show branch input
+	if !strings.Contains(view, "Branch:") {
+		t.Error("View should contain 'Branch:' label when worktree enabled")
+	}
+
+	// Checkbox should be checked
+	if !strings.Contains(view, "[x]") {
+		t.Error("View should show checked checkbox [x] when worktree enabled")
+	}
+}
+
+func TestNewDialog_View_HidesBranchInputWhenDisabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.worktreeEnabled = false
+
+	view := dialog.View()
+
+	// Should NOT show branch input label
+	if strings.Contains(view, "Branch:") {
+		t.Error("View should NOT contain 'Branch:' label when worktree disabled")
+	}
+
+	// Checkbox should be unchecked
+	if !strings.Contains(view, "[ ]") {
+		t.Error("View should show unchecked checkbox [ ] when worktree disabled")
 	}
 }

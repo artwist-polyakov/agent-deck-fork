@@ -6,167 +6,175 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Tokyo Night Color Palette
+// Theme represents the current color scheme
+type Theme string
+
 const (
-	ColorBg      = lipgloss.Color("#1a1b26") // Dark background
-	ColorSurface = lipgloss.Color("#24283b") // Surface background
-	ColorBorder  = lipgloss.Color("#414868") // Border color
-	ColorText    = lipgloss.Color("#c0caf5") // Primary text
-	ColorTextDim = lipgloss.Color("#787fa0") // Dim text (WCAG AA compliant - 4.6:1 contrast)
-	ColorAccent  = lipgloss.Color("#7aa2f7") // Accent blue
-	ColorPurple  = lipgloss.Color("#bb9af7") // Purple
-	ColorCyan    = lipgloss.Color("#7dcfff") // Cyan
-	ColorGreen   = lipgloss.Color("#9ece6a") // Green
-	ColorYellow  = lipgloss.Color("#e0af68") // Yellow
-	ColorOrange  = lipgloss.Color("#ff9e64") // Orange
-	ColorRed     = lipgloss.Color("#f7768e") // Red
-	ColorComment = lipgloss.Color("#787fa0") // Comment gray (WCAG AA compliant - 4.6:1 contrast)
+	ThemeDark  Theme = "dark"
+	ThemeLight Theme = "light"
 )
+
+// currentTheme holds the active theme (set at init)
+var currentTheme Theme = ThemeDark
+
+// Dark Theme - Tokyo Night
+var darkColors = struct {
+	Bg, Surface, Border, Text, TextDim  lipgloss.Color
+	Accent, Purple, Cyan, Green, Yellow lipgloss.Color
+	Orange, Red, Comment                lipgloss.Color
+}{
+	Bg:      lipgloss.Color("#1a1b26"),
+	Surface: lipgloss.Color("#24283b"),
+	Border:  lipgloss.Color("#414868"),
+	Text:    lipgloss.Color("#c0caf5"),
+	TextDim: lipgloss.Color("#787fa0"),
+	Accent:  lipgloss.Color("#7aa2f7"),
+	Purple:  lipgloss.Color("#bb9af7"),
+	Cyan:    lipgloss.Color("#7dcfff"),
+	Green:   lipgloss.Color("#9ece6a"),
+	Yellow:  lipgloss.Color("#e0af68"),
+	Orange:  lipgloss.Color("#ff9e64"),
+	Red:     lipgloss.Color("#f7768e"),
+	Comment: lipgloss.Color("#787fa0"),
+}
+
+// Light Theme - Tokyo Night Light variant
+var lightColors = struct {
+	Bg, Surface, Border, Text, TextDim  lipgloss.Color
+	Accent, Purple, Cyan, Green, Yellow lipgloss.Color
+	Orange, Red, Comment                lipgloss.Color
+}{
+	Bg:      lipgloss.Color("#d5d6db"),
+	Surface: lipgloss.Color("#e9e9ec"),
+	Border:  lipgloss.Color("#9699a3"),
+	Text:    lipgloss.Color("#343b58"),
+	TextDim: lipgloss.Color("#6a6d7c"),
+	Accent:  lipgloss.Color("#34548a"),
+	Purple:  lipgloss.Color("#7847bd"),
+	Cyan:    lipgloss.Color("#166775"),
+	Green:   lipgloss.Color("#485e30"),
+	Yellow:  lipgloss.Color("#8f5e15"),
+	Orange:  lipgloss.Color("#965027"),
+	Red:     lipgloss.Color("#8c4351"),
+	Comment: lipgloss.Color("#6a6d7c"),
+}
+
+// Active color variables (set by InitTheme)
+var (
+	ColorBg      lipgloss.Color
+	ColorSurface lipgloss.Color
+	ColorBorder  lipgloss.Color
+	ColorText    lipgloss.Color
+	ColorTextDim lipgloss.Color
+	ColorAccent  lipgloss.Color
+	ColorPurple  lipgloss.Color
+	ColorCyan    lipgloss.Color
+	ColorGreen   lipgloss.Color
+	ColorYellow  lipgloss.Color
+	ColorOrange  lipgloss.Color
+	ColorRed     lipgloss.Color
+	ColorComment lipgloss.Color
+)
+
+// InitTheme sets the active color palette based on theme name
+// Must be called before any UI rendering
+func InitTheme(theme string) {
+	if theme == "light" {
+		currentTheme = ThemeLight
+		ColorBg = lightColors.Bg
+		ColorSurface = lightColors.Surface
+		ColorBorder = lightColors.Border
+		ColorText = lightColors.Text
+		ColorTextDim = lightColors.TextDim
+		ColorAccent = lightColors.Accent
+		ColorPurple = lightColors.Purple
+		ColorCyan = lightColors.Cyan
+		ColorGreen = lightColors.Green
+		ColorYellow = lightColors.Yellow
+		ColorOrange = lightColors.Orange
+		ColorRed = lightColors.Red
+		ColorComment = lightColors.Comment
+	} else {
+		currentTheme = ThemeDark
+		ColorBg = darkColors.Bg
+		ColorSurface = darkColors.Surface
+		ColorBorder = darkColors.Border
+		ColorText = darkColors.Text
+		ColorTextDim = darkColors.TextDim
+		ColorAccent = darkColors.Accent
+		ColorPurple = darkColors.Purple
+		ColorCyan = darkColors.Cyan
+		ColorGreen = darkColors.Green
+		ColorYellow = darkColors.Yellow
+		ColorOrange = darkColors.Orange
+		ColorRed = darkColors.Red
+		ColorComment = darkColors.Comment
+	}
+	// Reinitialize styles with new colors
+	initStyles()
+}
+
+// GetCurrentTheme returns the active theme
+func GetCurrentTheme() Theme {
+	return currentTheme
+}
+
+func init() {
+	// Default to dark theme at package init
+	InitTheme("dark")
+}
 
 // Base Styles
 var (
-	BaseStyle = lipgloss.NewStyle().
-			Foreground(ColorText).
-			Background(ColorBg)
-
-	TitleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(ColorAccent).
-			Background(ColorSurface).
-			Padding(0, 1)
-
-	PanelStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ColorBorder).
-			Padding(0, 1)
-
-	HighlightStyle = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorAccent).
-			Bold(true)
-
-	DimStyle = lipgloss.NewStyle().
-			Foreground(ColorComment)
-
-	ErrorStyle = lipgloss.NewStyle().
-			Foreground(ColorRed).
-			Bold(true)
-
-	SuccessStyle = lipgloss.NewStyle().
-			Foreground(ColorGreen).
-			Bold(true)
-
-	WarningStyle = lipgloss.NewStyle().
-			Foreground(ColorYellow).
-			Bold(true)
-
-	InfoStyle = lipgloss.NewStyle().
-			Foreground(ColorCyan)
+	BaseStyle      lipgloss.Style
+	TitleStyle     lipgloss.Style
+	PanelStyle     lipgloss.Style
+	HighlightStyle lipgloss.Style
+	DimStyle       lipgloss.Style
+	ErrorStyle     lipgloss.Style
+	SuccessStyle   lipgloss.Style
+	WarningStyle   lipgloss.Style
+	InfoStyle      lipgloss.Style
 )
 
 // Status Indicator Styles
 var (
-	RunningStyle = lipgloss.NewStyle().
-			Foreground(ColorGreen).
-			Bold(true)
-
-	WaitingStyle = lipgloss.NewStyle().
-			Foreground(ColorYellow).
-			Bold(true)
-
-	IdleStyle = lipgloss.NewStyle().
-			Foreground(ColorComment)
-
-	ErrorIndicatorStyle = lipgloss.NewStyle().
-				Foreground(ColorRed).
-				Bold(true)
+	RunningStyle        lipgloss.Style
+	WaitingStyle        lipgloss.Style
+	IdleStyle           lipgloss.Style
+	ErrorIndicatorStyle lipgloss.Style
 )
 
 // Menu Bar Styles
 var (
-	MenuBarStyle = lipgloss.NewStyle().
-			Background(ColorSurface).
-			Foreground(ColorText).
-			Padding(0, 1)
-
-	MenuKeyStyle = lipgloss.NewStyle().
-			Foreground(ColorAccent).
-			Bold(true)
-
-	MenuDescStyle = lipgloss.NewStyle().
-			Foreground(ColorText)
-
-	MenuSeparatorStyle = lipgloss.NewStyle().
-				Foreground(ColorBorder)
+	MenuBarStyle       lipgloss.Style
+	MenuKeyStyle       lipgloss.Style
+	MenuDescStyle      lipgloss.Style
+	MenuSeparatorStyle lipgloss.Style
 )
 
 // Search Styles
 var (
-	SearchBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ColorAccent).
-			Padding(0, 1).
-			Foreground(ColorText)
-
-	SearchPromptStyle = lipgloss.NewStyle().
-				Foreground(ColorPurple).
-				Bold(true)
-
-	SearchMatchStyle = lipgloss.NewStyle().
-				Background(ColorYellow).
-				Foreground(ColorBg).
-				Bold(true)
+	SearchBoxStyle    lipgloss.Style
+	SearchPromptStyle lipgloss.Style
+	SearchMatchStyle  lipgloss.Style
 )
 
 // Dialog Styles
 var (
-	DialogBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ColorPurple).
-			Padding(1, 2).
-			Background(ColorSurface)
-
-	DialogTitleStyle = lipgloss.NewStyle().
-				Foreground(ColorPurple).
-				Bold(true).
-				Align(lipgloss.Center)
-
-	DialogButtonStyle = lipgloss.NewStyle().
-				Foreground(ColorAccent).
-				Background(ColorBorder).
-				Padding(0, 2).
-				MarginRight(1)
-
-	DialogButtonActiveStyle = lipgloss.NewStyle().
-				Foreground(ColorBg).
-				Background(ColorAccent).
-				Padding(0, 2).
-				MarginRight(1).
-				Bold(true)
+	DialogBoxStyle          lipgloss.Style
+	DialogTitleStyle        lipgloss.Style
+	DialogButtonStyle       lipgloss.Style
+	DialogButtonActiveStyle lipgloss.Style
 )
 
 // Preview Pane Styles
 var (
-	PreviewPanelStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(ColorBorder).
-				Padding(1)
-
-	PreviewTitleStyle = lipgloss.NewStyle().
-				Foreground(ColorCyan).
-				Bold(true).
-				Underline(true)
-
-	PreviewHeaderStyle = lipgloss.NewStyle().
-				Foreground(ColorPurple).
-				Bold(true)
-
-	PreviewContentStyle = lipgloss.NewStyle().
-				Foreground(ColorText)
-
-	PreviewMetaStyle = lipgloss.NewStyle().
-				Foreground(ColorComment).
-				Italic(true)
+	PreviewPanelStyle   lipgloss.Style
+	PreviewTitleStyle   lipgloss.Style
+	PreviewHeaderStyle  lipgloss.Style
+	PreviewContentStyle lipgloss.Style
+	PreviewMetaStyle    lipgloss.Style
 )
 
 // Tool Icons
@@ -177,6 +185,356 @@ const (
 	IconCodex    = "💻"
 	IconShell    = "🐚"
 )
+
+// List Item Styles (used by legacy list.go component in tests)
+var (
+	ListItemStyle       lipgloss.Style
+	ListItemActiveStyle lipgloss.Style
+)
+
+// Tag Styles
+var (
+	TagStyle       lipgloss.Style
+	TagActiveStyle lipgloss.Style
+	TagErrorStyle  lipgloss.Style
+)
+
+// Timestamp Style
+var TimestampStyle lipgloss.Style
+
+// Folder Styles
+var (
+	FolderStyle          lipgloss.Style
+	FolderCollapsedStyle lipgloss.Style
+)
+
+// Session Item Styles
+var (
+	SessionItemStyle         lipgloss.Style
+	SessionItemSelectedStyle lipgloss.Style
+)
+
+// Session List Rendering Styles (PERFORMANCE: cached at package level)
+// These styles are used by renderSessionItem() and renderGroupItem() to avoid
+// repeated allocations on every View() call
+var (
+	// Tree connector styles
+	TreeConnectorStyle    lipgloss.Style
+	TreeConnectorSelStyle lipgloss.Style
+
+	// Session status indicator styles
+	SessionStatusRunning  lipgloss.Style
+	SessionStatusWaiting  lipgloss.Style
+	SessionStatusIdle     lipgloss.Style
+	SessionStatusError    lipgloss.Style
+	SessionStatusSelStyle lipgloss.Style
+
+	// Session title styles by state
+	SessionTitleDefault  lipgloss.Style
+	SessionTitleActive   lipgloss.Style
+	SessionTitleError    lipgloss.Style
+	SessionTitleSelStyle lipgloss.Style
+
+	// Selection indicator
+	SessionSelectionPrefix lipgloss.Style
+
+	// Group item styles
+	GroupExpandStyle   lipgloss.Style
+	GroupNameStyle     lipgloss.Style
+	GroupCountStyle    lipgloss.Style
+	GroupHotkeyStyle   lipgloss.Style
+	GroupStatusRunning lipgloss.Style
+	GroupStatusWaiting lipgloss.Style
+
+	// Group selected styles
+	GroupNameSelStyle   lipgloss.Style
+	GroupCountSelStyle  lipgloss.Style
+	GroupExpandSelStyle lipgloss.Style
+)
+
+// ToolStyleCache provides pre-allocated styles for each tool type
+// Avoids repeated lipgloss.NewStyle() calls in renderSessionItem()
+var ToolStyleCache map[string]lipgloss.Style
+
+// DefaultToolStyle is used when tool is not in cache
+var DefaultToolStyle lipgloss.Style
+
+// Menu Styles
+var MenuStyle lipgloss.Style
+
+// Additional Styles
+var (
+	SubtitleStyle lipgloss.Style
+	ColorError    lipgloss.Color
+	ColorSuccess  lipgloss.Color
+	ColorWarning  lipgloss.Color
+	ColorPrimary  lipgloss.Color
+)
+
+// LogoBorderStyle for the grid lines
+var LogoBorderStyle lipgloss.Style
+
+// LogoFrames kept for backward compatibility (empty state default)
+var LogoFrames = [][]string{
+	{"●", "◐", "○"},
+}
+
+// initStyles initializes all style variables with current theme colors
+// Called by InitTheme after color variables are set
+func initStyles() {
+	// Base Styles
+	BaseStyle = lipgloss.NewStyle().
+		Foreground(ColorText).
+		Background(ColorBg)
+
+	TitleStyle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(ColorAccent).
+		Background(ColorSurface).
+		Padding(0, 1)
+
+	PanelStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorBorder).
+		Padding(0, 1)
+
+	HighlightStyle = lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorAccent).
+		Bold(true)
+
+	DimStyle = lipgloss.NewStyle().
+		Foreground(ColorComment)
+
+	ErrorStyle = lipgloss.NewStyle().
+		Foreground(ColorRed).
+		Bold(true)
+
+	SuccessStyle = lipgloss.NewStyle().
+		Foreground(ColorGreen).
+		Bold(true)
+
+	WarningStyle = lipgloss.NewStyle().
+		Foreground(ColorYellow).
+		Bold(true)
+
+	InfoStyle = lipgloss.NewStyle().
+		Foreground(ColorCyan)
+
+	// Status Indicator Styles
+	RunningStyle = lipgloss.NewStyle().
+		Foreground(ColorGreen).
+		Bold(true)
+
+	WaitingStyle = lipgloss.NewStyle().
+		Foreground(ColorYellow).
+		Bold(true)
+
+	IdleStyle = lipgloss.NewStyle().
+		Foreground(ColorComment)
+
+	ErrorIndicatorStyle = lipgloss.NewStyle().
+		Foreground(ColorRed).
+		Bold(true)
+
+	// Menu Bar Styles
+	MenuBarStyle = lipgloss.NewStyle().
+		Background(ColorSurface).
+		Foreground(ColorText).
+		Padding(0, 1)
+
+	MenuKeyStyle = lipgloss.NewStyle().
+		Foreground(ColorAccent).
+		Bold(true)
+
+	MenuDescStyle = lipgloss.NewStyle().
+		Foreground(ColorText)
+
+	MenuSeparatorStyle = lipgloss.NewStyle().
+		Foreground(ColorBorder)
+
+	// Search Styles
+	SearchBoxStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorAccent).
+		Padding(0, 1).
+		Foreground(ColorText)
+
+	SearchPromptStyle = lipgloss.NewStyle().
+		Foreground(ColorPurple).
+		Bold(true)
+
+	SearchMatchStyle = lipgloss.NewStyle().
+		Background(ColorYellow).
+		Foreground(ColorBg).
+		Bold(true)
+
+	// Dialog Styles
+	DialogBoxStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorPurple).
+		Padding(1, 2).
+		Background(ColorSurface)
+
+	DialogTitleStyle = lipgloss.NewStyle().
+		Foreground(ColorPurple).
+		Bold(true).
+		Align(lipgloss.Center)
+
+	DialogButtonStyle = lipgloss.NewStyle().
+		Foreground(ColorAccent).
+		Background(ColorBorder).
+		Padding(0, 2).
+		MarginRight(1)
+
+	DialogButtonActiveStyle = lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorAccent).
+		Padding(0, 2).
+		MarginRight(1).
+		Bold(true)
+
+	// Preview Pane Styles
+	PreviewPanelStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorBorder).
+		Padding(1)
+
+	PreviewTitleStyle = lipgloss.NewStyle().
+		Foreground(ColorCyan).
+		Bold(true).
+		Underline(true)
+
+	PreviewHeaderStyle = lipgloss.NewStyle().
+		Foreground(ColorPurple).
+		Bold(true)
+
+	PreviewContentStyle = lipgloss.NewStyle().
+		Foreground(ColorText)
+
+	PreviewMetaStyle = lipgloss.NewStyle().
+		Foreground(ColorComment).
+		Italic(true)
+
+	// List Item Styles
+	ListItemStyle = lipgloss.NewStyle().
+		Foreground(ColorText).
+		PaddingLeft(2)
+
+	ListItemActiveStyle = lipgloss.NewStyle().
+		Foreground(ColorAccent).
+		Bold(true).
+		PaddingLeft(2)
+
+	// Tag Styles
+	TagStyle = lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorPurple).
+		Padding(0, 1).
+		MarginRight(1)
+
+	TagActiveStyle = lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorGreen).
+		Padding(0, 1).
+		MarginRight(1)
+
+	TagErrorStyle = lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorRed).
+		Padding(0, 1).
+		MarginRight(1)
+
+	// Timestamp Style
+	TimestampStyle = lipgloss.NewStyle().
+		Foreground(ColorComment).
+		Italic(true)
+
+	// Folder Styles
+	FolderStyle = lipgloss.NewStyle().
+		Foreground(ColorAccent).
+		Bold(true)
+
+	FolderCollapsedStyle = lipgloss.NewStyle().
+		Foreground(ColorComment)
+
+	// Session Item Styles
+	SessionItemStyle = lipgloss.NewStyle().
+		Foreground(ColorText).
+		PaddingLeft(2)
+
+	SessionItemSelectedStyle = lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorAccent).
+		Bold(true).
+		PaddingLeft(0)
+
+	// Tree connector styles
+	TreeConnectorStyle = lipgloss.NewStyle().Foreground(ColorText)
+	TreeConnectorSelStyle = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
+
+	// Session status indicator styles
+	SessionStatusRunning = lipgloss.NewStyle().Foreground(ColorGreen)
+	SessionStatusWaiting = lipgloss.NewStyle().Foreground(ColorYellow)
+	SessionStatusIdle = lipgloss.NewStyle().Foreground(ColorTextDim)
+	SessionStatusError = lipgloss.NewStyle().Foreground(ColorRed)
+	SessionStatusSelStyle = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
+
+	// Session title styles by state
+	SessionTitleDefault = lipgloss.NewStyle().Foreground(ColorText)
+	SessionTitleActive = lipgloss.NewStyle().Foreground(ColorText).Bold(true)
+	SessionTitleError = lipgloss.NewStyle().Foreground(ColorText).Underline(true)
+	SessionTitleSelStyle = lipgloss.NewStyle().Bold(true).Foreground(ColorBg).Background(ColorAccent)
+
+	// Selection indicator
+	SessionSelectionPrefix = lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
+
+	// Group item styles
+	GroupExpandStyle = lipgloss.NewStyle().Foreground(ColorText)
+	GroupNameStyle = lipgloss.NewStyle().Bold(true).Foreground(ColorCyan)
+	GroupCountStyle = lipgloss.NewStyle().Foreground(ColorText)
+	GroupHotkeyStyle = lipgloss.NewStyle().Foreground(ColorComment)
+	GroupStatusRunning = lipgloss.NewStyle().Foreground(ColorGreen)
+	GroupStatusWaiting = lipgloss.NewStyle().Foreground(ColorYellow)
+
+	// Group selected styles
+	GroupNameSelStyle = lipgloss.NewStyle().Bold(true).Foreground(ColorBg).Background(ColorAccent)
+	GroupCountSelStyle = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
+	GroupExpandSelStyle = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
+
+	// ToolStyleCache - reinitialize with current theme colors
+	ToolStyleCache = map[string]lipgloss.Style{
+		"claude":   lipgloss.NewStyle().Foreground(ColorOrange),
+		"gemini":   lipgloss.NewStyle().Foreground(ColorPurple),
+		"codex":    lipgloss.NewStyle().Foreground(ColorCyan),
+		"aider":    lipgloss.NewStyle().Foreground(ColorRed),
+		"cursor":   lipgloss.NewStyle().Foreground(ColorAccent),
+		"shell":    lipgloss.NewStyle().Foreground(ColorText),
+		"opencode": lipgloss.NewStyle().Foreground(ColorText),
+	}
+
+	// DefaultToolStyle
+	DefaultToolStyle = lipgloss.NewStyle().Foreground(ColorText)
+
+	// Menu Styles
+	MenuStyle = lipgloss.NewStyle().
+		Background(ColorSurface).
+		Foreground(ColorText).
+		Padding(0, 1)
+
+	// Additional Styles
+	SubtitleStyle = lipgloss.NewStyle().
+		Foreground(ColorComment).
+		Italic(true)
+
+	ColorError = ColorRed
+	ColorSuccess = ColorGreen
+	ColorWarning = ColorYellow
+	ColorPrimary = ColorAccent
+
+	// LogoBorderStyle
+	LogoBorderStyle = lipgloss.NewStyle().Foreground(ColorBorder)
+}
 
 // Helper Functions
 
@@ -251,156 +609,12 @@ func ToolColor(tool string) lipgloss.Color {
 	}
 }
 
-// List Item Styles (used by legacy list.go component in tests)
-var (
-	ListItemStyle = lipgloss.NewStyle().
-			Foreground(ColorText).
-			PaddingLeft(2)
-
-	ListItemActiveStyle = lipgloss.NewStyle().
-				Foreground(ColorAccent).
-				Bold(true).
-				PaddingLeft(2)
-)
-
-// Tag Styles
-var (
-	TagStyle = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorPurple).
-			Padding(0, 1).
-			MarginRight(1)
-
-	TagActiveStyle = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorGreen).
-			Padding(0, 1).
-			MarginRight(1)
-
-	TagErrorStyle = lipgloss.NewStyle().
-			Foreground(ColorBg).
-			Background(ColorRed).
-			Padding(0, 1).
-			MarginRight(1)
-)
-
-// Timestamp Style
-var (
-	TimestampStyle = lipgloss.NewStyle().
-		Foreground(ColorComment).
-		Italic(true)
-)
-
-// Folder Styles
-var (
-	FolderStyle = lipgloss.NewStyle().
-			Foreground(ColorAccent).
-			Bold(true)
-
-	FolderCollapsedStyle = lipgloss.NewStyle().
-				Foreground(ColorComment)
-)
-
-// Session Item Styles
-var (
-	SessionItemStyle = lipgloss.NewStyle().
-				Foreground(ColorText).
-				PaddingLeft(2)
-
-	SessionItemSelectedStyle = lipgloss.NewStyle().
-					Foreground(ColorBg).
-					Background(ColorAccent).
-					Bold(true).
-					PaddingLeft(0)
-)
-
-// Session List Rendering Styles (PERFORMANCE: cached at package level)
-// These styles are used by renderSessionItem() and renderGroupItem() to avoid
-// repeated allocations on every View() call
-var (
-	// Tree connector styles
-	TreeConnectorStyle    = lipgloss.NewStyle().Foreground(ColorText)
-	TreeConnectorSelStyle = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
-
-	// Session status indicator styles
-	SessionStatusRunning  = lipgloss.NewStyle().Foreground(ColorGreen)
-	SessionStatusWaiting  = lipgloss.NewStyle().Foreground(ColorYellow)
-	SessionStatusIdle     = lipgloss.NewStyle().Foreground(ColorTextDim)
-	SessionStatusError    = lipgloss.NewStyle().Foreground(ColorRed)
-	SessionStatusSelStyle = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
-
-	// Session title styles by state
-	SessionTitleDefault  = lipgloss.NewStyle().Foreground(ColorText)
-	SessionTitleActive   = lipgloss.NewStyle().Foreground(ColorText).Bold(true)
-	SessionTitleError    = lipgloss.NewStyle().Foreground(ColorText).Underline(true)
-	SessionTitleSelStyle = lipgloss.NewStyle().Bold(true).Foreground(ColorBg).Background(ColorAccent)
-
-	// Selection indicator
-	SessionSelectionPrefix = lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
-
-	// Group item styles
-	GroupExpandStyle   = lipgloss.NewStyle().Foreground(ColorText)
-	GroupNameStyle     = lipgloss.NewStyle().Bold(true).Foreground(ColorCyan)
-	GroupCountStyle    = lipgloss.NewStyle().Foreground(ColorText)
-	GroupHotkeyStyle   = lipgloss.NewStyle().Foreground(ColorComment)
-	GroupStatusRunning = lipgloss.NewStyle().Foreground(ColorGreen)
-	GroupStatusWaiting = lipgloss.NewStyle().Foreground(ColorYellow)
-
-	// Group selected styles
-	GroupNameSelStyle   = lipgloss.NewStyle().Bold(true).Foreground(ColorBg).Background(ColorAccent)
-	GroupCountSelStyle  = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
-	GroupExpandSelStyle = lipgloss.NewStyle().Foreground(ColorBg).Background(ColorAccent)
-)
-
-// ToolStyleCache provides pre-allocated styles for each tool type
-// Avoids repeated lipgloss.NewStyle() calls in renderSessionItem()
-var ToolStyleCache = map[string]lipgloss.Style{
-	"claude":   lipgloss.NewStyle().Foreground(ColorOrange),
-	"gemini":   lipgloss.NewStyle().Foreground(ColorPurple),
-	"codex":    lipgloss.NewStyle().Foreground(ColorCyan),
-	"aider":    lipgloss.NewStyle().Foreground(ColorRed),
-	"cursor":   lipgloss.NewStyle().Foreground(ColorAccent),
-	"shell":    lipgloss.NewStyle().Foreground(ColorText),
-	"opencode": lipgloss.NewStyle().Foreground(ColorText),
-}
-
-// DefaultToolStyle is used when tool is not in cache
-var DefaultToolStyle = lipgloss.NewStyle().Foreground(ColorText)
-
 // GetToolStyle returns cached style for tool or default
 func GetToolStyle(tool string) lipgloss.Style {
 	if style, ok := ToolStyleCache[tool]; ok {
 		return style
 	}
 	return DefaultToolStyle
-}
-
-// Menu Styles
-var (
-	MenuStyle = lipgloss.NewStyle().
-		Background(ColorSurface).
-		Foreground(ColorText).
-		Padding(0, 1)
-)
-
-// Additional Styles
-var (
-	SubtitleStyle = lipgloss.NewStyle().
-			Foreground(ColorComment).
-			Italic(true)
-
-	ColorError   = ColorRed
-	ColorSuccess = ColorGreen
-	ColorWarning = ColorYellow
-	ColorPrimary = ColorAccent
-)
-
-// LogoBorderStyle for the grid lines
-var LogoBorderStyle = lipgloss.NewStyle().Foreground(ColorBorder)
-
-// LogoFrames kept for backward compatibility (empty state default)
-var LogoFrames = [][]string{
-	{"●", "◐", "○"},
 }
 
 // RenderLogoIndicator renders a single indicator with appropriate color

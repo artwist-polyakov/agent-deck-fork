@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/asheshgoplani/agent-deck/internal/mcppool"
+	"github.com/asheshgoplani/agent-deck/internal/platform"
 )
 
 // Global MCP pool instance
@@ -33,15 +34,36 @@ func InitializeGlobalPool(ctx context.Context, config *UserConfig, sessions []*I
 		return nil, nil // Pool disabled, not an error
 	}
 
+	// Check platform compatibility for Unix sockets
+	// WSL1 and Windows don't reliably support Unix domain sockets
+	detectedPlatform := platform.Detect()
+	if !platform.SupportsUnixSockets() {
+		log.Printf("[Pool] Platform '%s' detected - MCP socket pooling disabled", detectedPlatform)
+		log.Printf("[Pool] MCPs will use stdio mode (each session spawns its own MCP processes)")
+		if detectedPlatform == platform.PlatformWSL1 {
+			log.Printf("[Pool] Tip: WSL2 supports socket pooling. Run 'wsl --set-version <distro> 2' to upgrade")
+		}
+		return nil, nil // Platform doesn't support sockets, not an error
+	}
+
+	log.Printf("[Pool] Platform '%s' detected - socket pooling supported", detectedPlatform)
 	log.Printf("[Pool] Pool enabled, creating pool...")
 
 	// Create pool config
+	// FallbackStdio is forced to true for safety (Issue #36):
+	// - Pool sockets may not be ready immediately after TUI starts
+	// - Instant socket check (no blocking) means fallback is essential
+	// - Falling back to stdio is safe - MCPs work, just use more memory
+	//
+	// Note: The config field fallback_to_stdio is effectively ignored and
+	// always treated as true. This ensures session creation never fails
+	// due to pool initialization timing.
 	poolConfig := &mcppool.PoolConfig{
 		Enabled:       config.MCPPool.Enabled,
 		PoolAll:       config.MCPPool.PoolAll,
 		ExcludeMCPs:   config.MCPPool.ExcludeMCPs,
 		PoolMCPs:      config.MCPPool.PoolMCPs,
-		FallbackStdio: config.MCPPool.FallbackStdio,
+		FallbackStdio: true, // Always true - see Issue #36
 	}
 
 	// Create pool

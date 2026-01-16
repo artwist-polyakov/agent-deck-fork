@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/BurntSushi/toml"
+	"github.com/asheshgoplani/agent-deck/internal/platform"
 )
 
 // UserConfigFileName is the TOML config file for user preferences
@@ -20,6 +22,9 @@ type UserConfig struct {
 	// If empty or invalid, defaults to "shell" (no pre-selection)
 	DefaultTool string `toml:"default_tool"`
 
+	// Theme sets the color scheme: "dark" (default) or "light"
+	Theme string `toml:"theme"`
+
 	// Tools defines custom AI tool configurations
 	Tools map[string]ToolDef `toml:"tools"`
 
@@ -29,6 +34,9 @@ type UserConfig struct {
 
 	// Claude defines Claude Code integration settings
 	Claude ClaudeSettings `toml:"claude"`
+
+	// Worktree defines git worktree preferences
+	Worktree WorktreeSettings `toml:"worktree"`
 
 	// GlobalSearch defines global conversation search settings
 	GlobalSearch GlobalSearchSettings `toml:"global_search"`
@@ -41,6 +49,9 @@ type UserConfig struct {
 
 	// Updates defines auto-update settings
 	Updates UpdateSettings `toml:"updates"`
+
+	// Preview defines preview pane display settings
+	Preview PreviewSettings `toml:"preview"`
 }
 
 // MCPPoolSettings defines HTTP MCP pool configuration
@@ -78,6 +89,9 @@ type MCPPoolSettings struct {
 
 	// ExcludeMCPs excludes specific MCPs from pool when pool_all = true
 	ExcludeMCPs []string `toml:"exclude_mcps"`
+
+	// SocketWaitTimeout is seconds to wait for socket to become ready (default: 5)
+	SocketWaitTimeout int `toml:"socket_wait_timeout"`
 }
 
 // LogSettings defines log file management configuration
@@ -115,8 +129,50 @@ type UpdateSettings struct {
 	NotifyInCLI bool `toml:"notify_in_cli"`
 }
 
+// PreviewSettings defines preview pane configuration
+type PreviewSettings struct {
+	// ShowOutput shows terminal output in preview pane (including launch animation)
+	// Default: true (pointer to distinguish "not set" from "explicitly false")
+	ShowOutput *bool `toml:"show_output"`
+
+	// ShowAnalytics shows session analytics panel for Claude sessions
+	// Default: true (pointer to distinguish "not set" from "explicitly false")
+	ShowAnalytics *bool `toml:"show_analytics"`
+}
+
+// GetShowAnalytics returns whether to show analytics, defaulting to true
+func (p *PreviewSettings) GetShowAnalytics() bool {
+	if p.ShowAnalytics == nil {
+		return true // Default: analytics ON
+	}
+	return *p.ShowAnalytics
+}
+
+// GetShowOutput returns whether to show terminal output, defaulting to true
+func (p *PreviewSettings) GetShowOutput() bool {
+	if p.ShowOutput == nil {
+		return true // Default: output ON (shows launch animation)
+	}
+	return *p.ShowOutput
+}
+
+// GetShowOutput returns whether to show terminal output in preview
+func (c *UserConfig) GetShowOutput() bool {
+	return c.Preview.GetShowOutput()
+}
+
+// GetShowAnalytics returns whether to show analytics panel, defaulting to true
+func (c *UserConfig) GetShowAnalytics() bool {
+	return c.Preview.GetShowAnalytics()
+}
+
 // ClaudeSettings defines Claude Code configuration
 type ClaudeSettings struct {
+	// Command is the Claude CLI command or alias to use (e.g., "claude", "cdw", "cdp")
+	// Default: "claude"
+	// This allows using shell aliases that set CLAUDE_CONFIG_DIR automatically
+	Command string `toml:"command"`
+
 	// ConfigDir is the path to Claude's config directory
 	// Default: ~/.claude (or CLAUDE_CONFIG_DIR env var)
 	ConfigDir string `toml:"config_dir"`
@@ -124,6 +180,14 @@ type ClaudeSettings struct {
 	// DangerousMode enables --dangerously-skip-permissions flag for Claude sessions
 	// Default: false
 	DangerousMode bool `toml:"dangerous_mode"`
+}
+
+// WorktreeSettings contains git worktree preferences
+type WorktreeSettings struct {
+	// DefaultLocation: "sibling" (next to repo) or "subdirectory" (inside .worktrees/)
+	DefaultLocation string `toml:"default_location"`
+	// AutoCleanup: remove worktree when session is deleted
+	AutoCleanup bool `toml:"auto_cleanup"`
 }
 
 // GlobalSearchSettings defines global conversation search configuration
@@ -161,6 +225,30 @@ type ToolDef struct {
 
 	// BusyPatterns are strings that indicate the tool is busy
 	BusyPatterns []string `toml:"busy_patterns"`
+
+	// PromptPatterns are strings that indicate the tool is waiting for input
+	PromptPatterns []string `toml:"prompt_patterns"`
+
+	// DetectPatterns are regex patterns to auto-detect this tool from terminal content
+	DetectPatterns []string `toml:"detect_patterns"`
+
+	// ResumeFlag is the CLI flag to resume a session (e.g., "--resume")
+	ResumeFlag string `toml:"resume_flag"`
+
+	// SessionIDEnv is the tmux environment variable name storing the session ID
+	SessionIDEnv string `toml:"session_id_env"`
+
+	// DangerousMode enables dangerous mode flag for this tool
+	DangerousMode bool `toml:"dangerous_mode"`
+
+	// DangerousFlag is the CLI flag for dangerous mode (e.g., "--dangerously-skip-permissions")
+	DangerousFlag string `toml:"dangerous_flag"`
+
+	// OutputFormatFlag is the CLI flag for JSON output format (e.g., "--output-format json")
+	OutputFormatFlag string `toml:"output_format_flag"`
+
+	// SessionIDJsonPath is the jq path to extract session ID from JSON output
+	SessionIDJsonPath string `toml:"session_id_json_path"`
 }
 
 // MCPDef defines an MCP server configuration for the MCP Manager
@@ -185,6 +273,10 @@ type MCPDef struct {
 	// Transport specifies the MCP transport type: "stdio" (default), "http", or "sse"
 	// Only needed when URL is set; defaults to "http" if URL is present
 	Transport string `toml:"transport"`
+
+	// Headers is optional HTTP headers for HTTP/SSE MCPs (e.g., for authentication)
+	// Example: { Authorization = "Bearer token123" }
+	Headers map[string]string `toml:"headers"`
 }
 
 // Default user config (empty maps)
@@ -268,6 +360,81 @@ func ReloadUserConfig() (*UserConfig, error) {
 	return LoadUserConfig()
 }
 
+// SaveUserConfig writes the config to config.toml using atomic write pattern
+// This clears the cache so next LoadUserConfig() reads fresh values
+func SaveUserConfig(config *UserConfig) error {
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		return fmt.Errorf("failed to get config path: %w", err)
+	}
+
+	// Ensure directory exists
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	// Build config content in memory first
+	var buf bytes.Buffer
+
+	// Write header comment
+	if _, err := buf.WriteString("# Agent Deck Configuration\n"); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+	if _, err := buf.WriteString("# Edit this file or use Settings (press S) in the TUI\n\n"); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+
+	// Encode to TOML
+	encoder := toml.NewEncoder(&buf)
+	if err := encoder.Encode(config); err != nil {
+		return fmt.Errorf("failed to encode config: %w", err)
+	}
+
+	// ═══════════════════════════════════════════════════════════════════
+	// ATOMIC WRITE PATTERN: Prevents data corruption on crash/power loss
+	// 1. Write to temporary file with 0600 permissions
+	// 2. fsync the temp file (ensures data reaches disk)
+	// 3. Atomic rename temp to final
+	// ═══════════════════════════════════════════════════════════════════
+
+	tmpPath := configPath + ".tmp"
+
+	// Step 1: Write to temporary file (0600 = owner read/write only for security)
+	if err := os.WriteFile(tmpPath, buf.Bytes(), 0600); err != nil {
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+
+	// Step 2: fsync the temp file to ensure data reaches disk before rename
+	if err := syncConfigFile(tmpPath); err != nil {
+		// Log but don't fail - atomic rename still provides some safety
+		// Note: We don't have access to log package here, so we just continue
+		_ = err
+	}
+
+	// Step 3: Atomic rename (this is atomic on POSIX systems)
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		// Clean up temp file on failure
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to finalize config save: %w", err)
+	}
+
+	// Clear cache so next load picks up changes
+	ClearUserConfigCache()
+
+	return nil
+}
+
+// syncConfigFile calls fsync on a file to ensure data is written to disk
+func syncConfigFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // ClearUserConfigCache clears the cached user config, allowing tests to reset state
 // This does NOT reload - the next LoadUserConfig() call will read fresh from disk
 func ClearUserConfigCache() {
@@ -339,6 +506,18 @@ func GetDefaultTool() string {
 	return config.DefaultTool
 }
 
+// GetTheme returns the current theme, defaulting to "dark"
+func GetTheme() string {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return "dark"
+	}
+	if config.Theme == "" || (config.Theme != "dark" && config.Theme != "light") {
+		return "dark"
+	}
+	return config.Theme
+}
+
 // GetLogSettings returns log management settings with defaults applied
 func GetLogSettings() LogSettings {
 	config, err := LoadUserConfig()
@@ -364,6 +543,31 @@ func GetLogSettings() LogSettings {
 	// We detect this by checking if the entire Logs section is empty
 	if config.Logs.MaxSizeMB == 0 && config.Logs.MaxLines == 0 {
 		settings.RemoveOrphans = true
+	}
+
+	return settings
+}
+
+// GetWorktreeSettings returns worktree settings with defaults applied
+func GetWorktreeSettings() WorktreeSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return WorktreeSettings{
+			DefaultLocation: "sibling",
+			AutoCleanup:     true,
+		}
+	}
+
+	settings := config.Worktree
+
+	// Apply defaults for unset values
+	if settings.DefaultLocation == "" {
+		settings.DefaultLocation = "sibling"
+	}
+	// AutoCleanup defaults to true (Go zero value is false)
+	// We detect if section was not present by checking if DefaultLocation is empty
+	if config.Worktree.DefaultLocation == "" {
+		settings.AutoCleanup = true
 	}
 
 	return settings
@@ -395,6 +599,71 @@ func GetUpdateSettings() UpdateSettings {
 	}
 
 	return settings
+}
+
+// GetPreviewSettings returns preview settings with defaults applied
+func GetPreviewSettings() PreviewSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return PreviewSettings{
+			ShowOutput:    nil, // nil means "default to true"
+			ShowAnalytics: nil, // nil means "default to true"
+		}
+	}
+
+	return config.Preview
+}
+
+// getMCPPoolConfigSection returns the MCP pool config section based on platform
+// On unsupported platforms (WSL1, Windows), it's commented out with explanation
+func getMCPPoolConfigSection() string {
+	header := `
+# ============================================================================
+# MCP Socket Pool (Advanced)
+# ============================================================================
+# The MCP pool shares MCP processes across multiple Claude sessions via Unix
+# domain sockets. This reduces memory usage when running many sessions.
+#
+# PLATFORM SUPPORT:
+#   macOS/Linux: Full support
+#   WSL2: Full support
+#   WSL1: NOT SUPPORTED (Unix sockets unreliable)
+#   Windows: NOT SUPPORTED
+#
+# When pooling is disabled or unsupported, MCPs use stdio mode (default).
+# Both modes work identically - pooling is just a memory optimization.
+
+`
+	if platform.SupportsUnixSockets() {
+		// Platform supports pooling - show enabled example
+		return header + `# Uncomment to enable MCP socket pooling:
+# [mcp_pool]
+# enabled = true
+# pool_all = true           # Pool all MCPs defined above
+# fallback_to_stdio = true  # Fall back to stdio if socket fails
+# exclude_mcps = []         # MCPs to exclude from pooling
+`
+	}
+
+	// Platform doesn't support pooling - explain why it's disabled
+	p := platform.Detect()
+	reason := "Unix sockets not supported"
+	tip := ""
+
+	switch p {
+	case platform.PlatformWSL1:
+		reason = "WSL1 detected - Unix sockets unreliable"
+		tip = "\n# TIP: Upgrade to WSL2 for socket pooling support:\n#      wsl --set-version <distro> 2\n"
+	case platform.PlatformWindows:
+		reason = "Windows detected - Unix sockets not available"
+	}
+
+	return header + fmt.Sprintf(`# MCP pool is DISABLED on this platform: %s
+# MCPs will use stdio mode (works fine, just uses more memory with many sessions).
+%s
+# [mcp_pool]
+# enabled = false  # Cannot be enabled on this platform
+`, reason, tip)
 }
 
 // CreateExampleConfig creates an example config file if none exists
@@ -501,6 +770,13 @@ notify_in_cli = true
 # transport = "http"
 # description = "My custom HTTP MCP server"
 
+# Example: HTTP MCP with authentication headers
+# [mcps.authenticated-api]
+# url = "https://api.example.com/mcp"
+# transport = "http"
+# headers = { Authorization = "Bearer your-token-here", "X-API-Key" = "your-api-key" }
+# description = "HTTP MCP with auth headers"
+
 # Example: SSE MCP server
 # [mcps.remote-sse]
 # url = "https://api.example.com/mcp/sse"
@@ -527,6 +803,9 @@ notify_in_cli = true
 # icon = "🤖"
 # busy_patterns = ["Generating..."]
 `
+
+	// Add platform-aware MCP pool section
+	exampleConfig += getMCPPoolConfigSection()
 
 	// Ensure directory exists
 	dir := filepath.Dir(configPath)

@@ -23,7 +23,7 @@ import (
 	"github.com/muesli/termenv"
 )
 
-const Version = "0.8.14"
+const Version = "0.8.33"
 
 // Table column widths for list command output
 const (
@@ -222,6 +222,10 @@ func main() {
 
 	// Set version for UI update checking
 	ui.SetVersion(Version)
+
+	// Initialize theme from config
+	theme := session.GetTheme()
+	ui.InitTheme(theme)
 
 	// Check for updates and prompt user before launching TUI
 	if promptForUpdate() {
@@ -1532,7 +1536,7 @@ func handleUninstall(args []string) {
 
 		// Get total size
 		var totalSize int64
-		filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error {
+		_ = filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error {
 			if err == nil && !info.IsDir() {
 				totalSize += info.Size()
 			}
@@ -1601,7 +1605,7 @@ func handleUninstall(args []string) {
 	if !*yes && !*dryRun {
 		fmt.Print("Proceed with uninstall? [y/N] ")
 		var response string
-		fmt.Scanln(&response)
+		_, _ = fmt.Scanln(&response)
 		if strings.ToLower(response) != "y" {
 			fmt.Println("Uninstall cancelled.")
 			return
@@ -1741,7 +1745,7 @@ func handleUninstall(args []string) {
 			if !*yes {
 				fmt.Print("Create backup of data before removing? [Y/n] ")
 				var response string
-				fmt.Scanln(&response)
+				_, _ = fmt.Scanln(&response)
 				if strings.ToLower(response) != "n" {
 					backupFile := filepath.Join(homeDir, fmt.Sprintf("agent-deck-backup-%s.tar.gz", time.Now().Format("20060102-150405")))
 					fmt.Printf("Creating backup at %s...\n", backupFile)

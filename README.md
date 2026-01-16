@@ -19,6 +19,26 @@
 
 ---
 
+<details>
+<summary><b>💡 Ask AI about Agent Deck</b></summary>
+
+**Option 1: Claude Code Skill** (recommended for Claude Code users)
+```bash
+/plugin marketplace add asheshgoplani/agent-deck
+/plugin install agent-deck@agent-deck-help
+```
+Then ask: *"How do I set up MCP pooling?"*
+
+**Option 2: Any LLM** (ChatGPT, Claude, Gemini, etc.)
+```
+Read https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/llms-full.txt
+and answer: How do I fork a session?
+```
+
+</details>
+
+---
+
 https://github.com/user-attachments/assets/e4f55917-435c-45ba-92cc-89737d0d1401
 
 ## The Problem
@@ -171,6 +191,18 @@ Session 3 → memory         Session 3 ─┘
 
 Memory savings: 85-90% for MCP processes
 ```
+
+**Platform Support:**
+
+| Platform | Socket Pool | Notes |
+|----------|-------------|-------|
+| macOS | ✅ Full support | Works out of the box |
+| Linux | ✅ Full support | Works out of the box |
+| WSL2 | ✅ Full support | Works out of the box |
+| WSL1 | ❌ Auto-disabled | Uses stdio mode (MCPs still work fine) |
+| Windows | ❌ Not supported | Use WSL instead |
+
+> **WSL1 users:** MCP pooling is automatically disabled because Unix sockets don't work reliably. MCPs still work perfectly in stdio mode - you just use more memory with many sessions. Upgrade to WSL2 for socket pooling: `wsl --set-version <distro> 2`
 
 **Enable in `~/.agent-deck/config.toml`:**
 
@@ -575,6 +607,20 @@ Claude and Gemini get full integration with session management, MCP configuratio
 
 Agent Deck runs inside WSL and works exactly like it does on macOS/Linux.
 
+**WSL Version Differences:**
+
+| Feature | WSL1 | WSL2 |
+|---------|------|------|
+| Core functionality | ✅ | ✅ |
+| MCP management | ✅ | ✅ |
+| Session forking | ✅ | ✅ |
+| MCP socket pooling | ❌ Auto-disabled | ✅ |
+| Clipboard (via clip.exe) | ✅ | ✅ |
+
+**WSL2 is recommended** for the best experience. Check your version with `wsl --list --verbose`. Upgrade with `wsl --set-version <distro> 2`.
+
+On WSL1, MCP socket pooling is automatically disabled (Unix sockets don't work reliably), but everything else works fine. MCPs run in stdio mode instead.
+
 ### Will it interfere with my existing tmux setup?
 
 **No.** Agent Deck creates its own tmux sessions with the prefix `agentdeck_*`. Your existing sessions are untouched.
@@ -611,7 +657,7 @@ Then press `M` in Agent Deck to toggle it on/off for any session. [See MCP examp
 
 If you're running many Claude sessions (10+), each spawns its own MCP processes. This adds up fast.
 
-**Enable MCP Socket Pool** to share processes across sessions:
+**Enable MCP Socket Pool** to share processes across sessions (macOS, Linux, WSL2 only):
 
 ```toml
 # ~/.agent-deck/config.toml
@@ -621,6 +667,8 @@ pool_all = true
 ```
 
 Restart Agent Deck. All sessions now share MCP processes via Unix sockets. Memory usage drops 85-90% for MCP-related processes.
+
+> **Note:** On WSL1 and Windows, socket pooling is automatically disabled. MCPs work in stdio mode instead, which uses more memory but is fully functional.
 
 ### What if a session crashes?
 
@@ -667,6 +715,102 @@ config_dir = "~/.claude-work"
 ### tmux Configuration
 
 The installer configures tmux automatically. For manual setup, see the [tmux configuration guide](https://github.com/asheshgoplani/agent-deck/wiki/tmux-Configuration).
+
+## Troubleshooting
+
+### Mouse Scrolling Not Working (WSL)
+
+If scrolling doesn't work or you can't scroll back through output on WSL:
+
+**Quick Fix: Re-run the installer**
+```bash
+curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash
+```
+
+The installer will detect outdated tmux config and offer to update it with the WSL-compatible version.
+
+**Manual Fix:**
+
+1. Remove old agent-deck config from `~/.tmux.conf`:
+   ```bash
+   sed -i '/# agent-deck configuration/,/# End agent-deck configuration/d' ~/.tmux.conf
+   ```
+
+2. Add the updated config:
+   ```bash
+   cat >> ~/.tmux.conf << 'EOF'
+   # agent-deck configuration
+   # agent-deck-tmux-config-version: 2
+
+   set -g default-terminal "tmux-256color"
+   set -ag terminal-overrides ",xterm*:Tc:smcup@:rmcup@"
+   set -ag terminal-overrides ",*256col*:Tc"
+   set -sg escape-time 0
+   set -g history-limit 50000
+   set -g mouse on
+
+   # Auto-enter copy-mode on scroll up (critical for WSL)
+   bind-key -n WheelUpPane if-shell -F -t = "#{mouse_any_flag}" "send-keys -M" "if -Ft= '#{pane_in_mode}' 'send-keys -M' 'copy-mode -e'"
+
+   # Scroll bindings in copy-mode
+   bind-key -T copy-mode-vi WheelUpPane send-keys -X scroll-up
+   bind-key -T copy-mode-vi WheelDownPane send-keys -X scroll-down
+   bind-key -T copy-mode WheelUpPane send-keys -X scroll-up
+   bind-key -T copy-mode WheelDownPane send-keys -X scroll-down
+
+   # Clipboard (WSL uses clip.exe)
+   bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "clip.exe"
+   bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "clip.exe"
+   # End agent-deck configuration
+   EOF
+   ```
+
+3. Reload tmux:
+   ```bash
+   tmux source-file ~/.tmux.conf
+   ```
+
+**Why this happens:** The original config only had `set -g mouse on`, which works on macOS but not reliably on all WSL terminal emulators. The fix adds explicit `WheelUpPane` bindings that enter copy-mode when scrolling up.
+
+### Clipboard Not Working (WSL)
+
+If copying to clipboard doesn't work in WSL:
+
+1. **Verify clip.exe is accessible:**
+   ```bash
+   echo "test" | clip.exe && powershell.exe Get-Clipboard
+   # Should output: test
+   ```
+
+2. **If clip.exe not found**, ensure Windows system32 is in PATH:
+   ```bash
+   export PATH="$PATH:/mnt/c/Windows/System32"
+   ```
+
+### tmux History Too Short
+
+If you can't scroll back far enough:
+
+1. The default is now 50,000 lines. To increase:
+   ```bash
+   # In ~/.tmux.conf
+   set -g history-limit 100000
+   ```
+
+2. Reload: `tmux source-file ~/.tmux.conf`
+
+**Note:** Higher limits use more memory per pane.
+
+### Sessions Lost After Reboot
+
+tmux sessions don't persist through system reboots. However, agent-deck preserves your session **metadata** (titles, groups, paths).
+
+After reboot:
+1. Your sessions will show as "error" status (tmux process gone)
+2. Press `r` on any session to restart it
+3. Claude/Gemini sessions will resume from last conversation if session ID was captured
+
+To preserve conversation context across reboots, ensure sessions have captured session IDs (shown in session details with `agent-deck session show`).
 
 ## Development
 

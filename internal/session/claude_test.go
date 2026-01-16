@@ -402,3 +402,29 @@ func TestGetMCPMode(t *testing.T) {
 		})
 	}
 }
+
+func TestClearMCPCache_ClearsParentDirectories(t *testing.T) {
+	// Setup: Create nested directory structure
+	baseDir := t.TempDir()
+	childDir := filepath.Join(baseDir, "child", "grandchild")
+	if err := os.MkdirAll(childDir, 0755); err != nil {
+		t.Fatalf("failed to create dirs: %v", err)
+	}
+
+	// Populate cache for parent directory by calling GetMCPInfo
+	// (This will cache the parent path)
+	_ = GetMCPInfo(baseDir)
+
+	// Now clear cache for child directory
+	ClearMCPCache(childDir)
+
+	// The parent cache should also be cleared
+	// We verify by checking internal cache state
+	mcpInfoCacheMu.RLock()
+	_, parentCached := mcpInfoCache[baseDir]
+	mcpInfoCacheMu.RUnlock()
+
+	if parentCached {
+		t.Error("parent directory cache should be cleared but wasn't")
+	}
+}

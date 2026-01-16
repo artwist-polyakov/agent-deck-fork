@@ -20,27 +20,6 @@ type MCPServerConfig struct {
 	URL     string            `json:"url,omitempty"` // For HTTP transport
 }
 
-// waitForSocketReady waits for an MCP socket to become ready, with timeout
-// Returns true if socket is ready, false if timeout reached
-func waitForSocketReady(mcpName string, timeout time.Duration) bool {
-	pool := GetGlobalPool()
-	if pool == nil {
-		return false
-	}
-
-	deadline := time.Now().Add(timeout)
-	checkInterval := 100 * time.Millisecond
-
-	for time.Now().Before(deadline) {
-		if pool.IsRunning(mcpName) {
-			return true
-		}
-		time.Sleep(checkInterval)
-	}
-
-	return false
-}
-
 // getExternalSocketPath returns the socket path if an external pool socket exists and is alive
 // This allows CLI commands to use sockets created by the TUI without needing pool initialization
 func getExternalSocketPath(mcpName string) string {
@@ -93,14 +72,7 @@ func WriteMCPJsonFromConfig(projectPath string, enabledNames []string) error {
 
 			// Check if pool exists and should pool this MCP (stdio only)
 			if pool != nil && pool.ShouldPool(name) {
-				// Wait for socket to be ready (up to 3 seconds)
-				if !pool.IsRunning(name) {
-					log.Printf("[MCP-POOL] ⏳ %s: socket not ready, waiting up to 3s...", name)
-					if waitForSocketReady(name, 3*time.Second) {
-						log.Printf("[MCP-POOL] ✓ %s: socket became ready", name)
-					}
-				}
-
+				// Check if socket is ready NOW - don't block waiting (Issue #36)
 				if pool.IsRunning(name) {
 					// Use Unix socket (nc connects to socket proxy)
 					socketPath := pool.GetSocketPath(name)
@@ -112,12 +84,15 @@ func WriteMCPJsonFromConfig(projectPath string, enabledNames []string) error {
 					continue
 				}
 
-				// Socket still not ready after waiting - check fallback policy
+				// Socket not ready - check fallback policy
 				if !pool.FallbackEnabled() {
-					log.Printf("[MCP-POOL] ✗ %s: SOCKET NOT READY - fallback disabled, skipping MCP", name)
-					return fmt.Errorf("MCP '%s' socket not ready after 3s (fallback_to_stdio=false in config)", name)
+					log.Printf("[MCP-POOL] ✗ %s: socket not ready, fallback disabled", name)
+					return fmt.Errorf("MCP '%s' socket not ready. Options:\n"+
+						"  1. Enable fallback: set fallback_to_stdio = true in config.toml\n"+
+						"  2. Wait for pool to initialize and try again\n"+
+						"  3. Check MCP is running: ls /tmp/agentdeck-mcp-%s.sock", name, name)
 				}
-				log.Printf("[MCP-POOL] ⚠️ %s: socket not ready after 3s - falling back to stdio", name)
+				log.Printf("[MCP-POOL] ⚠️ %s: socket not ready - falling back to stdio", name)
 			} else if pool != nil && !pool.ShouldPool(name) {
 				// MCP is explicitly excluded from pool - use stdio
 				log.Printf("[MCP-POOL] %s: excluded from pool, using stdio", name)
@@ -137,7 +112,10 @@ func WriteMCPJsonFromConfig(projectPath string, enabledNames []string) error {
 					// Socket not found - check fallback policy
 					if !config.MCPPool.FallbackStdio {
 						log.Printf("[MCP-POOL] ✗ %s: pool enabled but socket not found - fallback disabled", name)
-						return fmt.Errorf("MCP '%s' cannot start: pool enabled but socket not found (fallback_to_stdio=false)", name)
+						return fmt.Errorf("MCP '%s' socket not found. Options:\n"+
+							"  1. Enable fallback: set fallback_to_stdio = true in config.toml\n"+
+							"  2. Start TUI to initialize pool: agent-deck\n"+
+							"  3. Check socket exists: ls /tmp/agentdeck-mcp-%s.sock", name, name)
 					}
 					log.Printf("[MCP-POOL] ⚠️ %s: socket not found, falling back to stdio", name)
 				} else {
@@ -222,14 +200,7 @@ func WriteGlobalMCP(enabledNames []string) error {
 
 			// Check if pool exists and should pool this MCP (stdio only)
 			if pool != nil && pool.ShouldPool(name) {
-				// Wait for socket to be ready (up to 3 seconds)
-				if !pool.IsRunning(name) {
-					log.Printf("[MCP-POOL] ⏳ Global %s: socket not ready, waiting up to 3s...", name)
-					if waitForSocketReady(name, 3*time.Second) {
-						log.Printf("[MCP-POOL] ✓ Global %s: socket became ready", name)
-					}
-				}
-
+				// Check if socket is ready NOW - don't block waiting (Issue #36)
 				if pool.IsRunning(name) {
 					// Use Unix socket (nc connects to socket proxy)
 					socketPath := pool.GetSocketPath(name)
@@ -241,12 +212,15 @@ func WriteGlobalMCP(enabledNames []string) error {
 					continue
 				}
 
-				// Socket still not ready after waiting - check fallback policy
+				// Socket not ready - check fallback policy
 				if !pool.FallbackEnabled() {
-					log.Printf("[MCP-POOL] ✗ Global %s: SOCKET NOT READY - fallback disabled, skipping MCP", name)
-					return fmt.Errorf("MCP '%s' socket not ready after 3s (fallback_to_stdio=false in config)", name)
+					log.Printf("[MCP-POOL] ✗ Global %s: socket not ready, fallback disabled", name)
+					return fmt.Errorf("MCP '%s' socket not ready. Options:\n"+
+						"  1. Enable fallback: set fallback_to_stdio = true in config.toml\n"+
+						"  2. Wait for pool to initialize and try again\n"+
+						"  3. Check MCP is running: ls /tmp/agentdeck-mcp-%s.sock", name, name)
 				}
-				log.Printf("[MCP-POOL] ⚠️ Global %s: socket not ready after 3s - falling back to stdio", name)
+				log.Printf("[MCP-POOL] ⚠️ Global %s: socket not ready - falling back to stdio", name)
 			} else if pool != nil && !pool.ShouldPool(name) {
 				// MCP is explicitly excluded from pool - use stdio
 				log.Printf("[MCP-POOL] Global %s: excluded from pool, using stdio", name)
@@ -266,7 +240,10 @@ func WriteGlobalMCP(enabledNames []string) error {
 					// Socket not found - check fallback policy
 					if !config.MCPPool.FallbackStdio {
 						log.Printf("[MCP-POOL] ✗ Global %s: pool enabled but socket not found - fallback disabled", name)
-						return fmt.Errorf("MCP '%s' cannot start: pool enabled but socket not found (fallback_to_stdio=false)", name)
+						return fmt.Errorf("MCP '%s' socket not found. Options:\n"+
+							"  1. Enable fallback: set fallback_to_stdio = true in config.toml\n"+
+							"  2. Start TUI to initialize pool: agent-deck\n"+
+							"  3. Check socket exists: ls /tmp/agentdeck-mcp-%s.sock", name, name)
 					}
 					log.Printf("[MCP-POOL] ⚠️ Global %s: socket not found, falling back to stdio", name)
 				} else {
