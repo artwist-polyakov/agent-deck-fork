@@ -599,6 +599,17 @@ fi
 
 **Note:** Requires `jq` for JSON parsing. Falls back to starting Claude fresh if capture fails.
 
+### Subagent --add-dir (PR #27)
+
+When creating subagents with `--parent`, they automatically get access to the parent's project directory via Claude's `--add-dir` flag. This is useful for worktrees and scenarios where subagents need to access files in the main project.
+
+**How it works:**
+- `agent-deck add -t "Subtask" --parent <parent-id> -c claude /tmp/subtask`
+- Subagent command includes: `--add-dir /path/to/parent/project`
+- Parent's `ProjectPath` is stored in `ParentProjectPath` field
+
+**Implementation:** `SetParentWithPath()` in `internal/session/instance.go`
+
 ---
 
 ## Global Search
@@ -625,6 +636,7 @@ tier = "auto"  # "instant" (<100MB), "balanced", or "auto"
 ```go
 type Instance struct {
     ID, Title, ProjectPath, GroupPath, Command, Tool string
+    ParentSessionID, ParentProjectPath string  // For subagent --add-dir access
     Status    Status    // running, waiting, idle, error
     CreatedAt time.Time
 }

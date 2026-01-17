@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -31,6 +32,8 @@ type NewDialog struct {
 	// Worktree support
 	worktreeEnabled bool
 	branchInput     textinput.Model
+	// Gemini YOLO mode
+	geminiYoloMode bool
 }
 
 // NewNewDialog creates a new NewDialog instance
@@ -100,6 +103,11 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName string) {
 	// Reset worktree fields
 	d.worktreeEnabled = false
 	d.branchInput.SetValue("")
+	// Initialize Gemini YOLO mode from global config
+	d.geminiYoloMode = false
+	if userConfig, err := session.LoadUserConfig(); err == nil && userConfig != nil {
+		d.geminiYoloMode = userConfig.Gemini.YoloMode
+	}
 }
 
 // SetDefaultTool sets the pre-selected command based on tool name
@@ -208,6 +216,24 @@ func (d *NewDialog) GetValuesWithWorktree() (name, path, command, branch string,
 	branch = strings.TrimSpace(d.branchInput.Value())
 	worktreeEnabled = d.worktreeEnabled
 	return
+}
+
+// IsGeminiYoloMode returns whether YOLO mode is enabled for Gemini
+func (d *NewDialog) IsGeminiYoloMode() bool {
+	return d.geminiYoloMode
+}
+
+// SetGeminiYoloMode sets the YOLO mode state
+func (d *NewDialog) SetGeminiYoloMode(enabled bool) {
+	d.geminiYoloMode = enabled
+}
+
+// GetSelectedCommand returns the currently selected command/tool
+func (d *NewDialog) GetSelectedCommand() string {
+	if d.commandCursor >= 0 && d.commandCursor < len(d.presetCommands) {
+		return d.presetCommands[d.commandCursor]
+	}
+	return ""
 }
 
 // Validate checks if the dialog values are valid and returns an error message if not
@@ -373,6 +399,13 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 					d.focusIndex = 3
 					d.updateFocus()
 				}
+				return d, nil
+			}
+
+		case "y":
+			// Toggle YOLO mode when on command field and gemini is selected
+			if d.focusIndex == 2 && d.GetSelectedCommand() == "gemini" {
+				d.geminiYoloMode = !d.geminiYoloMode
 				return d, nil
 			}
 		}
@@ -588,6 +621,22 @@ func (d *NewDialog) View() string {
 		content.WriteString(checkboxStyle.Render(fmt.Sprintf("  %s Create in worktree", checkbox)))
 	}
 	content.WriteString("\n")
+
+	// YOLO mode checkbox (only visible when gemini is selected)
+	if d.GetSelectedCommand() == "gemini" {
+		yoloCheckbox := "[ ]"
+		if d.geminiYoloMode {
+			yoloCheckbox = "[x]"
+		}
+
+		if d.focusIndex == 2 {
+			// When on command field, show as actionable
+			content.WriteString(checkboxActiveStyle.Render(fmt.Sprintf("  %s YOLO mode - auto-approve all (press y)", yoloCheckbox)))
+		} else {
+			content.WriteString(checkboxStyle.Render(fmt.Sprintf("  %s YOLO mode - auto-approve all", yoloCheckbox)))
+		}
+		content.WriteString("\n")
+	}
 
 	// Branch input (only visible when worktree is enabled)
 	if d.worktreeEnabled {

@@ -57,6 +57,7 @@ type Instance struct {
 	// Gemini CLI integration
 	GeminiSessionID  string    `json:"gemini_session_id,omitempty"`
 	GeminiDetectedAt time.Time `json:"gemini_detected_at,omitempty"`
+	GeminiYoloMode   *bool     `json:"gemini_yolo_mode,omitempty"` // Per-session override (nil = use global config)
 
 	// MCP tracking - which MCPs were loaded when session started/restarted
 	// Used to detect pending MCPs (added after session start) and stale MCPs (removed but still running)
@@ -305,11 +306,28 @@ func (i *Instance) buildGeminiCommand(baseCommand string) string {
 		return baseCommand
 	}
 
+	// Determine if YOLO mode is enabled (per-session overrides global config)
+	yoloMode := false
+	if i.GeminiYoloMode != nil {
+		yoloMode = *i.GeminiYoloMode
+	} else {
+		// Check global config
+		userConfig, _ := LoadUserConfig()
+		if userConfig != nil {
+			yoloMode = userConfig.Gemini.YoloMode
+		}
+	}
+
+	yoloFlag := ""
+	if yoloMode {
+		yoloFlag = " --yolo"
+	}
+
 	// If baseCommand is just "gemini", handle specially
 	if baseCommand == "gemini" {
 		// If we already have a session ID, use simple resume
 		if i.GeminiSessionID != "" {
-			return fmt.Sprintf("gemini --resume %s", i.GeminiSessionID)
+			return fmt.Sprintf("gemini --resume %s%s", i.GeminiSessionID, yoloFlag)
 		}
 
 		// Build the capture-resume command for new sessions with fallback
@@ -322,11 +340,11 @@ func (i *Instance) buildGeminiCommand(baseCommand string) string {
 		// NOTE: Using --output-format json (not stream-json with head -1) because:
 		// - head -1 sends SIGPIPE which kills Gemini before it saves the session
 		// - json mode runs to completion, ensuring session file is written
-		return `session_id=$(gemini --output-format json "." 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; ` +
-			`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then ` +
-			`tmux set-environment GEMINI_SESSION_ID "$session_id"; ` +
-			`gemini --resume "$session_id"; ` +
-			`else gemini; fi`
+		return fmt.Sprintf(`session_id=$(gemini --output-format json "." 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; `+
+			`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
+			`tmux set-environment GEMINI_SESSION_ID "$session_id"; `+
+			`gemini --resume "$session_id"%s; `+
+			`else gemini%s; fi`, yoloFlag, yoloFlag)
 	}
 
 	// For custom commands (e.g., resume commands), return as-is
