@@ -313,7 +313,10 @@ func (d *NewDialog) updateFocus() {
 	case 1:
 		d.pathInput.Focus()
 	case 2:
-		// Command selection (no text input focus needed for presets)
+		// Command selection - focus commandInput if shell is selected for custom command
+		if d.commandCursor == 0 { // shell
+			d.commandInput.Focus()
+		}
 	case 3:
 		// Branch input (when worktree is enabled) OR Claude options
 		if d.worktreeEnabled {
@@ -331,6 +334,9 @@ func (d *NewDialog) updateFocus() {
 
 // getMaxFocusIndex returns the maximum focus index based on current state
 func (d *NewDialog) getMaxFocusIndex() int {
+	if d.worktreeEnabled {
+		return 3 // 0=name, 1=path, 2=command, 3=branch
+	}
 	if d.isClaudeSelected() {
 		return 3 // 0=name, 1=path, 2=command, 3=claude options
 	}
@@ -493,8 +499,13 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 			d.suggestionNavigated = false
 			d.pathSuggestionCursor = 0
 		}
+	case 2:
+		// Update custom command input when shell is selected
+		if d.commandCursor == 0 { // shell
+			d.commandInput, cmd = d.commandInput.Update(msg)
+		}
 	case 3:
-		// Branch input (when worktree is enabled)
+		// Branch input (when worktree is enabled) or Claude options
 		if d.worktreeEnabled {
 			d.branchInput, cmd = d.branchInput.Update(msg)
 		} else if d.isClaudeSelected() {
@@ -673,8 +684,13 @@ func (d *NewDialog) View() string {
 
 	// Custom command input (only if shell is selected)
 	if d.commandCursor == 0 {
-		content.WriteString(labelStyle.Render("  Custom command:"))
-		content.WriteString("\n  ")
+		// Show active indicator when command field is focused
+		if d.focusIndex == 2 {
+			content.WriteString(activeLabelStyle.Render("  ▸ Custom:"))
+		} else {
+			content.WriteString(labelStyle.Render("    Custom:"))
+		}
+		content.WriteString("\n    ")
 		content.WriteString(d.commandInput.View())
 		content.WriteString("\n\n")
 	}
