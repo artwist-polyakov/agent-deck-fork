@@ -214,6 +214,9 @@ func main() {
 		case "group":
 			handleGroup(profile, args[1:])
 			return
+		case "try":
+			handleTry(profile, args[1:])
+			return
 		case "uninstall":
 			handleUninstall(args[1:])
 			return
@@ -1242,6 +1245,7 @@ func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  (none)           Start the TUI")
 	fmt.Println("  add <path>       Add a new session")
+	fmt.Println("  try <name>       Quick experiment (create/find dated folder + session)")
 	fmt.Println("  list, ls         List all sessions")
 	fmt.Println("  remove, rm       Remove a session")
 	fmt.Println("  status           Show session status summary")
