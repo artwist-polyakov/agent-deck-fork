@@ -37,29 +37,32 @@ func TestForkFlow_Integration(t *testing.T) {
 		t.Fatalf("CreateForkedInstance failed: %v", err)
 	}
 
-	// Verify fork command structure - uses capture-resume pattern
-	// Step 1: Capture session ID using -p "." --output-format json
-	if !strings.Contains(cmd, `-p "."`) {
-		t.Errorf("Fork command should have -p \".\" for capture: %s", cmd)
+	// Verify fork command structure - uses pre-generated UUID pattern
+	// Should generate UUID with uuidgen
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command should generate UUID with uuidgen: %s", cmd)
 	}
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Errorf("Fork command should have --output-format json: %s", cmd)
+	// Should store UUID in tmux environment
+	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("Fork command should store session ID in tmux env: %s", cmd)
 	}
+	// Should use --session-id with the generated UUID
+	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork command should use --session-id flag: %s", cmd)
+	}
+	// Should still use --resume for parent session and --fork-session
 	if !strings.Contains(cmd, "--resume "+parentID) {
 		t.Errorf("Fork command should have --resume %s: %s", parentID, cmd)
 	}
 	if !strings.Contains(cmd, "--fork-session") {
 		t.Errorf("Fork command should have --fork-session: %s", cmd)
 	}
-	if !strings.Contains(cmd, "jq -r '.session_id'") {
-		t.Errorf("Fork command should extract session ID with jq: %s", cmd)
+	// Should NOT use capture-resume pattern
+	if strings.Contains(cmd, `-p "."`) {
+		t.Errorf("Fork command should NOT use -p \".\" capture: %s", cmd)
 	}
-	// Step 2: Store in tmux env and resume
-	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
-		t.Errorf("Fork command should store session ID in tmux env: %s", cmd)
-	}
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Fork command should resume with captured session ID: %s", cmd)
+	if strings.Contains(cmd, "jq") {
+		t.Errorf("Fork command should NOT use jq: %s", cmd)
 	}
 
 	// Verify forked instance state

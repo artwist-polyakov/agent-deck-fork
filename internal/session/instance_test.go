@@ -117,7 +117,7 @@ func TestInstance_Fork(t *testing.T) {
 		t.Error("Fork() should fail without ClaudeSessionID")
 	}
 
-	// With session ID, Fork returns capture-resume command
+	// With session ID, Fork returns uuidgen + --session-id command
 	inst.ClaudeSessionID = "abc-123"
 	inst.ClaudeDetectedAt = time.Now()
 	cmd, err := inst.Fork("forked-test", "")
@@ -125,31 +125,34 @@ func TestInstance_Fork(t *testing.T) {
 		t.Errorf("Fork() failed: %v", err)
 	}
 
-	// Command should use capture-resume pattern
+	// Command should use uuidgen + --session-id pattern (instant, no API call)
 	// When not explicitly configured, CLAUDE_CONFIG_DIR should NOT be set
 	// (allows shell environment to take precedence)
 	if strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
 		t.Errorf("Fork() should NOT set CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
-	// Step 1: Capture session ID via fork with -p "." --output-format json
+	// Step 1: Pre-generate UUID with uuidgen
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork() should use uuidgen for session ID, got: %s", cmd)
+	}
+	// Should NOT use -p "." or jq (old capture-resume pattern)
+	if strings.Contains(cmd, `-p "."`) {
+		t.Errorf("Fork() should NOT use -p \".\" (old pattern), got: %s", cmd)
+	}
+	if strings.Contains(cmd, "jq") {
+		t.Errorf("Fork() should NOT use jq (old pattern), got: %s", cmd)
+	}
+	// Step 2: Use --session-id flag with pre-generated UUID
+	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork() should use --session-id flag, got: %s", cmd)
+	}
+	// Step 3: Include --resume with parent ID and --fork-session
 	if !strings.Contains(cmd, "--resume abc-123 --fork-session") {
-		t.Errorf("Fork() should include resume and fork-session flags for capture, got: %s", cmd)
+		t.Errorf("Fork() should include resume and fork-session flags, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, `-p "."`) {
-		t.Errorf("Fork() should use -p \".\" for minimal capture prompt, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Errorf("Fork() should use --output-format json for capture, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, "jq -r '.session_id'") {
-		t.Errorf("Fork() should extract session ID with jq, got: %s", cmd)
-	}
-	// Step 2: Store in tmux and resume
+	// Step 4: Store session ID in tmux environment
 	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
 		t.Errorf("Fork() should store session ID in tmux env, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Fork() should resume with captured session ID, got: %s", cmd)
 	}
 }
 
@@ -331,14 +334,9 @@ func TestBuildClaudeCommand(t *testing.T) {
 		t.Errorf("Should NOT contain CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
 
-	// Should use capture-resume pattern: -p "." to get session ID
-	if !strings.Contains(cmd, `-p "."`) {
-		t.Errorf("Should use -p \".\" for session ID capture, got: %s", cmd)
-	}
-
-	// Should use --output-format json to extract session ID
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Errorf("Should use --output-format json for capture, got: %s", cmd)
+	// Should use pre-generated UUID pattern with uuidgen
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Should use uuidgen for UUID generation, got: %s", cmd)
 	}
 
 	// Should store session ID in tmux environment
@@ -346,14 +344,20 @@ func TestBuildClaudeCommand(t *testing.T) {
 		t.Errorf("Should store session ID in tmux env, got: %s", cmd)
 	}
 
-	// Should use --resume to continue with captured session
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Should use --resume flag for captured session, got: %s", cmd)
+	// Should use --session-id flag for new sessions
+	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should use --session-id flag for new sessions, got: %s", cmd)
 	}
 
-	// Should NOT use --session-id flag (it doesn't work for NEW sessions)
-	if strings.Contains(cmd, "--session-id") {
-		t.Errorf("Should NOT use --session-id (only works for resume), got: %s", cmd)
+	// Should NOT use capture-resume pattern anymore
+	if strings.Contains(cmd, `-p "."`) {
+		t.Errorf("Should NOT use -p \".\" capture pattern anymore, got: %s", cmd)
+	}
+	if strings.Contains(cmd, "--output-format json") {
+		t.Errorf("Should NOT use --output-format json anymore, got: %s", cmd)
+	}
+	if strings.Contains(cmd, "jq") {
+		t.Errorf("Should NOT use jq anymore, got: %s", cmd)
 	}
 
 	// Note: --dangerously-skip-permissions is conditional on user config (dangerous_mode)
@@ -392,12 +396,12 @@ func TestBuildClaudeCommand_ExplicitConfig(t *testing.T) {
 		t.Errorf("Should contain CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
 	}
 
-	// Should use capture-resume pattern with explicit config
-	if !strings.Contains(cmd, `-p "."`) {
-		t.Errorf("Should use -p \".\" for session ID capture with explicit config, got: %s", cmd)
+	// Should use --session-id pattern with explicit config
+	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should use --session-id flag with explicit config, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Should use --resume flag with explicit config, got: %s", cmd)
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Should use uuidgen with explicit config, got: %s", cmd)
 	}
 }
 
@@ -443,9 +447,9 @@ config_dir = "~/.claude-work"
 		t.Errorf("Should include CLAUDE_CONFIG_DIR for capture-resume commands, got: %s", cmd)
 	}
 
-	// Should still use capture-resume pattern
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Should use --resume flag in capture-resume pattern, got: %s", cmd)
+	// Should use --session-id pattern (pre-generated UUID, instant start)
+	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should use --session-id flag for instant start pattern, got: %s", cmd)
 	}
 }
 
@@ -487,7 +491,7 @@ func TestBuildClaudeCommand_SubagentAddDir(t *testing.T) {
 }
 
 // TestCreateForkedInstance_SessionIDPattern tests that forked sessions
-// use capture-resume pattern to get the session ID
+// use pre-generated UUID + --session-id pattern for instant start
 func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 	inst := NewInstance("original", "/tmp/test")
 	inst.ClaudeSessionID = "parent-abc-123"
@@ -498,26 +502,29 @@ func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 		t.Fatalf("CreateForkedInstance() failed: %v", err)
 	}
 
-	// Command SHOULD use capture-resume pattern
-	// Step 1: Capture via -p "." --output-format json
+	// Command SHOULD use uuidgen + --session-id pattern (instant, no API call)
+	// Step 1: Pre-generate UUID with uuidgen
+	if !strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command should use uuidgen for session ID, got: %s", cmd)
+	}
+	// Should NOT use -p "." or jq (old capture-resume pattern)
+	if strings.Contains(cmd, `-p "."`) {
+		t.Errorf("Fork command should NOT use -p \".\" (old pattern), got: %s", cmd)
+	}
+	if strings.Contains(cmd, "jq") {
+		t.Errorf("Fork command should NOT use jq (old pattern), got: %s", cmd)
+	}
+	// Step 2: Use --session-id flag with pre-generated UUID
+	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork command should use --session-id flag, got: %s", cmd)
+	}
+	// Step 3: Include --resume with parent ID and --fork-session
 	if !strings.Contains(cmd, "--resume parent-abc-123 --fork-session") {
 		t.Errorf("Fork command should contain --resume with parent ID and --fork-session, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, `-p "."`) {
-		t.Errorf("Fork command should use -p \".\" for capture, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Errorf("Fork command should use --output-format json, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, "jq -r '.session_id'") {
-		t.Errorf("Fork command should extract session ID with jq, got: %s", cmd)
-	}
-	// Step 2: Store and resume
+	// Step 4: Store session ID in tmux environment
 	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
 		t.Errorf("Fork command should store session ID in tmux env, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Fork command should resume with captured session ID, got: %s", cmd)
 	}
 
 	// Forked instance should have empty ClaudeSessionID initially
@@ -833,34 +840,24 @@ func TestInstance_UpdateGeminiSession(t *testing.T) {
 func TestBuildGeminiCommand(t *testing.T) {
 	inst := NewInstanceWithTool("test", "/tmp/test", "gemini")
 
-	// Without session ID, should return capture-resume pattern
+	// Without session ID, should start Gemini fresh (no capture-resume for Gemini)
+	// NOTE: Gemini does NOT use capture-resume for new sessions because
+	// "gemini --output-format json ." would hang processing the prompt
 	cmd := inst.buildGeminiCommand("gemini")
 
-	// Should contain json output format and session ID capture
-	// NOTE: We use --output-format json (not stream-json) to let Gemini complete
-	// and save the session before extracting session_id
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Error("Should use json output format for session ID capture")
+	// Should set YOLO mode env and start fresh
+	if !strings.Contains(cmd, "GEMINI_YOLO_MODE") {
+		t.Error("Should set GEMINI_YOLO_MODE env var")
 	}
-	if !strings.Contains(cmd, "GEMINI_SESSION_ID") {
-		t.Error("Should set GEMINI_SESSION_ID in tmux environment")
+	if !strings.Contains(cmd, "exec gemini") {
+		t.Errorf("Should start gemini fresh for new session, got %q", cmd)
 	}
-	if !strings.Contains(cmd, "--resume") {
-		t.Error("Should resume captured session")
+	// Should NOT use capture-resume pattern for new sessions
+	if strings.Contains(cmd, "--output-format json") {
+		t.Error("Should NOT use capture-resume pattern for new Gemini sessions")
 	}
-
-	// Should have fallback when capture fails (Issue #19: WSL jq parse error)
-	if !strings.Contains(cmd, `|| session_id=""`) {
-		t.Error("Should have fallback when capture fails")
-	}
-	// Should check for null jq output
-	if !strings.Contains(cmd, `!= "null"`) {
-		t.Error("Should check for null session_id from jq")
-	}
-	// Should start Gemini even without session ID (fallback path)
-	// Note: The else branch now includes YOLO mode setup before starting gemini
-	if !strings.Contains(cmd, "else") || !strings.Contains(cmd, "gemini; fi") {
-		t.Error("Should have else branch to start Gemini fresh")
+	if strings.Contains(cmd, "--resume") && inst.GeminiSessionID == "" {
+		t.Error("Should NOT use --resume for new sessions without session ID")
 	}
 
 	// With session ID, should use simple resume with YOLO env var

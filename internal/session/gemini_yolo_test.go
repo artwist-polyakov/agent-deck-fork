@@ -99,9 +99,11 @@ func TestInstance_buildGeminiCommand_YoloFlag(t *testing.T) {
 			sessionID:      "",
 			expectedContains: []string{
 				"--yolo",
-				"gemini --resume",
+				"exec gemini",
 			},
-			expectedNotContain: []string{},
+			expectedNotContain: []string{
+				"--resume", // New sessions should NOT use --resume
+			},
 		},
 		{
 			name:           "global yolo=false, new session",
@@ -109,10 +111,11 @@ func TestInstance_buildGeminiCommand_YoloFlag(t *testing.T) {
 			perSessionYolo: nil,
 			sessionID:      "",
 			expectedContains: []string{
-				"gemini --resume",
+				"exec gemini",
 			},
 			expectedNotContain: []string{
 				"--yolo",
+				"--resume", // New sessions should NOT use --resume
 			},
 		},
 		{

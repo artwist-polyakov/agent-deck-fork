@@ -289,23 +289,19 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 		// NOTE: For `exec` commands, we must use `export VAR=value; exec cmd` instead of
 		// `exec VAR=value cmd` because bash's exec builtin doesn't support the VAR=value
 		// prefix syntax - it interprets VAR=value as the command name to execute.
-		bashConfigPrefix := ""
 		bashExportPrefix := "" // For use with exec
 		if IsClaudeConfigDirExplicit() {
 			configDir := GetClaudeConfigDir()
-			bashConfigPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 			bashExportPrefix = fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", configDir)
 		}
 
 		var baseCmd string
+		// Pre-generate UUID and use --session-id flag (instant, no API call)
+		// Note: --session-id works for new sessions as of Claude CLI 2.1.x
 		baseCmd = fmt.Sprintf(
-			`session_id=$(%sclaude -p "." --output-format json 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; `+
-				`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
+			`session_id=$(uuidgen | tr '[:upper:]' '[:lower:]'); `+
 				`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
-				`%sexec claude --resume "$session_id"%s; `+
-				`else %sexec claude%s; fi`,
-			bashConfigPrefix,
-			bashExportPrefix, extraFlags,
+				`%sexec claude --session-id "$session_id"%s`,
 			bashExportPrefix, extraFlags)
 
 		// If message provided, append wait-and-send logic
@@ -313,21 +309,15 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 			// Escape single quotes in message for bash
 			escapedMsg := strings.ReplaceAll(message, "'", "'\"'\"'")
 
-			// Capture-resume with wait-and-send in background
-			// The wait loop runs in a subshell that polls for ">" prompt (Claude's input prompt)
-			// Once detected, sends the message via tmux send-keys (text + Enter separately)
+			// Pre-generate UUID, then wait-and-send message in background
 			baseCmd = fmt.Sprintf(
-				`session_id=$(%sclaude -p "." --output-format json 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; `+
-					`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
+				`session_id=$(uuidgen | tr '[:upper:]' '[:lower:]'); `+
 					`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
 					`(sleep 2; SESSION_NAME=$(tmux display-message -p '#S'); `+
 					`while ! tmux capture-pane -p -t "$SESSION_NAME" | tail -5 | grep -qE "^>"; do sleep 0.2; done; `+
 					`tmux send-keys -l -t "$SESSION_NAME" '%s'; tmux send-keys -t "$SESSION_NAME" Enter) & `+
-					`%sexec claude --resume "$session_id"%s; `+
-					`else %sexec claude%s; fi`,
-				bashConfigPrefix,
+					`%sexec claude --session-id "$session_id"%s`,
 				escapedMsg,
-				bashExportPrefix, extraFlags,
 				bashExportPrefix, extraFlags)
 		}
 
@@ -401,22 +391,10 @@ func (i *Instance) buildGeminiCommand(baseCommand string) string {
 			return fmt.Sprintf("tmux set-environment GEMINI_YOLO_MODE %s; gemini --resume %s%s", yoloEnv, i.GeminiSessionID, yoloFlag)
 		}
 
-		// Build the capture-resume command for new sessions with fallback
-		// This command:
-		// 1. Runs Gemini with a minimal prompt "." to completion (saves session to disk)
-		// 2. Extracts session_id from the JSON output
-		// 3. Stores session ID and YOLO mode in tmux environment (for retrieval by agent-deck)
-		// 4. Resumes that session interactively
-		// Fallback: If capture fails (jq not installed, auth issues), start Gemini fresh
-		// NOTE: Using --output-format json (not stream-json with head -1) because:
-		// - head -1 sends SIGPIPE which kills Gemini before it saves the session
-		// - json mode runs to completion, ensuring session file is written
-		return fmt.Sprintf(`session_id=$(gemini --output-format json "." 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; `+
-			`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
-			`tmux set-environment GEMINI_SESSION_ID "$session_id"; `+
-			`tmux set-environment GEMINI_YOLO_MODE %s; `+
-			`exec gemini --resume "$session_id"%s; `+
-			`else tmux set-environment GEMINI_YOLO_MODE %s; exec gemini%s; fi`, yoloEnv, yoloFlag, yoloEnv, yoloFlag)
+		// Start Gemini fresh - session ID will be captured when user interacts
+		// The previous capture-resume approach (gemini --output-format json ".") would hang
+		// because Gemini processes the "." prompt which takes too long
+		return fmt.Sprintf(`tmux set-environment GEMINI_YOLO_MODE %s; exec gemini%s`, yoloEnv, yoloFlag)
 	}
 
 	// For custom commands (e.g., resume commands), return as-is
@@ -582,6 +560,12 @@ func (i *Instance) Start() error {
 		return fmt.Errorf("failed to start tmux session: %w", err)
 	}
 
+	// Set AGENTDECK_INSTANCE_ID for Claude hooks to identify this session
+	// This enables real-time status updates via Stop/SessionStart hooks
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_INSTANCE_ID", i.ID); err != nil {
+		log.Printf("Warning: failed to set AGENTDECK_INSTANCE_ID: %v", err)
+	}
+
 	// Capture MCPs that are now loaded (for sync tracking)
 	i.CaptureLoadedMCPs()
 
@@ -629,6 +613,12 @@ func (i *Instance) StartWithMessage(message string) error {
 	// Start the tmux session
 	if err := i.tmuxSession.Start(command); err != nil {
 		return fmt.Errorf("failed to start tmux session: %w", err)
+	}
+
+	// Set AGENTDECK_INSTANCE_ID for Claude hooks to identify this session
+	// This enables real-time status updates via Stop/SessionStart hooks
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_INSTANCE_ID", i.ID); err != nil {
+		log.Printf("Warning: failed to set AGENTDECK_INSTANCE_ID: %v", err)
 	}
 
 	// Capture MCPs that are now loaded (for sync tracking)
@@ -1619,6 +1609,12 @@ func (i *Instance) Restart() error {
 
 	log.Printf("[MCP-DEBUG] tmuxSession.Start() succeeded")
 
+	// Set AGENTDECK_INSTANCE_ID for Claude hooks to identify this session
+	// This enables real-time status updates via Stop/SessionStart hooks
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_INSTANCE_ID", i.ID); err != nil {
+		log.Printf("Warning: failed to set AGENTDECK_INSTANCE_ID: %v", err)
+	}
+
 	// Re-capture MCPs after restart
 	i.CaptureLoadedMCPs()
 
@@ -1732,11 +1728,9 @@ func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOp
 	// NOTE: For `exec` commands, we must use `export VAR=value; exec cmd` instead of
 	// `exec VAR=value cmd` because bash's exec builtin doesn't support the VAR=value
 	// prefix syntax - it interprets VAR=value as the command name to execute.
-	bashConfigPrefix := ""
 	bashExportPrefix := "" // For use with exec
 	if IsClaudeConfigDirExplicit() {
 		configDir := GetClaudeConfigDir()
-		bashConfigPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 		bashExportPrefix = fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", configDir)
 	}
 
@@ -1749,22 +1743,16 @@ func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOp
 	// Build extra flags from options (for fork, we use ToArgsForFork which excludes session mode)
 	extraFlags := i.buildClaudeExtraFlags(opts)
 
-	// Use capture-resume pattern for fork:
-	// 1. Run claude with --fork-session -p "." --output-format json to create fork and capture session ID
-	// 2. Store captured session ID in tmux environment
-	// 3. Resume the forked session interactively
-	// Note: --session-id flag does NOT work for creating new sessions (Claude ignores it)
+	// Pre-generate UUID for forked session and use --session-id flag
+	// Note: --session-id works for new/forked sessions as of Claude CLI 2.1.x
 	// Note: Path is single-quoted to handle spaces and special characters
 	cmd := fmt.Sprintf(
 		`cd '%s' && `+
-			`session_id=$(%sclaude -p "." --output-format json --resume %s --fork-session 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; `+
-			`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
+			`session_id=$(uuidgen | tr '[:upper:]' '[:lower:]'); `+
 			`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
-			`%sexec claude --resume "$session_id"%s; `+
-			`else echo "Fork failed: could not capture session ID"; fi`,
+			`%sexec claude --session-id "$session_id" --resume %s --fork-session%s`,
 		workDir,
-		bashConfigPrefix, i.ClaudeSessionID,
-		bashExportPrefix, extraFlags)
+		bashExportPrefix, i.ClaudeSessionID, extraFlags)
 
 	return cmd, nil
 }
