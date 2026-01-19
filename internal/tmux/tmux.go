@@ -667,6 +667,29 @@ func (s *Session) Start(command string) error {
 	return nil
 }
 
+// SetupActivityMonitoring configures tmux hooks for instant status detection.
+// This should be called when loading existing sessions from storage to ensure
+// activity hooks are set up even for sessions that weren't just created.
+func (s *Session) SetupActivityMonitoring() {
+	if s.InstanceID == "" || s.Name == "" {
+		return
+	}
+
+	// Check if session exists first
+	if !s.Exists() {
+		return
+	}
+
+	// Enable activity monitoring
+	_ = exec.Command("tmux", "set-option", "-t", s.Name, "monitor-activity", "on").Run()
+
+	// Set up hook to call our script when activity detected
+	hookCmd := fmt.Sprintf("run-shell '%s %s'",
+		filepath.Join(os.Getenv("HOME"), ".agent-deck", "hooks", "tmux-activity.sh"),
+		s.InstanceID)
+	_ = exec.Command("tmux", "set-hook", "-t", s.Name, "alert-activity", hookCmd).Run()
+}
+
 // Exists checks if the tmux session exists
 // Uses cached session list when available (refreshed by RefreshExistingSessions)
 // Falls back to direct tmux call if cache is stale

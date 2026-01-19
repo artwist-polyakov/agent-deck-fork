@@ -500,6 +500,8 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			if tmuxSess.Exists() {
 				// Ignore errors - non-fatal, older tmux versions may not support all options
 				_ = tmuxSess.EnableMouseMode()
+				// Set up activity monitoring hooks for instant status detection
+				tmuxSess.SetupActivityMonitoring()
 			}
 		}
 
