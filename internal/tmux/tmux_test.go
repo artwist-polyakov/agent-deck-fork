@@ -11,6 +11,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// activityCooldown is defined here for test compatibility.
+// Cooldown was removed in v0.8.62 - status now only uses busy indicators.
+// With cooldown=0, cooldown is always "expired" so tests still pass.
+const activityCooldown = 0 * time.Millisecond
+
 func TestSanitizeName(t *testing.T) {
 	tests := []struct {
 		input    string
