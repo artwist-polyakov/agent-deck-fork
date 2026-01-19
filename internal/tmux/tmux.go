@@ -670,8 +670,9 @@ func (s *Session) Exists() bool {
 }
 
 // ConfigureStatusBar sets up the tmux status bar with session info
-// Shows: session title on left, project folder on right
-// Uses a compact, informative layout that helps developers know where they are
+// Shows: notification bar on left (managed by NotificationManager), session info on right
+// NOTE: status-left is reserved for the notification bar showing waiting sessions
+// This function only configures status-right to avoid overwriting notification bar
 func (s *Session) ConfigureStatusBar() {
 	// Get short folder name from WorkDir
 	folderName := filepath.Base(s.WorkDir)
@@ -685,15 +686,14 @@ func (s *Session) ConfigureStatusBar() {
 	// Style: dark background with accent colors (Tokyo Night inspired)
 	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-style", "bg=#1a1b26,fg=#a9b1d6").Run()
 
-	// Left side: session title with icon
-	leftStatus := fmt.Sprintf(" 📁 %s ", s.DisplayName)
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-left", leftStatus).Run()
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-left-length", "40").Run()
+	// Left side: reserved for notification bar (waiting sessions: ⚡ [1] name [2] name2...)
+	// Set length to accommodate multiple waiting sessions
+	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-left-length", "120").Run()
 
-	// Right side: project folder path
-	rightStatus := fmt.Sprintf(" %s ", folderName)
+	// Right side: session title with folder path for identification
+	rightStatus := fmt.Sprintf(" 📁 %s | %s ", s.DisplayName, folderName)
 	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-right", rightStatus).Run()
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-right-length", "30").Run()
+	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-right-length", "60").Run()
 }
 
 // EnablePipePane enables tmux pipe-pane to stream output to a log file
