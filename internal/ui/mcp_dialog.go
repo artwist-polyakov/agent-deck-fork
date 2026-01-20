@@ -280,11 +280,11 @@ func (m *MCPDialog) HasItems() bool {
 	return len(m.localAttached)+len(m.localAvailable)+len(m.globalAttached)+len(m.globalAvailable) > 0
 }
 
-// HasChanged returns true if any MCPs were changed (either scope)
+// HasChanged returns true if any MCPs were changed (any scope)
 func (m *MCPDialog) HasChanged() bool {
-	result := m.localChanged || m.globalChanged
-	log.Printf("[MCP-DEBUG] HasChanged() called - localChanged=%v, globalChanged=%v, result=%v",
-		m.localChanged, m.globalChanged, result)
+	result := m.localChanged || m.globalChanged || m.userChanged
+	log.Printf("[MCP-DEBUG] HasChanged() called - localChanged=%v, globalChanged=%v, userChanged=%v, result=%v",
+		m.localChanged, m.globalChanged, m.userChanged, result)
 	return result
 }
 
@@ -387,10 +387,10 @@ func (m *MCPDialog) Move() {
 	}
 }
 
-// Apply saves the changes to LOCAL (.mcp.json) and GLOBAL (Claude/Gemini config)
+// Apply saves the changes to LOCAL (.mcp.json), GLOBAL (Claude/Gemini config), and USER (~/.claude.json)
 func (m *MCPDialog) Apply() error {
-	log.Printf("[MCP-DEBUG] Apply() called - tool=%q, localChanged=%v, globalChanged=%v, projectPath=%q",
-		m.tool, m.localChanged, m.globalChanged, m.projectPath)
+	log.Printf("[MCP-DEBUG] Apply() called - tool=%q, localChanged=%v, globalChanged=%v, userChanged=%v, projectPath=%q",
+		m.tool, m.localChanged, m.globalChanged, m.userChanged, m.projectPath)
 
 	if m.tool == "gemini" {
 		// Gemini: Only global scope, write to settings.json
@@ -445,6 +445,24 @@ func (m *MCPDialog) Apply() error {
 		// Also clear project-specific MCPs (they were shown in global view)
 		// This ensures removed MCPs are actually removed
 		if err := session.ClearProjectMCPs(m.projectPath); err != nil {
+			m.err = err
+			return err
+		}
+
+		// Clear MCP cache so preview updates
+		session.ClearMCPCache(m.projectPath)
+	}
+
+	// Claude: Apply USER changes (affects ALL sessions!)
+	if m.userChanged {
+		// Get names of attached MCPs
+		enabledNames := make([]string, len(m.userAttached))
+		for i, item := range m.userAttached {
+			enabledNames[i] = item.Name
+		}
+
+		// Write to ~/.claude.json (ROOT config)
+		if err := session.WriteUserMCP(enabledNames); err != nil {
 			m.err = err
 			return err
 		}
