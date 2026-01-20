@@ -8,12 +8,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// MCPScope represents LOCAL or GLOBAL scope
+// MCPScope represents LOCAL, GLOBAL, or USER scope
 type MCPScope int
 
 const (
 	MCPScopeLocal MCPScope = iota
 	MCPScopeGlobal
+	MCPScopeUser // NEW: Manages ~/.claude.json (ROOT)
 )
 
 // MCPColumn represents Attached or Available column
