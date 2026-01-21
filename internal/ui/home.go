@@ -5379,10 +5379,13 @@ func (h *Home) renderSessionInfoCard(inst *session.Instance, width, height int) 
 	// Tool
 	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Tool:"), valueStyle.Render(inst.Tool)))
 
-	// Session ID (if available) - Claude or Gemini
+	// Session ID (if available) - Claude, Gemini, or OpenCode
 	sessionID := inst.ClaudeSessionID
 	if sessionID == "" {
 		sessionID = inst.GeminiSessionID
+	}
+	if sessionID == "" {
+		sessionID = inst.OpenCodeSessionID
 	}
 	if sessionID != "" {
 		shortID := sessionID
@@ -5665,6 +5668,75 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(keyStyle.Render("F"))
 			b.WriteString(hintStyle.Render(" fork with options"))
 			b.WriteString("\n")
+		}
+	}
+
+	// Gemini-specific info (session ID)
+	if selected.Tool == "gemini" {
+		geminiHeader := renderSectionDivider("Gemini", width-4)
+		b.WriteString(geminiHeader)
+		b.WriteString("\n")
+
+		labelStyle := lipgloss.NewStyle().Foreground(ColorText)
+		valueStyle := lipgloss.NewStyle().Foreground(ColorText)
+
+		if selected.GeminiSessionID != "" {
+			statusStyle := lipgloss.NewStyle().Foreground(ColorGreen).Bold(true)
+			b.WriteString(labelStyle.Render("Status:  "))
+			b.WriteString(statusStyle.Render("● Connected"))
+			b.WriteString("\n")
+
+			b.WriteString(labelStyle.Render("Session: "))
+			b.WriteString(valueStyle.Render(selected.GeminiSessionID))
+			b.WriteString("\n")
+		} else {
+			statusStyle := lipgloss.NewStyle().Foreground(ColorText)
+			b.WriteString(labelStyle.Render("Status:  "))
+			b.WriteString(statusStyle.Render("○ Not connected"))
+			b.WriteString("\n")
+		}
+	}
+
+	// OpenCode-specific info (session ID)
+	if selected.Tool == "opencode" {
+		opencodeHeader := renderSectionDivider("OpenCode", width-4)
+		b.WriteString(opencodeHeader)
+		b.WriteString("\n")
+
+		labelStyle := lipgloss.NewStyle().Foreground(ColorText)
+		valueStyle := lipgloss.NewStyle().Foreground(ColorText)
+
+		if selected.OpenCodeSessionID != "" {
+			statusStyle := lipgloss.NewStyle().Foreground(ColorGreen).Bold(true)
+			b.WriteString(labelStyle.Render("Status:  "))
+			b.WriteString(statusStyle.Render("● Connected"))
+			b.WriteString("\n")
+
+			b.WriteString(labelStyle.Render("Session: "))
+			b.WriteString(valueStyle.Render(selected.OpenCodeSessionID))
+			b.WriteString("\n")
+
+			// Show when session was detected
+			if !selected.OpenCodeDetectedAt.IsZero() {
+				detectedAgo := formatRelativeTime(selected.OpenCodeDetectedAt)
+				dimStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
+				b.WriteString(labelStyle.Render("Detected:"))
+				b.WriteString(dimStyle.Render(" " + detectedAgo))
+				b.WriteString("\n")
+			}
+		} else {
+			// Check if detection is in progress
+			if selected.Status == session.StatusRunning || selected.Status == session.StatusWaiting {
+				statusStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+				b.WriteString(labelStyle.Render("Status:  "))
+				b.WriteString(statusStyle.Render("◐ Detecting session..."))
+				b.WriteString("\n")
+			} else {
+				statusStyle := lipgloss.NewStyle().Foreground(ColorText)
+				b.WriteString(labelStyle.Render("Status:  "))
+				b.WriteString(statusStyle.Render("○ Not connected"))
+				b.WriteString("\n")
+			}
 		}
 	}
 	b.WriteString("\n")

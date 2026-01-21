@@ -60,6 +60,11 @@ type Instance struct {
 	GeminiYoloMode   *bool                   `json:"gemini_yolo_mode,omitempty"`   // Per-session override (nil = use global config)
 	GeminiAnalytics  *GeminiSessionAnalytics `json:"gemini_analytics,omitempty"`   // Per-session analytics
 
+	// OpenCode CLI integration
+	OpenCodeSessionID  string    `json:"opencode_session_id,omitempty"`
+	OpenCodeDetectedAt time.Time `json:"opencode_detected_at,omitempty"`
+	OpenCodeStartedAt  int64     `json:"-"` // Unix millis when we started OpenCode (for session matching, not persisted)
+
 	// Latest user input for context (extracted from session files)
 	LatestPrompt string `json:"latest_prompt,omitempty"`
 
@@ -423,6 +428,170 @@ func (i *Instance) buildGeminiCommand(baseCommand string) string {
 	return baseCommand
 }
 
+// buildOpenCodeCommand builds the command for OpenCode CLI
+// OpenCode stores sessions in ~/.local/share/opencode/storage/session/
+// Session IDs are in format: ses_XXXXX
+// Resume: opencode -s <session-id> or opencode --session <session-id>
+// Continue last: opencode -c or opencode --continue
+func (i *Instance) buildOpenCodeCommand(baseCommand string) string {
+	if i.Tool != "opencode" {
+		return baseCommand
+	}
+
+	// If baseCommand is just "opencode", handle specially
+	if baseCommand == "opencode" {
+		// If we already have a session ID, use resume with -s flag
+		if i.OpenCodeSessionID != "" {
+			return fmt.Sprintf("tmux set-environment OPENCODE_SESSION_ID %s; exec opencode -s %s",
+				i.OpenCodeSessionID, i.OpenCodeSessionID)
+		}
+
+		// Start OpenCode fresh - session ID will be captured async after startup
+		return "exec opencode"
+	}
+
+	// For custom commands (e.g., resume commands), return as-is
+	return baseCommand
+}
+
+// detectOpenCodeSessionAsync detects the OpenCode session ID after startup
+// OpenCode generates session IDs internally (format: ses_XXXXX)
+// We query "opencode session list --format json" and match by project directory,
+// picking the most recently updated session (since OpenCode auto-resumes the last session)
+func (i *Instance) detectOpenCodeSessionAsync() {
+	// Brief wait for OpenCode to initialize
+	time.Sleep(1 * time.Second)
+
+	// Try up to 3 times with short delays (detection should be quick now)
+	delays := []time.Duration{0, 1 * time.Second, 2 * time.Second}
+
+	for attempt, delay := range delays {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+
+		sessionID := i.queryOpenCodeSession()
+		if sessionID != "" {
+			i.OpenCodeSessionID = sessionID
+			i.OpenCodeDetectedAt = time.Now()
+
+			// Store in tmux environment for restart
+			if i.tmuxSession != nil {
+				if err := i.tmuxSession.SetEnvironment("OPENCODE_SESSION_ID", sessionID); err != nil {
+					log.Printf("[OPENCODE] Warning: failed to set OPENCODE_SESSION_ID env: %v", err)
+				}
+			}
+
+			log.Printf("[OPENCODE] Detected session ID: %s (attempt %d)", sessionID, attempt+1)
+			return
+		}
+
+		log.Printf("[OPENCODE] Session ID not found yet (attempt %d/%d)", attempt+1, len(delays))
+	}
+
+	log.Printf("[OPENCODE] Warning: Could not detect session ID after %d attempts", len(delays))
+}
+
+// queryOpenCodeSession queries OpenCode CLI for session matching our project directory
+// OpenCode automatically resumes the most recent session for a directory, so we
+// simply find the most recently updated session matching our project path.
+func (i *Instance) queryOpenCodeSession() string {
+	// Run: opencode session list --format json
+	cmd := exec.Command("opencode", "session", "list", "--format", "json")
+	cmd.Dir = i.ProjectPath
+
+	log.Printf("[OPENCODE] Querying sessions from dir: %s", i.ProjectPath)
+
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("[OPENCODE] Failed to query sessions: %v", err)
+		return ""
+	}
+
+	log.Printf("[OPENCODE] Got %d bytes of session data", len(output))
+
+	// Parse JSON response
+	// Expected format: array of session objects with id, directory, created, updated fields
+	var sessions []struct {
+		ID        string `json:"id"`
+		Directory string `json:"directory"`
+		Path      string `json:"path"`    // Some versions use path instead of directory
+		Created   int64  `json:"created"` // Unix timestamp (milliseconds)
+		Updated   int64  `json:"updated"` // Unix timestamp (milliseconds) - when last active
+	}
+
+	if err := json.Unmarshal(output, &sessions); err != nil {
+		log.Printf("[OPENCODE] Failed to parse session list: %v", err)
+		return ""
+	}
+
+	log.Printf("[OPENCODE] Parsed %d sessions", len(sessions))
+
+	// Find the most recently updated session matching our project path
+	// OpenCode auto-resumes the most recent session when you run `opencode` in a directory,
+	// so we track that same session (no startTime check needed)
+	projectPath := i.ProjectPath
+
+	var bestMatch string
+	var bestMatchTime int64
+
+	for _, sess := range sessions {
+		// Check directory match (normalize paths)
+		sessDir := sess.Directory
+		if sessDir == "" {
+			sessDir = sess.Path
+		}
+
+		normalizedSessDir := normalizePath(sessDir)
+		normalizedProjectPath := normalizePath(projectPath)
+
+		log.Printf("[OPENCODE] Session %s: dir=%q vs project=%q, created=%d, updated=%d",
+			sess.ID, sessDir, projectPath, sess.Created, sess.Updated)
+
+		// Normalize both paths for comparison
+		if sessDir == "" || normalizedSessDir != normalizedProjectPath {
+			log.Printf("[OPENCODE] Session %s: directory mismatch, skipping", sess.ID)
+			continue
+		}
+
+		// Pick the most recently updated session for this directory
+		updatedAt := sess.Updated
+		if updatedAt == 0 {
+			updatedAt = sess.Created // Fallback to created if updated not available
+		}
+
+		log.Printf("[OPENCODE] Session %s: directory matches, updated=%d", sess.ID, updatedAt)
+
+		if bestMatch == "" || updatedAt > bestMatchTime {
+			bestMatch = sess.ID
+			bestMatchTime = updatedAt
+		}
+	}
+
+	log.Printf("[OPENCODE] Best match: %s (updated=%d)", bestMatch, bestMatchTime)
+	return bestMatch
+}
+
+// normalizePath normalizes a file path for comparison
+func normalizePath(p string) string {
+	// Expand home directory
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = strings.Replace(p, "~", home, 1)
+		}
+	}
+
+	// Clean the path
+	p = filepath.Clean(p)
+
+	// Resolve symlinks if possible
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+
+	return p
+}
+
 // buildGenericCommand builds command for user-defined tools from config.toml
 // If the tool has session resume config, builds capture-resume command similar to Claude/Gemini
 // Otherwise returns the base command as-is
@@ -558,13 +727,17 @@ func (i *Instance) Start() error {
 	}
 
 	// Build command based on tool type
-	// Priority: built-in tools (claude, gemini) → custom tools from config.toml → raw command
+	// Priority: built-in tools (claude, gemini, opencode) → custom tools from config.toml → raw command
 	var command string
 	switch i.Tool {
 	case "claude":
 		command = i.buildClaudeCommand(i.Command)
 	case "gemini":
 		command = i.buildGeminiCommand(i.Command)
+	case "opencode":
+		command = i.buildOpenCodeCommand(i.Command)
+		// Record start time for session ID detection (Unix millis)
+		i.OpenCodeStartedAt = time.Now().UnixMilli()
 	default:
 		// Check if this is a custom tool with session resume config
 		if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -598,6 +771,12 @@ func (i *Instance) Start() error {
 	// After 5s grace period, status will be properly detected from tmux
 	if command != "" {
 		i.Status = StatusStarting
+	}
+
+	// Start async session ID detection for OpenCode
+	// This runs in background and captures the session ID once OpenCode creates it
+	if i.Tool == "opencode" {
+		go i.detectOpenCodeSessionAsync()
 	}
 
 	return nil
@@ -1567,6 +1746,46 @@ func (i *Instance) Restart() error {
 		return nil
 	}
 
+	// If OpenCode session AND tmux session exists, use respawn-pane
+	if i.Tool == "opencode" && i.tmuxSession != nil && i.tmuxSession.Exists() {
+		// Try to get session ID from tmux environment if not already set
+		// (async detection stores it there but Instance might not have been saved)
+		if i.OpenCodeSessionID == "" {
+			if envID, err := i.tmuxSession.GetEnvironment("OPENCODE_SESSION_ID"); err == nil && envID != "" {
+				i.OpenCodeSessionID = envID
+				i.OpenCodeDetectedAt = time.Now()
+				log.Printf("[RESTART-DEBUG] OpenCode: recovered session ID from tmux env: %s", envID)
+			}
+		}
+
+		var resumeCmd string
+		if i.OpenCodeSessionID != "" {
+			// Resume with known session ID
+			resumeCmd = fmt.Sprintf("tmux set-environment OPENCODE_SESSION_ID %s && opencode -s %s",
+				i.OpenCodeSessionID, i.OpenCodeSessionID)
+		} else {
+			// No session ID yet, start fresh (will detect ID async)
+			resumeCmd = "opencode"
+			// Re-record start time for async detection
+			i.OpenCodeStartedAt = time.Now().UnixMilli()
+		}
+		log.Printf("[RESTART-DEBUG] OpenCode using respawn-pane with command: %s", resumeCmd)
+
+		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+			log.Printf("[RESTART-DEBUG] OpenCode RespawnPane failed: %v", err)
+			return fmt.Errorf("failed to restart OpenCode session: %w", err)
+		}
+
+		// If no session ID, start async detection
+		if i.OpenCodeSessionID == "" {
+			go i.detectOpenCodeSessionAsync()
+		}
+
+		log.Printf("[RESTART-DEBUG] OpenCode RespawnPane succeeded")
+		i.Status = StatusWaiting
+		return nil
+	}
+
 	// If custom tool with session resume support AND tmux session exists, use respawn-pane
 	if i.CanRestartGeneric() && i.tmuxSession != nil && i.tmuxSession.Exists() {
 		toolDef := GetToolDef(i.Tool)
@@ -1610,6 +1829,10 @@ func (i *Instance) Restart() error {
 		// Set GEMINI_SESSION_ID in tmux env so detection works after restart
 		command = fmt.Sprintf("tmux set-environment GEMINI_SESSION_ID %s && gemini --resume %s",
 			i.GeminiSessionID, i.GeminiSessionID)
+	} else if i.Tool == "opencode" && i.OpenCodeSessionID != "" {
+		// Set OPENCODE_SESSION_ID in tmux env so detection works after restart
+		command = fmt.Sprintf("tmux set-environment OPENCODE_SESSION_ID %s && opencode -s %s",
+			i.OpenCodeSessionID, i.OpenCodeSessionID)
 	} else {
 		// Route to appropriate command builder based on tool
 		switch i.Tool {
@@ -1617,6 +1840,10 @@ func (i *Instance) Restart() error {
 			command = i.buildClaudeCommand(i.Command)
 		case "gemini":
 			command = i.buildGeminiCommand(i.Command)
+		case "opencode":
+			command = i.buildOpenCodeCommand(i.Command)
+			// Record start time for async session ID detection
+			i.OpenCodeStartedAt = time.Now().UnixMilli()
 		default:
 			// Check if this is a custom tool with session resume config
 			if toolDef := GetToolDef(i.Tool); toolDef != nil {
@@ -1648,6 +1875,11 @@ func (i *Instance) Restart() error {
 
 	// Re-capture MCPs after restart
 	i.CaptureLoadedMCPs()
+
+	// Start async session ID detection for OpenCode (if no ID yet)
+	if i.Tool == "opencode" && i.OpenCodeSessionID == "" {
+		go i.detectOpenCodeSessionAsync()
+	}
 
 	// Start as WAITING - will go GREEN on next tick if Claude shows busy indicator
 	if command != "" {
@@ -1710,6 +1942,7 @@ func (i *Instance) buildClaudeResumeCommand() string {
 // CanRestart returns true if the session can be restarted
 // For Claude sessions with known ID: can always restart (interrupt and resume)
 // For Gemini sessions with known ID: can always restart (interrupt and resume)
+// For OpenCode sessions with known ID: can always restart (interrupt and resume)
 // For custom tools with session resume config: can restart if session ID available
 // For other sessions: only if dead/error state
 func (i *Instance) CanRestart() bool {
@@ -1720,6 +1953,17 @@ func (i *Instance) CanRestart() bool {
 
 	// Claude sessions with known session ID can always be restarted
 	if i.Tool == "claude" && i.ClaudeSessionID != "" {
+		return true
+	}
+
+	// OpenCode sessions with known session ID can always be restarted
+	if i.Tool == "opencode" && i.OpenCodeSessionID != "" {
+		return true
+	}
+
+	// OpenCode sessions without ID can still restart (will start fresh)
+	// This allows restart even before session ID is detected
+	if i.Tool == "opencode" {
 		return true
 	}
 

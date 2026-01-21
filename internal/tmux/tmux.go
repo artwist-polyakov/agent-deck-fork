@@ -696,10 +696,11 @@ func (s *Session) ConfigureStatusBar() {
 	// Set length to accommodate multiple waiting sessions
 	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-left-length", "120").Run()
 
-	// Right side: session title with folder path for identification
-	rightStatus := fmt.Sprintf(" 📁 %s | %s ", s.DisplayName, folderName)
+	// Right side: detach hint + session title with folder path
+	// The hint uses subtle gray (#565f89) so it doesn't compete with session info
+	rightStatus := fmt.Sprintf("#[fg=#565f89]ctrl+q detach#[default] │ 📁 %s | %s ", s.DisplayName, folderName)
 	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-right", rightStatus).Run()
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-right-length", "60").Run()
+	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-right-length", "80").Run()
 }
 
 // EnablePipePane enables tmux pipe-pane to stream output to a log file
@@ -1534,7 +1535,17 @@ func (s *Session) hasBusyIndicator(content string) bool {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// CHECK 3: Custom busy patterns from config.toml
+	// CHECK 3: OpenCode "esc interrupt" - PRIMARY indicator for OpenCode
+	// OpenCode shows "esc interrupt" at the bottom status bar when actively working
+	// This is equivalent to Claude's "ctrl+c to interrupt"
+	// ═══════════════════════════════════════════════════════════════════════
+	if strings.Contains(recentContent, "esc interrupt") {
+		debugLog("%s: BUSY_REASON=esc interrupt (OpenCode)", shortName)
+		return true
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// CHECK 4: Custom busy patterns from config.toml
 	// Allows custom tools to define their own busy indicators
 	// ═══════════════════════════════════════════════════════════════════════
 	if len(s.customBusyPatterns) > 0 {
@@ -1547,7 +1558,7 @@ func (s *Session) hasBusyIndicator(content string) bool {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// CHECK 4: Spinner characters - BACKUP indicator
+	// CHECK 5: Spinner characters - BACKUP indicator
 	// Braille spinner dots from cli-spinners "dots" pattern
 	// Check last 5 lines (spinners appear at status line)
 	// ═══════════════════════════════════════════════════════════════════════
