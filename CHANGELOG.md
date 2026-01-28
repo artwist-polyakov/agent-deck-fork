@@ -5,6 +5,14 @@ All notable changes to Agent Deck will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.89] - 2026-01-28
+
+### Fixed
+
+- Fix shutdown hang when quitting with "shut down" MCP pool option (process `Wait()` blocked forever on child-held pipes)
+- Set `cmd.Cancel` (SIGTERM) and `cmd.WaitDelay` (3s) on MCP processes for graceful shutdown with escalation
+- Add 5s safety timeout to individual proxy `Stop()` and 10s overall timeout to pool `Shutdown()`
+
 ## [0.8.88] - 2026-01-28
 
 ### Fixed

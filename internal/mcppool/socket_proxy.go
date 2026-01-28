@@ -156,6 +156,16 @@ func (p *SocketProxy) Start() error {
 	}
 	p.mcpProcess.Env = cmdEnv
 
+	// Graceful shutdown: send SIGTERM on context cancel (instead of default SIGKILL).
+	// WaitDelay gives the process time to exit after SIGTERM before Go forcibly
+	// closes I/O pipes and sends SIGKILL. This prevents shutdown hangs when child
+	// processes (e.g., node spawned by npx) inherit stdout/stderr and keep Wait() blocked.
+	// See: https://github.com/golang/go/issues/50436
+	p.mcpProcess.Cancel = func() error {
+		return p.mcpProcess.Process.Signal(syscall.SIGTERM)
+	}
+	p.mcpProcess.WaitDelay = 3 * time.Second
+
 	p.mcpStdin, err = p.mcpProcess.StdinPipe()
 	if err != nil {
 		return err
@@ -332,8 +342,23 @@ func (p *SocketProxy) Stop() error {
 	// Only kill process and remove socket if we OWN it (mcpProcess != nil)
 	if p.mcpProcess != nil {
 		p.mcpStdin.Close()
-		_ = p.mcpProcess.Process.Signal(syscall.SIGTERM)
-		_ = p.mcpProcess.Wait()
+		// Context cancel above triggers cmd.Cancel (SIGTERM), then WaitDelay handles
+		// escalation to SIGKILL + pipe close after 3s. Add 5s safety net.
+		done := make(chan error, 1)
+		go func() {
+			done <- p.mcpProcess.Wait()
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				log.Printf("[Pool] %s: process exited with: %v", p.name, err)
+			}
+		case <-time.After(5 * time.Second):
+			// Final safety net: force kill if Wait() somehow still blocks
+			log.Printf("[Pool] %s: Wait() timed out after 5s, force killing", p.name)
+			_ = p.mcpProcess.Process.Kill()
+			<-done // Wait must return after Kill
+		}
 		os.Remove(p.socketPath)
 		log.Printf("[Pool] %s: Stopped owned process and removed socket", p.name)
 	} else {

@@ -174,7 +174,18 @@ func (p *Pool) Shutdown() error {
 			_ = sp.Stop()
 		}(name, proxy)
 	}
-	wg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("[Pool] All proxies stopped cleanly")
+	case <-time.After(10 * time.Second):
+		log.Printf("[Pool] WARNING: Shutdown timed out after 10s, some proxies may not have stopped cleanly")
+	}
 
 	return nil
 }
