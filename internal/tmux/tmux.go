@@ -10,8 +10,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -885,7 +887,10 @@ func (s *Session) EnableMouseMode() error {
 	return nil
 }
 
-// Kill terminates the tmux session
+// Kill terminates the tmux session.
+// Like RespawnPane, this captures the process tree first and ensures all
+// processes actually die. tmux kill-session sends SIGHUP which some CLI
+// tools (e.g. Claude Code 2.1.27+) ignore, leaving orphan processes.
 func (s *Session) Kill() error {
 	// Disable pipe-pane first
 	_ = s.DisablePipePane()
@@ -894,19 +899,173 @@ func (s *Session) Kill() error {
 	logFile := s.LogFile()
 	os.Remove(logFile) // Ignore errors
 
+	// Capture process tree BEFORE killing so we can verify they die
+	_, oldPIDs := s.getPaneProcessTree()
+	if len(oldPIDs) > 0 {
+		log.Printf("[RESPAWN] Pre-kill process tree for %s: %v", s.Name, oldPIDs)
+	}
+
 	// Kill the tmux session
 	cmd := exec.Command("tmux", "kill-session", "-t", s.Name)
-	return cmd.Run()
+	err := cmd.Run()
+
+	// Verify old processes are dead; escalate to SIGKILL if needed
+	if len(oldPIDs) > 0 {
+		go s.ensureProcessesDead(oldPIDs, 0)
+	}
+
+	return err
 }
 
-// RespawnPane kills the current process in the pane and starts a new command
-// This is more reliable than sending Ctrl+C and waiting for shell prompt
-// The -k flag kills the current process before respawning
+// getPaneProcessTree returns the pane's direct PID and all descendant PIDs.
+// Used before respawn to track processes that must die.
+func (s *Session) getPaneProcessTree() (panePID int, allPIDs []int) {
+	target := s.Name + ":"
+	out, err := exec.Command("tmux", "list-panes", "-t", target, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return 0, nil
+	}
+	// Take only the first line (handles multi-pane sessions safely)
+	pidStr := strings.TrimSpace(string(out))
+	if idx := strings.IndexByte(pidStr, '\n'); idx >= 0 {
+		pidStr = pidStr[:idx]
+	}
+	panePID, err = strconv.Atoi(pidStr)
+	if err != nil {
+		return 0, nil
+	}
+
+	// Collect the pane PID plus all descendants via pgrep -P (recursive)
+	allPIDs = []int{panePID}
+	queue := []int{panePID}
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		pgrepOut, err := exec.Command("pgrep", "-P", strconv.Itoa(parent)).Output()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(pgrepOut)), "\n") {
+			if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
+				allPIDs = append(allPIDs, pid)
+				queue = append(queue, pid)
+			}
+		}
+	}
+	return panePID, allPIDs
+}
+
+// isOurProcess checks if a PID still belongs to a process we spawned
+// (claude, node, zsh, bash, sh) rather than an unrelated process that
+// reused the PID. This prevents accidentally killing random processes.
+func isOurProcess(pid int) bool {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+	if err != nil {
+		return false // Process doesn't exist
+	}
+	name := strings.ToLower(strings.TrimSpace(string(out)))
+	for _, known := range []string{"claude", "node", "zsh", "bash", "sh", "cat", "npm"} {
+		if strings.Contains(name, known) {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureProcessesDead checks if any of the given PIDs are still alive and
+// escalates from SIGTERM to SIGKILL. This prevents zombie/orphan process
+// accumulation when CLI tools (e.g. Claude Code) ignore SIGHUP from tmux.
+func (s *Session) ensureProcessesDead(oldPIDs []int, newPanePID int) {
+	if len(oldPIDs) == 0 {
+		return
+	}
+
+	// Wait briefly for respawn-pane's SIGHUP to take effect
+	time.Sleep(500 * time.Millisecond)
+
+	var survivors []int
+	for _, pid := range oldPIDs {
+		// Skip the new pane process (respawn reuses the pane PID slot sometimes)
+		if pid == newPanePID {
+			continue
+		}
+		// Check if process is still alive (signal 0 = existence check)
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			continue // Already dead
+		}
+		// Guard against PID reuse: verify it's still one of our processes
+		if !isOurProcess(pid) {
+			log.Printf("[RESPAWN] PID %d is alive but not our process, skipping", pid)
+			continue
+		}
+		survivors = append(survivors, pid)
+	}
+
+	if len(survivors) == 0 {
+		return
+	}
+
+	// First try SIGTERM
+	log.Printf("[RESPAWN] %d processes survived respawn SIGHUP, sending SIGTERM: %v", len(survivors), survivors)
+	for _, pid := range survivors {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Signal(syscall.SIGTERM)
+		}
+	}
+
+	// Wait for SIGTERM
+	time.Sleep(1 * time.Second)
+
+	// Check again and SIGKILL any remaining
+	var stubborn []int
+	for _, pid := range survivors {
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			continue // Dead now
+		}
+		stubborn = append(stubborn, pid)
+	}
+
+	if len(stubborn) == 0 {
+		log.Printf("[RESPAWN] All survivors terminated after SIGTERM")
+		return
+	}
+
+	log.Printf("[RESPAWN] %d processes ignored SIGTERM, sending SIGKILL: %v", len(stubborn), stubborn)
+	for _, pid := range stubborn {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Signal(syscall.SIGKILL)
+		}
+	}
+	log.Printf("[RESPAWN] SIGKILL sent to %d processes, cleanup complete", len(stubborn))
+}
+
+// RespawnPane kills the current process in the pane and starts a new command.
+// This is more reliable than sending Ctrl+C and waiting for shell prompt.
+// The -k flag kills the current process before respawning.
+//
+// IMPORTANT: After respawn, this function verifies that old processes actually
+// died. Some CLI tools (notably Claude Code 2.1.27+) ignore SIGHUP sent by
+// tmux respawn-pane, leaving orphan processes that consume CPU indefinitely.
+// If old processes survive, we escalate through SIGTERM → SIGKILL.
 func (s *Session) RespawnPane(command string) error {
 	if !s.Exists() {
 		return fmt.Errorf("session does not exist: %s", s.Name)
 	}
 	s.invalidateCache()
+
+	// Capture the current process tree BEFORE respawn so we can verify they die
+	_, oldPIDs := s.getPaneProcessTree()
+	if len(oldPIDs) > 0 {
+		log.Printf("[RESPAWN] Pre-respawn process tree: %v", oldPIDs)
+	}
 
 	// Build respawn-pane command
 	// -k: Kill current process
@@ -944,6 +1103,15 @@ func (s *Session) RespawnPane(command string) error {
 		return fmt.Errorf("failed to respawn pane: %w (output: %s)", err, string(output))
 	}
 	log.Printf("[MCP-DEBUG] RespawnPane output: %s", string(output))
+
+	// Get the NEW pane PID so we don't accidentally kill the fresh process
+	newPanePID, _ := s.getPaneProcessTree()
+
+	// Verify old processes are dead; escalate to SIGKILL if needed
+	// Run in background so RespawnPane returns quickly
+	if len(oldPIDs) > 0 {
+		go s.ensureProcessesDead(oldPIDs, newPanePID)
+	}
 
 	return nil
 }
