@@ -2541,6 +2541,15 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, tea.Batch(h.tick(), previewCmd)
 
+	case globalSearchDebounceMsg, globalSearchResultsMsg:
+		// Route async global search messages to the global search component
+		if h.globalSearch.IsVisible() {
+			var cmd tea.Cmd
+			h.globalSearch, cmd = h.globalSearch.Update(msg)
+			return h, cmd
+		}
+		return h, nil
+
 	case tea.KeyMsg:
 		// Track user activity for adaptive status updates
 		h.lastUserInputTime = time.Now()
@@ -3004,15 +3013,12 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
-	case "G": // Jump to bottom
-		if len(h.flatItems) > 0 {
-			h.cursor = len(h.flatItems) - 1
-			h.syncViewport()
-			h.lastNavigationTime = time.Now()
-			h.isNavigating = true
-			if selected := h.getSelectedSession(); selected != nil {
-				return h, h.fetchPreviewDebounced(selected.ID)
-			}
+	case "G": // Open global search (fall back to local search if index not available)
+		if h.globalSearchIndex != nil {
+			h.globalSearch.SetSize(h.width, h.height)
+			h.globalSearch.Show()
+		} else {
+			h.search.Show()
 		}
 		return h, nil
 
