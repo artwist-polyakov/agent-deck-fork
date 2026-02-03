@@ -874,7 +874,7 @@ func TestBuildGeminiCommand(t *testing.T) {
 	if !strings.Contains(cmd, "GEMINI_YOLO_MODE") {
 		t.Error("Should set GEMINI_YOLO_MODE env var")
 	}
-	if !strings.Contains(cmd, "exec gemini") {
+	if !strings.Contains(cmd, "gemini") {
 		t.Errorf("Should start gemini fresh for new session, got %q", cmd)
 	}
 	// Should NOT use capture-resume pattern for new sessions
@@ -912,7 +912,7 @@ func TestBuildGeminiCommand(t *testing.T) {
 	if !strings.Contains(cmd, "--model gemini-2.5-pro") {
 		t.Errorf("buildGeminiCommand('gemini') with model should include --model flag, got %q", cmd)
 	}
-	if !strings.Contains(cmd, "exec gemini") {
+	if !strings.Contains(cmd, "gemini") {
 		t.Errorf("buildGeminiCommand('gemini') without session ID should start fresh, got %q", cmd)
 	}
 

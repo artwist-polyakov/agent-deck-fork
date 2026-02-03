@@ -159,7 +159,7 @@ func TestOpenCodeBuildCommand(t *testing.T) {
 			name:              "Fresh start without session ID",
 			baseCommand:       "opencode",
 			openCodeSessionID: "",
-			wantContains:      []string{"exec opencode"},
+			wantContains:      []string{"opencode"},
 			wantNotContains:   []string{"-s", "tmux set-environment"},
 		},
 		{

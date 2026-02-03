@@ -312,7 +312,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 					bashExportPrefix = fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", configDir)
 				}
 				return fmt.Sprintf(
-					`tmux set-environment CLAUDE_SESSION_ID "%s"; %sexec claude --session-id "%s"%s`,
+					`tmux set-environment CLAUDE_SESSION_ID "%s"; %sclaude --session-id "%s"%s`,
 					opts.ResumeSessionID, bashExportPrefix, opts.ResumeSessionID, extraFlags)
 			}
 			// No session ID provided - use -r flag for interactive picker
@@ -330,10 +330,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 		// Reason: Commands with $(...) get wrapped in `bash -c` for fish compatibility (#47),
 		// and shell aliases are not available in non-interactive bash shells.
 		//
-		// NOTE: For `exec` commands, we must use `export VAR=value; exec cmd` instead of
-		// `exec VAR=value cmd` because bash's exec builtin doesn't support the VAR=value
-		// prefix syntax - it interprets VAR=value as the command name to execute.
-		bashExportPrefix := "" // For use with exec
+		bashExportPrefix := ""
 		if IsClaudeConfigDirExplicit() {
 			configDir := GetClaudeConfigDir()
 			bashExportPrefix = fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", configDir)
@@ -345,7 +342,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 		baseCmd = fmt.Sprintf(
 			`session_id=$(uuidgen | tr '[:upper:]' '[:lower:]'); `+
 				`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
-				`%sexec claude --session-id "$session_id"%s`,
+				`%sclaude --session-id "$session_id"%s`,
 			bashExportPrefix, extraFlags)
 
 		// If message provided, append wait-and-send logic
@@ -360,7 +357,7 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 					`(sleep 2; SESSION_NAME=$(tmux display-message -p '#S'); `+
 					`while ! tmux capture-pane -p -t "$SESSION_NAME" | tail -5 | grep -qE "^>"; do sleep 0.2; done; `+
 					`tmux send-keys -l -t "$SESSION_NAME" '%s'; tmux send-keys -t "$SESSION_NAME" Enter) & `+
-					`%sexec claude --session-id "$session_id"%s`,
+					`%sclaude --session-id "$session_id"%s`,
 				escapedMsg,
 				bashExportPrefix, extraFlags)
 		}
@@ -453,7 +450,7 @@ func (i *Instance) buildGeminiCommand(baseCommand string) string {
 		// Start Gemini fresh - session ID will be captured when user interacts
 		// The previous capture-resume approach (gemini --output-format json ".") would hang
 		// because Gemini processes the "." prompt which takes too long
-		return envPrefix + fmt.Sprintf(`tmux set-environment GEMINI_YOLO_MODE %s; exec gemini%s%s`, yoloEnv, yoloFlag, modelFlag)
+		return envPrefix + fmt.Sprintf(`tmux set-environment GEMINI_YOLO_MODE %s; gemini%s%s`, yoloEnv, yoloFlag, modelFlag)
 	}
 
 	// For custom commands (e.g., resume commands), return as-is
@@ -477,12 +474,12 @@ func (i *Instance) buildOpenCodeCommand(baseCommand string) string {
 	if baseCommand == "opencode" {
 		// If we already have a session ID, use resume with -s flag
 		if i.OpenCodeSessionID != "" {
-			return envPrefix + fmt.Sprintf("tmux set-environment OPENCODE_SESSION_ID %s; exec opencode -s %s",
+			return envPrefix + fmt.Sprintf("tmux set-environment OPENCODE_SESSION_ID %s; opencode -s %s",
 				i.OpenCodeSessionID, i.OpenCodeSessionID)
 		}
 
 		// Start OpenCode fresh - session ID will be captured async after startup
-		return envPrefix + "exec opencode"
+		return envPrefix + "opencode"
 	}
 
 	// For custom commands (e.g., resume commands), return as-is
@@ -510,12 +507,12 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	if baseCommand == "codex" {
 		// If we already have a session ID, use resume
 		if i.CodexSessionID != "" {
-			return envPrefix + fmt.Sprintf("tmux set-environment CODEX_SESSION_ID %s; exec codex resume %s",
+			return envPrefix + fmt.Sprintf("tmux set-environment CODEX_SESSION_ID %s; codex resume %s",
 				i.CodexSessionID, i.CodexSessionID)
 		}
 
 		// Start Codex fresh - session ID will be captured async after startup
-		return envPrefix + "exec codex"
+		return envPrefix + "codex"
 	}
 
 	// For custom commands (e.g., resume commands), return as-is
@@ -912,8 +909,8 @@ func (i *Instance) buildGenericCommand(baseCommand string) string {
 		`session_id=$(%s %s "." 2>/dev/null | jq -r '%s' 2>/dev/null) || session_id=""; `+
 			`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
 			`tmux set-environment %s "$session_id"; `+
-			`exec %s %s "$session_id"%s; `+
-			`else exec %s%s; fi`,
+			`%s %s "$session_id"%s; `+
+			`else %s%s; fi`,
 		baseCommand, toolDef.OutputFormatFlag, toolDef.SessionIDJsonPath,
 		toolDef.SessionIDEnv,
 		baseCommand, toolDef.ResumeFlag, dangerousFlag,
@@ -2260,11 +2257,11 @@ func (i *Instance) Restart() error {
 		var resumeCmd string
 		if i.CodexSessionID != "" {
 			// Resume with known session ID
-			resumeCmd = fmt.Sprintf("tmux set-environment CODEX_SESSION_ID %s; exec codex resume %s",
+			resumeCmd = fmt.Sprintf("tmux set-environment CODEX_SESSION_ID %s; codex resume %s",
 				i.CodexSessionID, i.CodexSessionID)
 		} else {
 			// No session ID yet, start fresh (will detect ID async)
-			resumeCmd = "exec codex"
+			resumeCmd = "codex"
 			// Re-record start time for async detection
 			i.CodexStartedAt = time.Now().UnixMilli()
 		}
@@ -2332,7 +2329,7 @@ func (i *Instance) Restart() error {
 			i.OpenCodeSessionID, i.OpenCodeSessionID)
 	} else if i.Tool == "codex" && i.CodexSessionID != "" {
 		// Set CODEX_SESSION_ID in tmux env so detection works after restart
-		command = fmt.Sprintf("tmux set-environment CODEX_SESSION_ID %s; exec codex resume %s",
+		command = fmt.Sprintf("tmux set-environment CODEX_SESSION_ID %s; codex resume %s",
 			i.CodexSessionID, i.CodexSessionID)
 	} else {
 		// Route to appropriate command builder based on tool
@@ -2559,11 +2556,7 @@ func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOp
 	// "claude" binary + CLAUDE_CONFIG_DIR, NOT a custom command alias like "cdw".
 	// Reason: Commands with $(...) get wrapped in `bash -c` for fish compatibility (#47),
 	// and shell aliases are not available in non-interactive bash shells.
-	//
-	// NOTE: For `exec` commands, we must use `export VAR=value; exec cmd` instead of
-	// `exec VAR=value cmd` because bash's exec builtin doesn't support the VAR=value
-	// prefix syntax - it interprets VAR=value as the command name to execute.
-	bashExportPrefix := "" // For use with exec
+	bashExportPrefix := ""
 	if IsClaudeConfigDirExplicit() {
 		configDir := GetClaudeConfigDir()
 		bashExportPrefix = fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", configDir)
@@ -2585,7 +2578,7 @@ func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOp
 		`cd '%s' && `+
 			`session_id=$(uuidgen | tr '[:upper:]' '[:lower:]'); `+
 			`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
-			`%sexec claude --session-id "$session_id" --resume %s --fork-session%s`,
+			`%sclaude --session-id "$session_id" --resume %s --fork-session%s`,
 		workDir,
 		bashExportPrefix, i.ClaudeSessionID, extraFlags)
 
