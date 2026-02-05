@@ -30,11 +30,11 @@ type ConfirmDialog struct {
 	mcpCount    int // Number of running MCPs (for quit confirmation)
 
 	// Pending session creation data (for ConfirmCreateDirectory)
-	pendingSessionName        string
-	pendingSessionPath        string
-	pendingSessionCommand     string
-	pendingSessionGroupPath   string
-	pendingToolOptionsJSON    json.RawMessage // Generic tool options (claude, codex, etc.)
+	pendingSessionName      string
+	pendingSessionPath      string
+	pendingSessionCommand   string
+	pendingSessionGroupPath string
+	pendingToolOptionsJSON  json.RawMessage // Generic tool options (claude, codex, etc.)
 }
 
 // NewConfirmDialog creates a new confirmation dialog

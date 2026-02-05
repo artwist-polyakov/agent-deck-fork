@@ -323,11 +323,6 @@ func (p *ClaudeOptionsPanel) viewNewMode(labelStyle, activeStyle, dimStyle, head
 	return content
 }
 
-// renderCheckbox renders a checkbox [x] or [ ] (delegates to shared function)
-func (p *ClaudeOptionsPanel) renderCheckbox(checked, focused bool) string {
-	return renderCheckboxMark(checked, focused)
-}
-
 // renderCheckboxMark renders a checkbox mark [x] or [ ] with consistent styling.
 // Shared across all tool option panels for visual consistency.
 func renderCheckboxMark(checked, focused bool) string {

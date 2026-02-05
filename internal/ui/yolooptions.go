@@ -70,7 +70,7 @@ func (p *YoloOptionsPanel) View() string {
 	headerStyle := lipgloss.NewStyle().Foreground(ColorComment)
 
 	var content string
-	content += headerStyle.Render("─ " + p.toolName + " Options ─") + "\n"
+	content += headerStyle.Render("─ "+p.toolName+" Options ─") + "\n"
 	content += renderCheckboxLine(p.label, p.yoloMode, p.focused)
 	return content
 }
