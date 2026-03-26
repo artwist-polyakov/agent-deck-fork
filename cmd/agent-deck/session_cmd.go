@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/clipboard"
+	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/profile"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
+	"github.com/asheshgoplani/agent-deck/internal/ui"
 )
 
 // handleSession dispatches session subcommands
@@ -98,6 +103,7 @@ func printSessionHelp() {
 	fmt.Println("  path               Project path")
 	fmt.Println("  command            Command to run")
 	fmt.Println("  tool               Tool type (claude, gemini, shell, etc.)")
+	fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
 	fmt.Println("  claude-session-id  Claude conversation ID (for fork/resume)")
 	fmt.Println("  gemini-session-id  Gemini conversation ID (for resume)")
 	fmt.Println()
@@ -105,6 +111,7 @@ func printSessionHelp() {
 	fmt.Println("  agent-deck session set my-project title \"New Title\"")
 	fmt.Println("  agent-deck session set my-project claude-session-id \"abc123-def456\"")
 	fmt.Println("  agent-deck session set my-project tool claude")
+	fmt.Println("  agent-deck session set my-project wrapper \"nvim +'terminal {command}'\"")
 }
 
 // handleSessionStart starts a session's tmux process
@@ -115,6 +122,7 @@ func handleSessionStart(profile string, args []string) {
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
 	message := fs.String("message", "", "Initial message to send once agent is ready")
 	messageShort := fs.String("m", "", "Initial message to send once agent is ready (short)")
+	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode when starting Gemini or Codex sessions")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session start <id|title> [options]")
@@ -130,7 +138,7 @@ func handleSessionStart(profile string, args []string) {
 		fmt.Println("  agent-deck session start my-project -m \"Explain this codebase\"")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -156,11 +164,17 @@ func handleSessionStart(profile string, args []string) {
 			os.Exit(2)
 		}
 		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Check if already running
 	if inst.Exists() {
 		out.Error(fmt.Sprintf("session '%s' is already running", inst.Title), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	if err := applyCLIYoloOverride(inst, *yoloMode); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -177,6 +191,10 @@ func handleSessionStart(profile string, args []string) {
 		}
 	}
 
+	// Capture session ID from tmux env before saving to JSON
+	// Claude: UUID is set by bash capture-resume pattern before exec
+	inst.PostStartSync(3 * time.Second)
+
 	// Save updated state
 	if err := saveSessionData(storage, instances); err != nil {
 		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
@@ -192,10 +210,13 @@ func handleSessionStart(profile string, args []string) {
 	if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 		jsonData["tmux"] = tmuxSess.Name
 	}
+	if inst.ClaudeSessionID != "" {
+		jsonData["claude_session_id"] = inst.ClaudeSessionID
+	}
 	if initialMessage != "" {
 		jsonData["message"] = initialMessage
-		jsonData["message_pending"] = true
-		out.Success(fmt.Sprintf("Started session: %s (message will be sent when ready)", inst.Title), jsonData)
+		jsonData["message_pending"] = false
+		out.Success(fmt.Sprintf("Started session: %s (message sent)", inst.Title), jsonData)
 	} else {
 		out.Success(fmt.Sprintf("Started session: %s", inst.Title), jsonData)
 	}
@@ -217,7 +238,7 @@ func handleSessionStop(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -240,6 +261,7 @@ func handleSessionStop(profile string, args []string) {
 			os.Exit(2)
 		}
 		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Check if not running
@@ -247,6 +269,12 @@ func handleSessionStop(profile string, args []string) {
 		out.Error(fmt.Sprintf("session '%s' is not running", inst.Title), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+
+	// Capture tool conversation IDs from tmux env before killing the session.
+	// This ensures IDs are saved to storage even if PostStartSync timed out
+	// during start (e.g., tool started late on slow WSL2 machines).
+	// Must happen before Kill() because tmux show-environment fails on dead sessions.
+	inst.SyncSessionIDsFromTmux()
 
 	// Stop the session by killing the tmux session
 	if err := inst.Kill(); err != nil {
@@ -284,7 +312,7 @@ func handleSessionRestart(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -307,12 +335,22 @@ func handleSessionRestart(profile string, args []string) {
 			os.Exit(2)
 		}
 		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Restart the session
 	if err := inst.Restart(); err != nil {
 		out.Error(fmt.Sprintf("failed to restart session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+	warning := inst.ConsumeCodexRestartWarning()
+	if warning != "" && !*jsonOutput {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
+	}
+
+	// If restart created a fresh session (no prior ID), capture the new ID
+	if session.IsClaudeCompatible(inst.Tool) && inst.ClaudeSessionID == "" {
+		inst.PostStartSync(3 * time.Second)
 	}
 
 	// Save updated state
@@ -322,11 +360,15 @@ func handleSessionRestart(profile string, args []string) {
 	}
 
 	// Output success
-	out.Success(fmt.Sprintf("Restarted session: %s", inst.Title), map[string]interface{}{
+	data := map[string]interface{}{
 		"success": true,
 		"id":      inst.ID,
 		"title":   inst.Title,
-	})
+	}
+	if warning != "" {
+		data["warning"] = warning
+	}
+	out.Success(fmt.Sprintf("Restarted session: %s", inst.Title), data)
 }
 
 // handleSessionFork forks a Claude session
@@ -339,6 +381,12 @@ func handleSessionFork(profile string, args []string) {
 	titleShort := fs.String("t", "", "Title for forked session (short)")
 	group := fs.String("group", "", "Group for forked session")
 	groupShort := fs.String("g", "", "Group for forked session (short)")
+	worktreeBranch := fs.String("w", "", "Create fork in git worktree for branch")
+	worktreeBranchLong := fs.String("worktree", "", "Create fork in git worktree for branch")
+	newBranch := fs.Bool("b", false, "Create new branch if needed (reuse existing branch when present)")
+	newBranchLong := fs.Bool("new-branch", false, "Create new branch if needed (reuse existing branch when present)")
+	sandbox := fs.Bool("sandbox", false, "Run forked session in Docker sandbox")
+	sandboxImage := fs.String("sandbox-image", "", "Docker image for sandbox (overrides config default)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session fork <id|title> [options]")
@@ -352,9 +400,11 @@ func handleSessionFork(profile string, args []string) {
 		fmt.Println("  agent-deck session fork my-project")
 		fmt.Println("  agent-deck session fork my-project -t \"my-fork\"")
 		fmt.Println("  agent-deck session fork my-project -t \"my-fork\" -g \"experiments\"")
+		fmt.Println("  agent-deck session fork my-project -w fork/experiment")
+		fmt.Println("  agent-deck session fork my-project -w fork/new-idea -b")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -381,17 +431,29 @@ func handleSessionFork(profile string, args []string) {
 			os.Exit(2)
 		}
 		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Verify it's a Claude session
-	if inst.Tool != "claude" {
-		out.Error(fmt.Sprintf("session '%s' is not a Claude session (tool: %s)", inst.Title, inst.Tool), ErrCodeInvalidOperation)
+	if !session.IsClaudeCompatible(inst.Tool) {
+		out.Error(
+			fmt.Sprintf("session '%s' is not a Claude session (tool: %s)", inst.Title, inst.Tool),
+			ErrCodeInvalidOperation,
+		)
 		os.Exit(1)
+	}
+
+	// Try to capture session ID from tmux if missing (handles pre-fix sessions)
+	if inst.ClaudeSessionID == "" && inst.Exists() {
+		inst.PostStartSync(2 * time.Second)
 	}
 
 	// Verify it can be forked
 	if !inst.CanFork() {
-		out.Error(fmt.Sprintf("session '%s' cannot be forked: no active Claude session ID", inst.Title), ErrCodeInvalidOperation)
+		out.Error(
+			fmt.Sprintf("session '%s' cannot be forked: no active Claude session ID", inst.Title),
+			ErrCodeInvalidOperation,
+		)
 		os.Exit(1)
 	}
 
@@ -405,11 +467,79 @@ func handleSessionFork(profile string, args []string) {
 		forkGroup = inst.GroupPath
 	}
 
+	// Resolve worktree flags
+	wtBranch := *worktreeBranch
+	if *worktreeBranchLong != "" {
+		wtBranch = *worktreeBranchLong
+	}
+	_ = *newBranch || *newBranchLong
+
+	// Handle worktree creation
+	var opts *session.ClaudeOptions
+	if wtBranch != "" {
+		if !git.IsGitRepo(inst.ProjectPath) {
+			out.Error("session path is not a git repository", ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		repoRoot, err := git.GetWorktreeBaseRoot(inst.ProjectPath)
+		if err != nil {
+			out.Error(fmt.Sprintf("failed to get repo root: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+
+		if err := git.ValidateBranchName(wtBranch); err != nil {
+			out.Error(fmt.Sprintf("invalid branch name: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+
+		wtSettings := session.GetWorktreeSettings()
+		worktreePath := git.WorktreePath(git.WorktreePathOptions{
+			Branch:    wtBranch,
+			Location:  wtSettings.DefaultLocation,
+			RepoDir:   repoRoot,
+			SessionID: git.GeneratePathID(),
+			Template:  wtSettings.Template(),
+		})
+
+		// Check for an existing worktree for this branch before creating a new one
+		if existingPath, err := git.GetWorktreeForBranch(repoRoot, wtBranch); err == nil && existingPath != "" {
+			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
+			worktreePath = existingPath
+		} else {
+			if _, statErr := os.Stat(worktreePath); statErr == nil {
+				out.Error(fmt.Sprintf("worktree path already exists: %s", worktreePath), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+
+			if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
+				out.Error(fmt.Sprintf("failed to create directory: %v", err), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+
+			if err := git.CreateWorktree(repoRoot, worktreePath, wtBranch); err != nil {
+				out.Error(fmt.Sprintf("worktree creation failed: %v", err), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		}
+
+		userConfig, _ := session.LoadUserConfig()
+		opts = session.NewClaudeOptions(userConfig)
+		opts.WorkDir = worktreePath
+		opts.WorktreePath = worktreePath
+		opts.WorktreeRepoRoot = repoRoot
+		opts.WorktreeBranch = wtBranch
+	}
+
 	// Create the forked instance
-	forkedInst, _, err := inst.CreateForkedInstance(forkTitle, forkGroup)
+	forkedInst, _, err := inst.CreateForkedInstanceWithOptions(forkTitle, forkGroup, opts)
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to create fork: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	// Apply sandbox config if requested.
+	if *sandbox {
+		forkedInst.Sandbox = session.NewSandboxConfig(*sandboxImage)
 	}
 
 	// Start the forked session
@@ -417,6 +547,9 @@ func handleSessionFork(profile string, args []string) {
 		out.Error(fmt.Sprintf("failed to start forked session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+
+	// Capture forked session's new session ID
+	forkedInst.PostStartSync(3 * time.Second)
 
 	// Add to instances
 	instances = append(instances, forkedInst)
@@ -434,26 +567,32 @@ func handleSessionFork(profile string, args []string) {
 	}
 
 	// Output success
-	out.Success(fmt.Sprintf("Forked session: %s -> %s (%s)", inst.Title, forkedInst.Title, TruncateID(forkedInst.ID)), map[string]interface{}{
-		"success":   true,
-		"parent_id": inst.ID,
-		"new_id":    forkedInst.ID,
-		"new_title": forkedInst.Title,
-	})
+	out.Success(
+		fmt.Sprintf("Forked session: %s -> %s (%s)", inst.Title, forkedInst.Title, TruncateID(forkedInst.ID)),
+		map[string]interface{}{
+			"success":   true,
+			"parent_id": inst.ID,
+			"new_id":    forkedInst.ID,
+			"new_title": forkedInst.Title,
+		},
+	)
 }
 
 // handleSessionAttach attaches to a session interactively
 func handleSessionAttach(profile string, args []string) {
+	detachByte := ui.ResolvedDetachByte(session.GetHotkeyOverrides())
+	detachLabel := ui.DetachByteLabel(detachByte)
+
 	fs := flag.NewFlagSet("session attach", flag.ExitOnError)
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session attach <id|title>")
 		fmt.Println()
 		fmt.Println("Attach to a session interactively.")
-		fmt.Println("Press Ctrl+Q to detach.")
+		fmt.Printf("Press %s to detach.\n", detachLabel)
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -474,6 +613,7 @@ func handleSessionAttach(profile string, args []string) {
 			os.Exit(2)
 		}
 		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Check if session exists
@@ -492,7 +632,7 @@ func handleSessionAttach(profile string, args []string) {
 	// Create context for attach
 	ctx := context.Background()
 
-	if err := tmuxSession.Attach(ctx); err != nil {
+	if err := tmuxSession.Attach(ctx, detachByte); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to attach: %v\n", err)
 		os.Exit(1)
 	}
@@ -514,7 +654,7 @@ func handleSessionShow(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -565,37 +705,35 @@ func handleSessionShow(profile string, args []string) {
 
 	// Get MCP info if Claude session
 	var mcpInfo *session.MCPInfo
-	if inst.Tool == "claude" {
+	if session.IsClaudeCompatible(inst.Tool) {
 		mcpInfo = inst.GetMCPInfo()
 	}
 
 	// Prepare JSON output
 	jsonData := map[string]interface{}{
-		"id":         inst.ID,
-		"title":      inst.Title,
-		"profile":    profile,
-		"status":     StatusString(inst.Status),
-		"path":       inst.ProjectPath,
-		"group":      inst.GroupPath,
-		"tool":       inst.Tool,
-		"created_at": inst.CreatedAt.Format(time.RFC3339),
+		"id":                  inst.ID,
+		"title":               inst.Title,
+		"profile":             profile,
+		"status":              StatusString(inst.Status),
+		"path":                inst.ProjectPath,
+		"group":               inst.GroupPath,
+		"parent_session_id":   inst.ParentSessionID,
+		"parent_project_path": inst.ParentProjectPath,
+		"tool":                inst.Tool,
+		"created_at":          inst.CreatedAt.Format(time.RFC3339),
 	}
 
 	if inst.Command != "" {
 		jsonData["command"] = inst.Command
 	}
 
-	if inst.Tool == "claude" {
+	if session.IsClaudeCompatible(inst.Tool) {
 		jsonData["claude_session_id"] = inst.ClaudeSessionID
 		jsonData["can_fork"] = inst.CanFork()
 		jsonData["can_restart"] = inst.CanRestart()
 
-		if mcpInfo != nil && mcpInfo.HasAny() {
-			jsonData["mcps"] = map[string]interface{}{
-				"local":   mcpInfo.Local,
-				"global":  mcpInfo.Global,
-				"project": mcpInfo.Project,
-			}
+		if mcps := mcpInfoForJSON(mcpInfo); mcps != nil {
+			jsonData["mcps"] = mcps
 		}
 	}
 
@@ -625,7 +763,7 @@ func handleSessionShow(profile string, args []string) {
 		sb.WriteString(fmt.Sprintf("Command: %s\n", inst.Command))
 	}
 
-	if inst.Tool == "claude" {
+	if session.IsClaudeCompatible(inst.Tool) {
 		if inst.ClaudeSessionID != "" {
 			truncatedID := inst.ClaudeSessionID
 			if len(truncatedID) > 36 {
@@ -671,6 +809,17 @@ func handleSessionShow(profile string, args []string) {
 	out.Print(sb.String(), jsonData)
 }
 
+func mcpInfoForJSON(mcpInfo *session.MCPInfo) map[string]interface{} {
+	if mcpInfo == nil || !mcpInfo.HasAny() {
+		return nil
+	}
+	return map[string]interface{}{
+		"local":   mcpInfo.Local(),
+		"global":  mcpInfo.Global,
+		"project": mcpInfo.Project,
+	}
+}
+
 // handleSessionSet updates a session property
 func handleSessionSet(profile string, args []string) {
 	fs := flag.NewFlagSet("session set", flag.ExitOnError)
@@ -688,6 +837,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  path               Project path")
 		fmt.Println("  command            Command to run")
 		fmt.Println("  tool               Tool type (claude, gemini, shell, etc.)")
+		fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
 		fmt.Println()
@@ -698,9 +848,10 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  agent-deck session set my-project title \"New Title\"")
 		fmt.Println("  agent-deck session set my-project claude-session-id \"abc123-def456\"")
 		fmt.Println("  agent-deck session set my-project path /new/path/to/project")
+		fmt.Println("  agent-deck session set my-project wrapper \"nvim +'terminal {command}'\"")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -717,16 +868,23 @@ func handleSessionSet(profile string, args []string) {
 
 	// Validate field name
 	validFields := map[string]bool{
-		"title":              true,
-		"path":               true,
-		"command":            true,
-		"tool":               true,
-		"claude-session-id":  true,
-		"gemini-session-id":  true,
+		"title":             true,
+		"path":              true,
+		"command":           true,
+		"tool":              true,
+		"wrapper":           true,
+		"claude-session-id": true,
+		"gemini-session-id": true,
 	}
 
 	if !validFields[field] {
-		out.Error(fmt.Sprintf("invalid field: %s\nValid fields: title, path, command, tool, claude-session-id, gemini-session-id", field), ErrCodeInvalidOperation)
+		out.Error(
+			fmt.Sprintf(
+				"invalid field: %s\nValid fields: title, path, command, tool, wrapper, claude-session-id, gemini-session-id",
+				field,
+			),
+			ErrCodeInvalidOperation,
+		)
 		os.Exit(1)
 	}
 
@@ -745,6 +903,7 @@ func handleSessionSet(profile string, args []string) {
 			os.Exit(2)
 		}
 		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Store old value for output
@@ -755,6 +914,7 @@ func handleSessionSet(profile string, args []string) {
 	case "title":
 		oldValue = inst.Title
 		inst.Title = value
+		inst.SyncTmuxDisplayName()
 	case "path":
 		oldValue = inst.ProjectPath
 		inst.ProjectPath = value
@@ -764,6 +924,9 @@ func handleSessionSet(profile string, args []string) {
 	case "tool":
 		oldValue = inst.Tool
 		inst.Tool = value
+	case "wrapper":
+		oldValue = inst.Wrapper
+		inst.Wrapper = value
 	case "claude-session-id":
 		oldValue = inst.ClaudeSessionID
 		inst.ClaudeSessionID = value
@@ -813,7 +976,8 @@ func loadSessionData(profile string) (*session.Storage, []*session.Instance, []*
 		return nil, nil, nil, fmt.Errorf("failed to load sessions: %w", err)
 	}
 
-	// LoadWithGroups already reconnects tmux sessions and updates status
+	// LoadWithGroups reconnects tmux sessions with lazy loading.
+	// Status uses cached values from JSON; session IDs are not synced at load time.
 
 	return storage, instances, groupsData, nil
 }
@@ -978,12 +1142,13 @@ func handleSessionSetParent(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Link a session as a sub-session of another session.")
 		fmt.Println("The session will inherit the parent's group.")
+		fmt.Println("This works for any session, including those created with --no-parent.")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -1009,6 +1174,7 @@ func handleSessionSetParent(profile string, args []string) {
 	if inst == nil {
 		out.Error(errMsg, errCode)
 		os.Exit(2)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Resolve the parent session
@@ -1016,6 +1182,7 @@ func handleSessionSetParent(profile string, args []string) {
 	if parentInst == nil {
 		out.Error(errMsg, errCode)
 		os.Exit(2)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Validate: can't set self as parent
@@ -1033,13 +1200,16 @@ func handleSessionSetParent(profile string, args []string) {
 	// Validate: session can't already have sub-sessions
 	for _, other := range instances {
 		if other.ParentSessionID == inst.ID {
-			out.Error(fmt.Sprintf("session '%s' already has sub-sessions, cannot become a sub-session", inst.Title), ErrCodeInvalidOperation)
+			out.Error(
+				fmt.Sprintf("session '%s' already has sub-sessions, cannot become a sub-session", inst.Title),
+				ErrCodeInvalidOperation,
+			)
 			os.Exit(1)
 		}
 	}
 
-	// Set parent and inherit group
-	inst.SetParent(parentInst.ID)
+	// Set parent (with project path for --add-dir access) and inherit group
+	inst.SetParentWithPath(parentInst.ID, parentInst.ProjectPath)
 	inst.GroupPath = parentInst.GroupPath
 
 	// Save
@@ -1050,12 +1220,12 @@ func handleSessionSetParent(profile string, args []string) {
 	}
 
 	out.Success(fmt.Sprintf("Linked '%s' as sub-session of '%s'", inst.Title, parentInst.Title), map[string]interface{}{
-		"success":           true,
-		"session_id":        inst.ID,
-		"session_title":     inst.Title,
-		"parent_id":         parentInst.ID,
-		"parent_title":      parentInst.Title,
-		"inherited_group":   inst.GroupPath,
+		"success":         true,
+		"session_id":      inst.ID,
+		"session_title":   inst.Title,
+		"parent_id":       parentInst.ID,
+		"parent_title":    parentInst.Title,
+		"inherited_group": inst.GroupPath,
 	})
 }
 
@@ -1076,7 +1246,7 @@ func handleSessionUnsetParent(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -1101,6 +1271,7 @@ func handleSessionUnsetParent(profile string, args []string) {
 	if inst == nil {
 		out.Error(errMsg, errCode)
 		os.Exit(2)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Check if it's actually a sub-session
@@ -1128,22 +1299,43 @@ func handleSessionUnsetParent(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	out.Success(fmt.Sprintf("Removed sub-session link from '%s' (was linked to '%s')", inst.Title, parentTitle), map[string]interface{}{
-		"success":        true,
-		"session_id":     inst.ID,
-		"session_title":  inst.Title,
-		"former_parent":  parentTitle,
-	})
+	out.Success(
+		fmt.Sprintf("Removed sub-session link from '%s' (was linked to '%s')", inst.Title, parentTitle),
+		map[string]interface{}{
+			"success":       true,
+			"session_id":    inst.ID,
+			"session_title": inst.Title,
+			"former_parent": parentTitle,
+		},
+	)
 }
 
 // handleSessionSend sends a message to a running session
 // Waits for the agent to be ready before sending (Claude, Gemini, etc.)
 func handleSessionSend(profile string, args []string) {
 	fs := flag.NewFlagSet("session send", flag.ExitOnError)
+	fs.SetOutput(os.Stdout)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("q", false, "Quiet mode")
 	noWait := fs.Bool("no-wait", false, "Don't wait for agent to be ready (send immediately)")
-	if err := fs.Parse(args); err != nil {
+	wait := fs.Bool("wait", false, "Block until agent finishes processing, then print output")
+	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for completion (used with --wait)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck session send <id|title> <message> [options]")
+		fmt.Println()
+		fmt.Println("Send a message to a running session.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fs.PrintDefaults()
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck session send my-project \"Summarize recent changes\"")
+		fmt.Println("  agent-deck session send my-project \"run tests\" --wait")
+		fmt.Println("  agent-deck session send my-project \"quick ping\" --no-wait")
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 	remaining := fs.Args()
@@ -1151,7 +1343,8 @@ func handleSessionSend(profile string, args []string) {
 	out := NewCLIOutput(*jsonOutput, *quiet)
 
 	if len(remaining) < 2 {
-		out.Error("usage: agent-deck session send <id> <message>", ErrCodeInvalidOperation)
+		fs.Usage()
+		out.Error("session and message are required", ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -1173,6 +1366,7 @@ func handleSessionSend(profile string, args []string) {
 			os.Exit(2)
 		}
 		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
 	// Check if session is running
@@ -1196,19 +1390,23 @@ func handleSessionSend(profile string, args []string) {
 		}
 	}
 
-	// Send message via tmux
-	tmuxName := tmuxSess.Name
-	cmd := exec.Command("tmux", "send-keys", "-l", "-t", tmuxName, message)
-	if err := cmd.Run(); err != nil {
-		out.Error(fmt.Sprintf("failed to send message: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
-	}
-
-	// Send Enter
-	cmd = exec.Command("tmux", "send-keys", "-t", tmuxName, "Enter")
-	if err := cmd.Run(); err != nil {
-		out.Error(fmt.Sprintf("failed to send Enter: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
+	// Send message atomically (text + Enter in single tmux invocation).
+	// --no-wait: skip readiness waiting, but still do a short retry/verification
+	// loop to avoid silent "pasted but not submitted" races.
+	// default mode: full retry budget after readiness check.
+	if *noWait {
+		if err := sendWithRetryTarget(tmuxSess, message, false, sendRetryOptions{
+			maxRetries: 8,
+			checkDelay: 150 * time.Millisecond,
+		}); err != nil {
+			out.Error(fmt.Sprintf("failed to send message: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	} else {
+		if err := sendWithRetry(tmuxSess, message, false); err != nil {
+			out.Error(fmt.Sprintf("failed to send message: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
 	}
 
 	out.Success(fmt.Sprintf("Sent message to '%s'", inst.Title), map[string]interface{}{
@@ -1217,47 +1415,296 @@ func handleSessionSend(profile string, args []string) {
 		"session_title": inst.Title,
 		"message":       message,
 	})
+
+	// If --wait, block until the agent finishes processing, then print output
+	if *wait {
+		finalStatus, err := waitForCompletion(tmuxSess, *timeout)
+		if err != nil {
+			out.Error(fmt.Sprintf("timeout waiting for completion: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+
+		// Refresh session ID: the instance was loaded before sending the message,
+		// so the ClaudeSessionID may be stale (e.g., PostStartSync timed out,
+		// TUI updated it during the wait, or /clear created a new session).
+		// First try tmux env (fast), then fall back to reloading from DB.
+		if session.IsClaudeCompatible(inst.Tool) {
+			if freshID := inst.GetSessionIDFromTmux(); freshID != "" {
+				inst.ClaudeSessionID = freshID
+				inst.ClaudeDetectedAt = time.Now()
+			}
+		}
+
+		// Fetch and print last response (like session output -q)
+		response, err := inst.GetLastResponseBestEffort()
+		if err != nil {
+			// Fallback: reload session from DB in case tmux env was also stale
+			// (e.g., /clear created a new session that TUI or hooks detected)
+			if _, freshInstances, _, loadErr := loadSessionData(profile); loadErr == nil {
+				if freshInst, _, _ := ResolveSession(sessionRef, freshInstances); freshInst != nil {
+					response, err = freshInst.GetLastResponseBestEffort()
+				}
+			}
+		}
+		if err != nil {
+			out.Error(fmt.Sprintf("failed to get response: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		fmt.Println(response.Content)
+
+		// Exit 1 for error/inactive status
+		if finalStatus == "inactive" || finalStatus == "error" {
+			os.Exit(1)
+		}
+	}
+}
+
+// sendWithRetry sends a message atomically and retries Enter if the agent
+// doesn't start processing within a reasonable time.
+func sendWithRetry(tmuxSess *tmux.Session, message string, skipVerify bool) error {
+	return sendWithRetryTarget(tmuxSess, message, skipVerify, sendRetryOptions{
+		maxRetries: 50,
+		checkDelay: 300 * time.Millisecond,
+	})
+}
+
+type sendRetryTarget interface {
+	SendKeysAndEnter(string) error
+	GetStatus() (string, error)
+	SendEnter() error
+	SendCtrlC() error
+	CapturePaneFresh() (string, error)
+}
+
+type sendRetryOptions struct {
+	maxRetries int
+	checkDelay time.Duration
+}
+
+func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool, opts sendRetryOptions) error {
+	if opts.maxRetries <= 0 {
+		opts.maxRetries = 1
+	}
+	if opts.checkDelay < 0 {
+		opts.checkDelay = 0
+	}
+
+	if err := target.SendKeysAndEnter(message); err != nil {
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+
+	if skipVerify {
+		return nil
+	}
+
+	// Verify the agent accepted Enter and began processing.
+	// Strategy:
+	// - If unsent prompt is visible, press Enter again immediately.
+	// - Consider success only after sustained post-send activity ("active").
+	// - If we never observe active and remain in waiting/idle, keep a periodic
+	//   fallback Enter cadence instead of returning early (handles late unsent
+	//   prompt rendering races seen in Claude startup).
+	// - If the message appears completely lost (no prompt marker, no activity
+	//   after several retries), clear stale input with Ctrl+C and re-send the
+	//   full message. This handles the TUI init race where the prompt renders
+	//   before the input handler is ready, causing sent keys to be discarded.
+	const activeSuccessThreshold = 2
+	const waitingAfterActiveThreshold = 2
+	// fullResendThreshold: after this many consecutive waiting/idle checks
+	// with no activity and no unsent prompt, assume the message was lost
+	// during TUI init and re-send the full message.
+	const fullResendThreshold = 8
+	const maxFullResends = 3
+	waitingNoMarkerChecks := 0
+	waitingNoActivityChecks := 0
+	activeChecks := 0
+	sawActiveAfterSend := false
+	fullResendCount := 0
+	for retry := 0; retry < opts.maxRetries; retry++ {
+		time.Sleep(opts.checkDelay)
+
+		unsentPromptDetected := false
+		if rawContent, captureErr := target.CapturePaneFresh(); captureErr == nil {
+			content := tmux.StripANSI(rawContent)
+			unsentPromptDetected = send.HasUnsentPastedPrompt(content) || send.HasUnsentComposerPrompt(content, message)
+		}
+		status, err := target.GetStatus()
+
+		if unsentPromptDetected {
+			waitingNoMarkerChecks = 0
+			waitingNoActivityChecks = 0
+			activeChecks = 0
+			_ = target.SendEnter()
+			continue
+		}
+
+		if err == nil && status == "active" {
+			sawActiveAfterSend = true
+			waitingNoMarkerChecks = 0
+			waitingNoActivityChecks = 0
+			activeChecks++
+			if activeChecks >= activeSuccessThreshold {
+				return nil
+			}
+			continue
+		}
+		activeChecks = 0
+
+		if err == nil && (status == "waiting" || status == "idle") {
+			if sawActiveAfterSend {
+				waitingNoMarkerChecks++
+				waitingNoActivityChecks = 0
+				if waitingNoMarkerChecks >= waitingAfterActiveThreshold {
+					return nil
+				}
+			} else {
+				waitingNoMarkerChecks = 0
+				waitingNoActivityChecks++
+
+				// Message may have been lost during TUI init: the prompt was
+				// visible but the input handler wasn't ready, so sent keys were
+				// discarded. Clear stale input and re-send the full message.
+				if waitingNoActivityChecks >= fullResendThreshold && fullResendCount < maxFullResends {
+					fullResendCount++
+					waitingNoActivityChecks = 0
+					_ = target.SendCtrlC()
+					time.Sleep(200 * time.Millisecond)
+					_ = target.SendKeysAndEnter(message)
+					continue
+				}
+
+				// We haven't observed any post-send activity yet. Nudge Enter
+				// aggressively in the early window (every iteration for first 5
+				// retries) then every 2nd iteration. This addresses bracketed
+				// paste timing failures that are most likely early on.
+				if retry < 5 || retry%2 == 0 {
+					_ = target.SendEnter()
+				}
+			}
+			continue
+		}
+		waitingNoMarkerChecks = 0
+		waitingNoActivityChecks = 0
+
+		// Ambiguous state: keep a best-effort Enter retry budget.
+		// Increased from 2 to 4 because some TUI frameworks take longer
+		// to process and reflect state.
+		if retry < 4 {
+			_ = target.SendEnter()
+		}
+	}
+
+	// Best effort: don't fail even if verification is inconclusive.
+	return nil
 }
 
 // waitForAgentReady waits for Claude/Gemini/other agents to be ready for input
 // Uses status detection: waits for "active" → "waiting" transition
 func waitForAgentReady(tmuxSess *tmux.Session, tool string) error {
 	sawActive := false
-	waitingCount := 0
-	maxAttempts := 300 // 60 seconds max (300 * 200ms)
+	readyCount := 0
+	maxAttempts := 400 // 80 seconds max (400 * 200ms)
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		time.Sleep(200 * time.Millisecond)
 
 		status, err := tmuxSess.GetStatus()
 		if err != nil {
-			waitingCount = 0
+			readyCount = 0
 			continue
 		}
 
 		if status == "active" {
 			sawActive = true
-			waitingCount = 0
+			readyCount = 0
 			continue
 		}
 
-		if status == "waiting" {
-			waitingCount++
+		if status == "waiting" || status == "idle" {
+			readyCount++
 		} else {
-			waitingCount = 0
+			readyCount = 0
 		}
 
 		// Agent is ready when:
 		// 1. We've seen "active" (loading) and now see "waiting" (ready)
-		// 2. We've seen "waiting" 10+ times (already ready)
-		alreadyReady := waitingCount >= 10 && attempt >= 15 // At least 3s elapsed
-		if (sawActive && status == "waiting") || alreadyReady {
+		// 2. We've seen stable waiting/idle 10+ times (already ready)
+		alreadyReady := readyCount >= 10 && attempt >= 15 // At least 3s elapsed
+		if (sawActive && (status == "waiting" || status == "idle")) || alreadyReady {
+			if tool == "claude" {
+				if rawContent, captureErr := tmuxSess.CapturePaneFresh(); captureErr == nil && !send.HasCurrentComposerPrompt(tmux.StripANSI(rawContent)) {
+					// Claude can report waiting before the interactive prompt is visible.
+					// Keep polling until the prompt line is present.
+					continue
+				}
+			}
+			// Gate Codex sends on prompt readiness: wait for "codex>" or
+			// "Continue?" to be visible before considering the agent ready.
+			if tool == "codex" {
+				if rawContent, captureErr := tmuxSess.CapturePaneFresh(); captureErr == nil {
+					content := tmux.StripANSI(rawContent)
+					detector := tmux.NewPromptDetector("codex")
+					if !detector.HasPrompt(content) {
+						// Codex hasn't shown its prompt yet; keep polling.
+						continue
+					}
+				}
+			}
 			time.Sleep(300 * time.Millisecond) // Small delay for UI to render
 			return nil
 		}
 	}
 
-	return fmt.Errorf("agent not ready after 60 seconds")
+	return fmt.Errorf("agent not ready after 80 seconds")
+}
+
+// statusChecker abstracts tmux status polling so waitForCompletion is testable.
+type statusChecker interface {
+	GetStatus() (string, error)
+}
+
+// waitForCompletion polls until the agent finishes processing (status leaves "active").
+// Returns the final status string ("waiting", "idle", "inactive") or an error on timeout.
+func waitForCompletion(checker statusChecker, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	const pollInterval = 2 * time.Second
+
+	// Initial grace period: wait for the agent to start processing.
+	// sendWithRetry already checks for "active", but give a small buffer.
+	time.Sleep(1 * time.Second)
+
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 5
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("agent still running after %s", timeout)
+		default:
+		}
+
+		status, err := checker.GetStatus()
+		if err != nil {
+			consecutiveErrors++
+			if consecutiveErrors >= maxConsecutiveErrors {
+				return "error", nil // Session likely died
+			}
+			time.Sleep(pollInterval)
+			continue
+		}
+		consecutiveErrors = 0
+
+		// "active" means still processing, keep waiting
+		if status == "active" {
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		// Any non-active status means the agent is done
+		return status, nil
+	}
 }
 
 // handleSessionOutput gets the last response from a session
@@ -1266,6 +1713,7 @@ func handleSessionOutput(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
+	copyFlag := fs.Bool("copy", false, "Copy output to system clipboard")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session output [id|title] [options]")
@@ -1276,7 +1724,7 @@ func handleSessionOutput(profile string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -1299,13 +1747,37 @@ func handleSessionOutput(profile string, args []string) {
 			os.Exit(2)
 		}
 		os.Exit(1)
+		return // unreachable, satisfies staticcheck SA5011
 	}
 
-	// Get the last response
-	response, err := inst.GetLastResponse()
+	// Get the last response (best-effort fallback for smoother CLI reads)
+	response, err := inst.GetLastResponseBestEffort()
 	if err != nil {
 		out.Error(fmt.Sprintf("failed to get response: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+
+	// Copy to clipboard mode
+	if *copyFlag {
+		termInfo := tmux.GetTerminalInfo()
+		result, err := clipboard.Copy(response.Content, termInfo.SupportsOSC52)
+		if err != nil {
+			out.Error(fmt.Sprintf("clipboard: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		jsonData := map[string]interface{}{
+			"success":       true,
+			"session_id":    inst.ID,
+			"session_title": inst.Title,
+			"lines_copied":  result.LineCount,
+			"bytes_copied":  result.ByteSize,
+			"method":        result.Method,
+		}
+		out.Print(
+			fmt.Sprintf("Copied %d lines to clipboard via %s (%s)", result.LineCount, result.Method, inst.Title),
+			jsonData,
+		)
+		return
 	}
 
 	// Quiet mode: just print raw content
@@ -1349,6 +1821,7 @@ func handleSessionOutput(profile string, args []string) {
 }
 
 // handleSessionCurrent shows current session and profile (auto-detected)
+// Uses a fast path that reads session data without tmux initialization (LoadLite).
 func handleSessionCurrent(profileArg string, args []string) {
 	fs := flag.NewFlagSet("session current", flag.ExitOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
@@ -1364,7 +1837,7 @@ func handleSessionCurrent(profileArg string, args []string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -1377,68 +1850,130 @@ func handleSessionCurrent(profileArg string, args []string) {
 		os.Exit(1)
 	}
 
+	// ═══════════════════════════════════════════════════════════════════
+	// FAST PATH: Get current tmux session name (1 subprocess call)
+	// Then match against session data without full tmux initialization
+	// ═══════════════════════════════════════════════════════════════════
+	tmuxSessionName, err := getCurrentTmuxSessionName()
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to get current tmux session: %v", err), ErrCodeNotFound)
+		os.Exit(1)
+	}
+
 	// Detect profile: use explicit arg if provided, otherwise auto-detect
 	detectedProfile := profileArg
 	if detectedProfile == "" || detectedProfile == session.DefaultProfile {
 		detectedProfile = profile.DetectCurrentProfile()
 	}
 
-	// Load sessions for detected profile first
-	_, instances, _, err := loadSessionData(detectedProfile)
-	if err != nil {
-		out.Error(err.Error(), ErrCodeNotFound)
+	// Try fast path: LoadLite + match by tmux session name
+	instData, foundProfile := findInstanceDataByTmuxFast(tmuxSessionName, detectedProfile)
+
+	if instData == nil {
+		out.Error(
+			"current tmux session is not an agent-deck session\nHint: Run 'agent-deck list' to see available sessions",
+			ErrCodeNotFound,
+		)
 		os.Exit(1)
 	}
 
-	// Try to find session in detected profile
-	inst := findSessionByTmux(instances)
-
-	// If not found in detected profile, search all profiles
-	if inst == nil {
-		var foundProfile string
-		inst, foundProfile = findSessionByTmuxAcrossProfiles()
-		if inst != nil && foundProfile != "" {
-			detectedProfile = foundProfile
-		}
+	if foundProfile != "" {
+		detectedProfile = foundProfile
 	}
-
-	if inst == nil {
-		out.Error("current tmux session is not an agent-deck session\nHint: Run 'agent-deck list' to see available sessions", ErrCodeNotFound)
-		os.Exit(1)
-	}
-
-	// Update status
-	_ = inst.UpdateStatus()
 
 	// Quiet mode: just print session name
 	if quietMode {
-		fmt.Println(inst.Title)
+		fmt.Println(instData.Title)
 		return
 	}
 
+	// Determine status from saved data (no live tmux check in fast path)
+	status := StatusString(instData.Status)
+
 	// Prepare JSON output
 	jsonData := map[string]interface{}{
-		"session": inst.Title,
+		"session": instData.Title,
 		"profile": detectedProfile,
-		"id":      inst.ID,
-		"path":    inst.ProjectPath,
-		"status":  StatusString(inst.Status),
+		"id":      instData.ID,
+		"path":    instData.ProjectPath,
+		"status":  status,
 	}
 
-	if inst.GroupPath != "" {
-		jsonData["group"] = inst.GroupPath
+	if instData.GroupPath != "" {
+		jsonData["group"] = instData.GroupPath
 	}
 
 	// Build human-readable output
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Session: %s\n", inst.Title))
+	sb.WriteString(fmt.Sprintf("Session: %s\n", instData.Title))
 	sb.WriteString(fmt.Sprintf("Profile: %s\n", detectedProfile))
-	sb.WriteString(fmt.Sprintf("ID:      %s\n", inst.ID))
-	sb.WriteString(fmt.Sprintf("Status:  %s %s\n", StatusSymbol(inst.Status), StatusString(inst.Status)))
-	sb.WriteString(fmt.Sprintf("Path:    %s\n", FormatPath(inst.ProjectPath)))
-	if inst.GroupPath != "" {
-		sb.WriteString(fmt.Sprintf("Group:   %s\n", inst.GroupPath))
+	sb.WriteString(fmt.Sprintf("ID:      %s\n", instData.ID))
+	sb.WriteString(fmt.Sprintf("Status:  %s %s\n", StatusSymbol(instData.Status), status))
+	sb.WriteString(fmt.Sprintf("Path:    %s\n", FormatPath(instData.ProjectPath)))
+	if instData.GroupPath != "" {
+		sb.WriteString(fmt.Sprintf("Group:   %s\n", instData.GroupPath))
 	}
 
 	out.Print(sb.String(), jsonData)
+}
+
+// getCurrentTmuxSessionName gets the current tmux session name (single subprocess call)
+func getCurrentTmuxSessionName() (string, error) {
+	cmd := exec.Command("tmux", "display-message", "-p", "#{session_name}")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// findInstanceDataByTmuxFast finds a session by tmux name using LoadLite (no tmux initialization)
+// First tries the specified profile, then searches all profiles if not found.
+// Returns the InstanceData and the profile it was found in.
+func findInstanceDataByTmuxFast(tmuxSessionName, preferredProfile string) (*session.InstanceData, string) {
+	// Try preferred profile first
+	storage, err := session.NewStorageWithProfile(preferredProfile)
+	if err == nil {
+		instances, _, err := storage.LoadLite()
+		if err == nil {
+			if inst := matchInstanceDataByTmuxName(instances, tmuxSessionName); inst != nil {
+				return inst, preferredProfile
+			}
+		}
+	}
+
+	// Search all profiles
+	profiles, err := session.ListProfiles()
+	if err != nil {
+		return nil, ""
+	}
+
+	for _, p := range profiles {
+		if p == preferredProfile {
+			continue // Already checked
+		}
+		storage, err := session.NewStorageWithProfile(p)
+		if err != nil {
+			continue
+		}
+		instances, _, err := storage.LoadLite()
+		if err != nil {
+			continue
+		}
+		if inst := matchInstanceDataByTmuxName(instances, tmuxSessionName); inst != nil {
+			return inst, p
+		}
+	}
+
+	return nil, ""
+}
+
+// matchInstanceDataByTmuxName finds an InstanceData by exact tmux session name match
+func matchInstanceDataByTmuxName(instances []*session.InstanceData, tmuxSessionName string) *session.InstanceData {
+	for _, inst := range instances {
+		if inst.TmuxSession == tmuxSessionName {
+			return inst
+		}
+	}
+	return nil
 }

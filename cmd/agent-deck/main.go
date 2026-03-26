@@ -1,29 +1,37 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/asheshgoplani/agent-deck/internal/session"
-	"github.com/asheshgoplani/agent-deck/internal/ui"
-	"github.com/asheshgoplani/agent-deck/internal/update"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
+	"golang.org/x/term"
+
+	"github.com/asheshgoplani/agent-deck/internal/costs"
+	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/ui"
+	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-const Version = "0.8.14"
+const Version = "0.26.4"
 
 // Table column widths for list command output
 const (
@@ -177,6 +185,14 @@ func initColorProfile() {
 func main() {
 	// Extract global -p/--profile flag before subcommand dispatch
 	profile, args := extractProfileFlag(os.Args[1:])
+	if profile != "" {
+		// Propagate explicit profile selection so config lookups (e.g., per-profile Claude config)
+		// resolve consistently across all command paths in this process.
+		_ = os.Setenv("AGENTDECK_PROFILE", profile)
+	}
+
+	var webEnabled bool
+	var webArgs []string
 
 	// Handle subcommands
 	if len(args) > 0 {
@@ -196,6 +212,9 @@ func main() {
 		case "remove", "rm":
 			handleRemove(profile, args[1:])
 			return
+		case "rename", "mv":
+			handleRename(profile, args[1:])
+			return
 		case "status":
 			handleStatus(profile, args[1:])
 			return
@@ -211,17 +230,93 @@ func main() {
 		case "mcp":
 			handleMCP(profile, args[1:])
 			return
+		case "skill":
+			handleSkill(profile, args[1:])
+			return
+		case "mcp-proxy":
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Usage: agent-deck mcp-proxy <socket-path>")
+				os.Exit(1)
+			}
+			runMCPProxy(args[1])
+			return
 		case "group":
 			handleGroup(profile, args[1:])
 			return
+		case "try":
+			handleTry(profile, args[1:])
+			return
+		case "launch":
+			handleLaunch(profile, args[1:])
+			return
+		case "conductor":
+			handleConductor(profile, args[1:])
+			return
+		case "openclaw", "oc":
+			handleOpenClaw(profile, args[1:])
+			return
+		case "remote":
+			handleRemote(profile, args[1:])
+			return
+		case "worktree", "wt":
+			handleWorktree(profile, args[1:])
+			return
+		case "costs":
+			handleCosts(profile, args[1:])
+			return
+		case "web":
+			webEnabled = true
+			webArgs = append(webArgs, args[1:]...)
+			// fall through to TUI launch below
 		case "uninstall":
 			handleUninstall(args[1:])
+			return
+		case "hook-handler":
+			handleHookHandler()
+			return
+		case "codex-notify":
+			handleCodexNotify()
+			return
+		case "hooks":
+			handleHooks(args[1:])
+			return
+		case "codex-hooks":
+			handleCodexHooks(args[1:])
+			return
+		case "gemini-hooks":
+			handleGeminiHooks(args[1:])
+			return
+		case "notify-daemon":
+			handleNotifyDaemon(args[1:])
+			return
+		case "debug-dump":
+			handleDebugDump()
 			return
 		}
 	}
 
+	// Block TUI launch inside a managed session to prevent infinite nesting.
+	// CLI commands (add, session start/stop, mcp attach, etc.) still work fine.
+	if isNestedSession() {
+		fmt.Fprintln(os.Stderr, "Error: Cannot launch the agent-deck TUI inside an agent-deck session.")
+		fmt.Fprintln(os.Stderr, "This would create a recursive nested session.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "CLI commands work inside sessions. For example:")
+		fmt.Fprintln(os.Stderr, "  agent-deck add /path -t \"Title\"    # Add a new session")
+		fmt.Fprintln(os.Stderr, "  agent-deck session start <id>      # Start a session")
+		fmt.Fprintln(os.Stderr, "  agent-deck mcp attach <id> <mcp>   # Attach MCP")
+		fmt.Fprintln(os.Stderr, "  agent-deck list                    # List sessions")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "To open the TUI, detach first with Ctrl+Q.")
+		os.Exit(1)
+	}
+
 	// Set version for UI update checking
 	ui.SetVersion(Version)
+
+	// Initialize theme from config (resolves "system" to actual dark/light)
+	theme := session.ResolveTheme()
+	ui.InitTheme(theme)
 
 	// Check for updates and prompt user before launching TUI
 	if promptForUpdate() {
@@ -237,46 +332,258 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Acquire lock to prevent duplicate instances
-	if err := acquireLock(profile); err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
+	// Create storage early to register instance via SQLite
+	earlyStorage, err := session.NewStorageWithProfile(profile)
+	if err == nil {
+		if db := earlyStorage.GetDB(); db != nil {
+			statedb.SetGlobal(db)
+			_ = db.RegisterInstance(false)
+		}
 	}
-	defer releaseLock(profile)
 
-	// Set up signal handling for graceful lock cleanup
+	// Check if multiple instances are allowed (uses primary election as single-instance gate)
+	instanceSettings := session.GetInstanceSettings()
+	if !instanceSettings.GetAllowMultiple() {
+		if db := statedb.GetGlobal(); db != nil {
+			isFirst, electErr := db.ElectPrimary(30 * time.Second)
+			if electErr == nil && !isFirst {
+				fmt.Println("Error: agent-deck is already running for this profile")
+				fmt.Println("Set [instances] allow_multiple = true in config.toml to allow multiple instances")
+				os.Exit(1)
+			}
+		}
+	}
+
+	// Set up signal handling for graceful shutdown and crash dumps
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		releaseLock(profile)
+		if db := statedb.GetGlobal(); db != nil {
+			_ = db.ResignPrimary()
+			_ = db.UnregisterInstance()
+		}
 		os.Exit(0)
 	}()
 
-	// Set up debug logging if AGENTDECK_DEBUG is set
-	// Logs go to ~/.agent-deck/debug.log to avoid interfering with TUI
-	if os.Getenv("AGENTDECK_DEBUG") != "" {
-		if baseDir, err := session.GetAgentDeckDir(); err == nil {
-			logPath := filepath.Join(baseDir, "debug.log")
-			logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-			if err == nil {
-				log.SetOutput(logFile)
-				log.SetFlags(log.Ltime | log.Lmicroseconds)
-				log.Printf("=== Agent Deck Debug Log Started ===")
-				defer logFile.Close()
+	// Set up structured logging (JSONL format with rotation)
+	// When AGENTDECK_DEBUG is set, logs go to ~/.agent-deck/debug.log
+	// When not set, logs are discarded to avoid TUI interference
+	debugMode := os.Getenv("AGENTDECK_DEBUG") != ""
+	if baseDir, err := session.GetAgentDeckDir(); err == nil {
+		logCfg := logging.Config{
+			Debug:                 debugMode,
+			LogDir:                baseDir,
+			Level:                 "debug",
+			Format:                "json",
+			MaxSizeMB:             10,
+			MaxBackups:            5,
+			MaxAgeDays:            10,
+			Compress:              true,
+			RingBufferSize:        10 * 1024 * 1024,
+			AggregateIntervalSecs: 30,
+		}
+
+		// Override defaults from user config if available
+		if userCfg, err := session.LoadUserConfig(); err == nil {
+			ls := userCfg.Logs
+			if ls.DebugLevel != "" {
+				logCfg.Level = ls.DebugLevel
+			}
+			if ls.DebugFormat != "" {
+				logCfg.Format = ls.DebugFormat
+			}
+			if ls.DebugMaxMB > 0 {
+				logCfg.MaxSizeMB = ls.DebugMaxMB
+			}
+			if ls.DebugBackups > 0 {
+				logCfg.MaxBackups = ls.DebugBackups
+			}
+			if ls.DebugRetentionDays > 0 {
+				logCfg.MaxAgeDays = ls.DebugRetentionDays
+			}
+			if ls.DebugCompress {
+				logCfg.Compress = ls.DebugCompress
+			}
+			if ls.RingBufferMB > 0 {
+				logCfg.RingBufferSize = ls.RingBufferMB * 1024 * 1024
+			}
+			if ls.PprofEnabled {
+				logCfg.PprofEnabled = ls.PprofEnabled
+			}
+			if ls.AggregateIntervalS > 0 {
+				logCfg.AggregateIntervalSecs = ls.AggregateIntervalS
 			}
 		}
-	} else {
-		// Disable logging when not in debug mode to avoid TUI interference
-		log.SetOutput(io.Discard)
+
+		logging.Init(logCfg)
+		defer logging.Shutdown()
+
+		if debugMode {
+			logging.ForComponent(logging.CompUI).Info("instance_started",
+				slog.Int("pid", os.Getpid()))
+		}
+
+		// SIGUSR1 dumps the ring buffer for post-mortem debugging
+		usr1Chan := make(chan os.Signal, 1)
+		signal.Notify(usr1Chan, syscall.SIGUSR1)
+		go func() {
+			for range usr1Chan {
+				dumpPath := filepath.Join(baseDir, fmt.Sprintf("crash-dump-%d.jsonl", time.Now().Unix()))
+				if err := logging.DumpRingBuffer(dumpPath); err != nil {
+					logging.ForComponent(logging.CompUI).Error("crash_dump_failed",
+						slog.String("error", err.Error()))
+				} else {
+					logging.ForComponent(logging.CompUI).Info("crash_dump_written",
+						slog.String("path", dumpPath))
+				}
+			}
+		}()
 	}
 
 	// Start TUI with the specified profile
+	homeModel := ui.NewHomeWithProfileAndMode(profile)
+
+	// ═══════════════════════════════════════════════════════════════════
+	// Cost Tracking Initialization
+	// ═══════════════════════════════════════════════════════════════════
+	var costStore *costs.Store
+	if db := statedb.GetGlobal(); db != nil {
+		costStore = costs.NewStore(db.DB())
+
+		// Load user config for pricing overrides and budgets
+		userCfg, _ := session.LoadUserConfig()
+
+		// Set up pricer with overrides
+		homeDir, _ := os.UserHomeDir()
+		cacheDir := filepath.Join(homeDir, ".agent-deck")
+		pricerCfg := costs.PricerConfig{CachePath: cacheDir}
+		if userCfg != nil && len(userCfg.Costs.Pricing.Overrides) > 0 {
+			pricerCfg.Overrides = make(map[string]costs.PriceOverride)
+			for model, ov := range userCfg.Costs.Pricing.Overrides {
+				pricerCfg.Overrides[model] = costs.PriceOverride{
+					InputPerMtok:      ov.InputPerMtok,
+					OutputPerMtok:     ov.OutputPerMtok,
+					CacheReadPerMtok:  ov.CacheReadPerMtok,
+					CacheWritePerMtok: ov.CacheWritePerMtok,
+				}
+			}
+		}
+		pricer := costs.NewPricer(pricerCfg)
+		_ = pricer.LoadCache()
+
+		// Start daily price fetcher
+		fetchCtx, fetchCancel := context.WithCancel(context.Background())
+		defer fetchCancel()
+		fetcher := &costs.Fetcher{CachePath: filepath.Join(cacheDir, "pricing.json"), Pricer: pricer}
+		go fetcher.StartDaily(fetchCtx)
+
+		// Set up budget checker
+		var budgetCfg costs.BudgetConfig
+		if userCfg != nil {
+			bc := userCfg.Costs.Budgets
+			budgetCfg.DailyLimit = int64(math.Round(bc.DailyLimit * 1_000_000))
+			budgetCfg.WeeklyLimit = int64(math.Round(bc.WeeklyLimit * 1_000_000))
+			budgetCfg.MonthlyLimit = int64(math.Round(bc.MonthlyLimit * 1_000_000))
+			if len(bc.Groups) > 0 {
+				budgetCfg.GroupLimits = make(map[string]int64)
+				for name, g := range bc.Groups {
+					budgetCfg.GroupLimits[name] = int64(math.Round(g.DailyLimit * 1_000_000))
+				}
+			}
+		}
+		budgetChecker := costs.NewBudgetChecker(budgetCfg, costStore)
+
+		// Wire into TUI
+		homeModel.SetCostStore(costStore)
+		homeModel.SetCostPricer(pricer)
+		homeModel.SetCostBudget(budgetChecker)
+
+		// Start cost event watcher (for Claude hook events)
+		costEventsDir := filepath.Join(homeDir, ".agent-deck", "cost-events")
+		costWatcher, watchErr := costs.NewCostEventWatcher(costEventsDir)
+		if watchErr == nil {
+			go costWatcher.Start()
+			defer costWatcher.Stop()
+
+			// Process incoming cost events from hooks
+			go func() {
+				for raw := range costWatcher.EventCh() {
+					ev := costs.CostEvent{
+						ID:               fmt.Sprintf("%s_%d", raw.InstanceID, raw.Timestamp),
+						SessionID:        raw.InstanceID,
+						Timestamp:        time.Unix(0, raw.Timestamp),
+						Model:            raw.Model,
+						InputTokens:      raw.InputTokens,
+						OutputTokens:     raw.OutputTokens,
+						CacheReadTokens:  raw.CacheReadTokens,
+						CacheWriteTokens: raw.CacheWriteTokens,
+						CostMicrodollars: pricer.ComputeCost(raw.Model, raw.InputTokens, raw.OutputTokens, raw.CacheReadTokens, raw.CacheWriteTokens),
+					}
+					_ = costStore.WriteCostEvent(ev)
+				}
+			}()
+		}
+
+		// Run retention cleanup on startup
+		if userCfg != nil {
+			retDays := userCfg.Costs.GetRetentionDays()
+			if retDays > 0 {
+				_, _ = costStore.PurgeOlderThan(retDays)
+			}
+		}
+	}
+
+	// Start web server alongside TUI if "web" subcommand was used
+	if webEnabled {
+		effectiveProfile := session.GetEffectiveProfile(profile)
+		fallbackMenuData := web.NewSessionDataService(effectiveProfile)
+		liveMenuData := web.NewMemoryMenuData(fallbackMenuData)
+		homeModel.SetWebMenuData(liveMenuData)
+
+		server, err := buildWebServer(effectiveProfile, webArgs, liveMenuData)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: web server setup failed: %v\n", err)
+			os.Exit(1)
+		}
+		if costStore != nil {
+			server.SetCostStore(costStore)
+		}
+		go func() {
+			if err := server.Start(); err != nil {
+				logging.ForComponent(logging.CompWeb).Error("web_server_error",
+					slog.String("error", err.Error()))
+			}
+		}()
+		fmt.Printf("Web server: http://%s\n", server.Addr())
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = server.Shutdown(ctx)
+		}()
+	}
+
+	// Disable the Kitty keyboard protocol before starting the TUI.
+	// Wayland terminals (Ghostty, Foot, Alacritty) send keys using CSI u
+	// encoding by default; Bubble Tea v1.3.10 does not parse those sequences,
+	// so uppercase shortcuts and uppercase text input are silently dropped.
+	// Pushing keyboard mode 0 (legacy) restores standard key reporting.
+	// Terminals that don't support the protocol ignore this sequence safely.
+	ui.DisableKittyKeyboard(os.Stdout)
+	defer ui.RestoreKittyKeyboard(os.Stdout)
+
 	p := tea.NewProgram(
-		ui.NewHomeWithProfile(profile),
+		homeModel,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
+
+	// Start maintenance worker (background goroutine, respects config toggle)
+	maintenanceCtx, maintenanceCancel := context.WithCancel(context.Background())
+	defer maintenanceCancel()
+	session.StartMaintenanceWorker(maintenanceCtx, func(result session.MaintenanceResult) {
+		p.Send(ui.MaintenanceCompleteMsg{Result: result})
+	})
 
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -328,12 +635,21 @@ func reorderArgsForFlagParsing(args []string) []string {
 	}
 
 	// Known flags that take a value (need to skip their values)
+	// Note: -b/--new-branch are boolean flags (no value), so not included here
 	valueFlags := map[string]bool{
 		"-t": true, "--title": true,
 		"-g": true, "--group": true,
 		"-c": true, "--cmd": true,
+		"-m": true, "--message": true,
 		"-p": true, "--parent": true,
-		"--mcp": true,
+		"--mcp":     true,
+		"--wrapper": true,
+		"-w":        true, "--worktree": true,
+		"--location":       true,
+		"--resume-session": true,
+		"--sandbox-image":  true,
+		"--ssh":            true,
+		"--remote-path":    true,
 	}
 
 	var flags []string
@@ -415,6 +731,64 @@ func generateUniqueTitle(instances []*session.Instance, baseTitle, path string) 
 	return fmt.Sprintf("%s (%d)", baseTitle, time.Now().Unix())
 }
 
+// isWorktreeAlreadyExistsError detects whether git worktree creation failed because
+// the destination path already exists. This preserves friendly UX while avoiding
+// TOCTOU race windows from separate filesystem pre-checks.
+func isWorktreeAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
+}
+
+func resolveAutoParentInstance(instances []*session.Instance) *session.Instance {
+	candidates := []string{
+		strings.TrimSpace(os.Getenv("AGENT_DECK_SESSION_ID")),
+		strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")),
+	}
+
+	if tmuxCurrent := strings.TrimSpace(GetCurrentSessionID()); tmuxCurrent != "" {
+		candidates = append(candidates, tmuxCurrent)
+	}
+
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		if inst, _, _ := ResolveSession(candidate, instances); inst != nil {
+			return inst
+		}
+	}
+	return nil
+}
+
+// resolveGroupPathForAdd resolves a user-provided group selector to a stored group path.
+// It accepts exact paths, normalized paths, and case-insensitive group display names.
+func resolveGroupPathForAdd(groupTree *session.GroupTree, groupSelector string) string {
+	if groupTree == nil || groupSelector == "" {
+		return groupSelector
+	}
+
+	if _, exists := groupTree.Groups[groupSelector]; exists {
+		return groupSelector
+	}
+
+	normalized := strings.ToLower(strings.ReplaceAll(groupSelector, " ", "-"))
+	if _, exists := groupTree.Groups[normalized]; exists {
+		return normalized
+	}
+
+	for path, group := range groupTree.Groups {
+		if strings.EqualFold(group.Name, groupSelector) {
+			return path
+		}
+	}
+
+	return groupSelector
+}
+
 // handleAdd adds a new session from CLI
 func handleAdd(profile string, args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
@@ -422,10 +796,28 @@ func handleAdd(profile string, args []string) {
 	titleShort := fs.String("t", "", "Session title (short)")
 	group := fs.String("group", "", "Group path (defaults to parent folder)")
 	groupShort := fs.String("g", "", "Group path (short)")
-	command := fs.String("cmd", "", "Command to run (e.g., 'claude', 'opencode')")
-	commandShort := fs.String("c", "", "Command to run (short)")
+	command := fs.String("cmd", "", "Tool/command to run (e.g., 'claude' or 'codex --dangerously-bypass-approvals-and-sandbox')")
+	commandShort := fs.String("c", "", "Tool/command to run (short)")
+	wrapper := fs.String(
+		"wrapper",
+		"",
+		"Wrapper command (use {command} to include tool command, e.g., 'nvim +\"terminal {command}\"')",
+	)
 	parent := fs.String("parent", "", "Parent session (creates sub-session, inherits group)")
 	parentShort := fs.String("p", "", "Parent session (short)")
+	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking (use 'session set-parent' later to link manually)")
+	quickCreate := fs.Bool("quick", false, "Auto-generate session name (adjective-noun)")
+	quickCreateShort := fs.Bool("Q", false, "Auto-generate session name (short)")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	// Worktree flags
+	worktreeBranch := fs.String("w", "", "Create session in git worktree for branch")
+	worktreeBranchLong := fs.String("worktree", "", "Create session in git worktree for branch")
+	newBranch := fs.Bool("b", false, "Create new branch if needed (reuse existing branch when present)")
+	newBranchLong := fs.Bool("new-branch", false, "Create new branch if needed (reuse existing branch when present)")
+	worktreeLocation := fs.String("location", "", "Worktree location: sibling, subdirectory, or custom path")
 
 	// MCP flag - can be specified multiple times
 	var mcpFlags []string
@@ -433,6 +825,19 @@ func handleAdd(profile string, args []string) {
 		mcpFlags = append(mcpFlags, s)
 		return nil
 	})
+
+	// Sandbox flags
+	sandbox := fs.Bool("sandbox", false, "Run session in Docker sandbox")
+	sandboxImage := fs.String("sandbox-image", "", "Docker image for sandbox (overrides config default)")
+
+	// SSH remote flags
+	sshHost := fs.String("ssh", "", "SSH destination (e.g., user@host)")
+	sshRemotePath := fs.String("remote-path", "", "Remote working directory (used with --ssh)")
+
+	// Resume session flag
+	resumeSession := fs.String("resume-session", "", "Claude session ID to resume (skips new session creation)")
+	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode for Gemini or Codex sessions")
+	geminiYoloMode := fs.Bool("gemini-yolo", false, "Enable YOLO mode (alias for --yolo)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck add [path] [options]")
@@ -453,6 +858,21 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck -p work add               # Add to 'work' profile")
 		fmt.Println("  agent-deck add -t \"Sub-task\" --parent \"Main Project\"  # Create sub-session")
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
+		fmt.Println("  agent-deck add -c opencode --wrapper \"nvim +'terminal {command}' +'startinsert'\" .")
+		fmt.Println("  agent-deck add -c \"codex --dangerously-bypass-approvals-and-sandbox\" .")
+		fmt.Println("  agent-deck add -c gemini --yolo .")
+		fmt.Println("  agent-deck add -c claude -g work .   # -c is shorthand for --cmd")
+		fmt.Println("  agent-deck add -g ard --no-parent -c claude .")
+		fmt.Println("  agent-deck add --quick -c claude .   # Auto-generated name")
+		fmt.Println()
+		fmt.Println("Worktree Examples:")
+		fmt.Println("  agent-deck add -w feature/login .    # Create worktree for existing branch")
+		fmt.Println("  agent-deck add -w feature/new -b .   # Create worktree with new branch")
+		fmt.Println("  agent-deck add --worktree fix/bug-123 --new-branch /path/to/repo")
+		fmt.Println()
+		fmt.Println("SSH Examples:")
+		fmt.Println("  agent-deck add --ssh user@host --remote-path ~/project -c claude")
+		fmt.Println("  agent-deck add --ssh user@host -c claude -t \"remote-dev\"")
 	}
 
 	// Reorder args: move path to end so flags are parsed correctly
@@ -460,50 +880,42 @@ func handleAdd(profile string, args []string) {
 	// This allows: "add . -c claude" to work same as "add -c claude ."
 	args = reorderArgsForFlagParsing(args)
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
-	// Get path argument (defaults to current directory)
-	// Fix: sanitize input to remove surrounding quotes that cause issues
-	// Users sometimes pass paths like '"/path/with spaces"' which stores literal quotes
-	path := strings.Trim(fs.Arg(0), "'\"")
-	if path == "" || path == "." {
-		var err error
-		path, err = os.Getwd()
-		if err != nil {
-			fmt.Printf("Error: failed to get current directory: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		var err error
-		path, err = filepath.Abs(path)
-		if err != nil {
-			fmt.Printf("Error: failed to resolve path: %v\n", err)
-			os.Exit(1)
-		}
-	}
+	// Path argument is optional; if omitted with -g/--group, we'll try group default_path.
+	// Fix: sanitize input to remove surrounding quotes that cause issues.
+	rawPathArg := strings.Trim(fs.Arg(0), "'\"")
+	explicitPathProvided := rawPathArg != ""
+	path := ""
 
-	// Verify path exists and is a directory
-	info, err := os.Stat(path)
-	if err != nil {
-		fmt.Printf("Error: path does not exist: %s\n", path)
-		os.Exit(1)
+	// Resolve worktree flags
+	wtBranch := *worktreeBranch
+	if *worktreeBranchLong != "" {
+		wtBranch = *worktreeBranchLong
 	}
-	if !info.IsDir() {
-		fmt.Printf("Error: path is not a directory: %s\n", path)
-		os.Exit(1)
-	}
+	_ = *newBranch || *newBranchLong
 
 	// Merge short and long flags
 	sessionTitle := mergeFlags(*title, *titleShort)
 	sessionGroup := mergeFlags(*group, *groupShort)
-	sessionCommand := mergeFlags(*command, *commandShort)
+	explicitGroupProvided := strings.TrimSpace(sessionGroup) != ""
+	sessionCommandInput := mergeFlags(*command, *commandShort)
+	sessionCommandTool, sessionCommandResolved, sessionWrapperResolved, sessionCommandNote := resolveSessionCommand(sessionCommandInput, *wrapper)
 	sessionParent := mergeFlags(*parent, *parentShort)
+	if sessionParent != "" && *noParent {
+		fmt.Println("Error: --parent and --no-parent cannot be used together")
+		os.Exit(1)
+	}
 
-	// Default title to folder name
-	if sessionTitle == "" {
-		sessionTitle = filepath.Base(path)
+	// Validate --resume-session requires Claude
+	if *resumeSession != "" {
+		tool := firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
+		if tool != "claude" {
+			fmt.Println("Error: --resume-session only works with Claude sessions (-c claude)")
+			os.Exit(1)
+		}
 	}
 
 	// Load existing sessions with profile
@@ -519,6 +931,8 @@ func handleAdd(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+
 	// Resolve parent session if specified
 	var parentInstance *session.Instance
 	if sessionParent != "" {
@@ -527,20 +941,159 @@ func handleAdd(profile string, args []string) {
 		if parentInstance == nil {
 			fmt.Printf("Error: %s\n", errMsg)
 			os.Exit(1)
+			return // unreachable, satisfies staticcheck SA5011
 		}
 		// Sub-sessions cannot have sub-sessions (single level only)
 		if parentInstance.IsSubSession() {
 			fmt.Printf("Error: cannot create sub-session of a sub-session (single level only)\n")
 			os.Exit(1)
 		}
-		// Inherit group from parent
-		sessionGroup = parentInstance.GroupPath
+		sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+	} else if !*noParent {
+		parentInstance = resolveAutoParentInstance(instances)
+		if parentInstance != nil && !parentInstance.IsSubSession() {
+			sessionGroup = resolveGroupSelection(sessionGroup, parentInstance.GroupPath, explicitGroupProvided)
+		} else {
+			parentInstance = nil
+		}
+	}
+
+	// Resolve group selector to a canonical path when possible.
+	if sessionGroup != "" {
+		sessionGroup = resolveGroupPathForAdd(groupTree, sessionGroup)
+	}
+
+	if explicitPathProvided {
+		if rawPathArg == "." {
+			path, err = os.Getwd()
+			if err != nil {
+				fmt.Printf("Error: failed to get current directory: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			path, err = filepath.Abs(rawPathArg)
+			if err != nil {
+				fmt.Printf("Error: failed to resolve path: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	} else {
+		// No explicit path provided: use group default path first, then cwd fallback.
+		if sessionGroup != "" {
+			path = groupTree.DefaultPathForGroup(sessionGroup)
+		}
+		if path == "" {
+			path, err = os.Getwd()
+			if err != nil {
+				fmt.Printf("Error: failed to get current directory: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	// Verify path exists and is a directory (skip for SSH remote sessions)
+	if *sshHost != "" {
+		// For SSH sessions, use CWD as local placeholder path (project lives on remote)
+		if path == "" {
+			path, err = os.Getwd()
+			if err != nil {
+				fmt.Printf("Error: failed to get current directory: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	} else {
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Printf("Error: path does not exist: %s\n", path)
+			os.Exit(1)
+		}
+		if !info.IsDir() {
+			fmt.Printf("Error: path is not a directory: %s\n", path)
+			os.Exit(1)
+		}
+	}
+
+	// Handle worktree creation
+	var worktreePath, worktreeRepoRoot string
+	if wtBranch != "" {
+		// Validate path is a git repo
+		if !git.IsGitRepo(path) {
+			fmt.Fprintf(os.Stderr, "Error: %s is not a git repository\n", path)
+			os.Exit(1)
+		}
+
+		// Get repo root (resolve through worktrees to prevent nesting)
+		repoRoot, err := git.GetWorktreeBaseRoot(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to get repo root: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Pre-validate branch name for better error messages
+		if err := git.ValidateBranchName(wtBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid branch name: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Determine worktree location: CLI flag overrides config
+		wtSettings := session.GetWorktreeSettings()
+		location := wtSettings.DefaultLocation
+		if *worktreeLocation != "" {
+			location = *worktreeLocation
+		}
+
+		// Generate worktree path
+		worktreePath = git.WorktreePath(git.WorktreePathOptions{
+			Branch:    wtBranch,
+			Location:  location,
+			RepoDir:   repoRoot,
+			SessionID: git.GeneratePathID(),
+			Template:  wtSettings.Template(),
+		})
+
+		// Check for an existing worktree for this branch before creating a new one
+		if existingPath, err := git.GetWorktreeForBranch(repoRoot, wtBranch); err == nil && existingPath != "" {
+			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
+			worktreePath = existingPath
+		} else {
+			// Ensure parent directory exists (needed for subdirectory mode)
+			if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to create parent directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Create worktree atomically (git handles existence checks).
+			// This avoids a TOCTOU race from separate check-then-create steps.
+			if err := git.CreateWorktree(repoRoot, worktreePath, wtBranch); err != nil {
+				if isWorktreeAlreadyExistsError(err) {
+					fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)
+					fmt.Fprintf(os.Stderr, "Tip: Use 'agent-deck add %s' to add the existing worktree\n", worktreePath)
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "Error: failed to create worktree: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Created worktree at: %s\n", worktreePath)
+		}
+		worktreeRepoRoot = repoRoot
+		// Update path to point to worktree so session uses worktree as working directory
+		path = worktreePath
+	}
+
+	// Default title to folder name
+	if sessionTitle == "" {
+		sessionTitle = filepath.Base(path)
 	}
 
 	// Track if user provided explicit title or we auto-generated from folder name
 	userProvidedTitle := (mergeFlags(*title, *titleShort) != "")
+	isQuick := *quickCreate || *quickCreateShort
 
-	if !userProvidedTitle {
+	if isQuick && !userProvidedTitle {
+		// Quick mode: use auto-generated adjective-noun name
+		sessionTitle = session.GenerateUniqueSessionName(instances, sessionGroup)
+	} else if !userProvidedTitle {
 		// User didn't provide title - auto-generate unique title for this path
 		sessionTitle = generateUniqueTitle(instances, sessionTitle, path)
 	} else {
@@ -559,23 +1112,71 @@ func handleAdd(profile string, args []string) {
 		newInstance = session.NewInstance(sessionTitle, path)
 	}
 
-	// Set parent if specified
+	// Set parent if specified (includes parent's project path for --add-dir access)
 	if parentInstance != nil {
-		newInstance.SetParent(parentInstance.ID)
+		newInstance.SetParentWithPath(parentInstance.ID, parentInstance.ProjectPath)
 	}
 
 	// Set command if provided
-	if sessionCommand != "" {
-		newInstance.Command = sessionCommand
-		// Detect tool from command
-		newInstance.Tool = detectTool(sessionCommand)
+	if sessionCommandInput != "" {
+		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
+		newInstance.Command = sessionCommandResolved
+	}
+
+	// Set wrapper if provided
+	if sessionWrapperResolved != "" {
+		newInstance.Wrapper = sessionWrapperResolved
+	}
+
+	// Set worktree fields if created
+	if worktreePath != "" {
+		newInstance.WorktreePath = worktreePath
+		newInstance.WorktreeRepoRoot = worktreeRepoRoot
+		newInstance.WorktreeBranch = wtBranch
+	}
+
+	// Apply sandbox config if requested.
+	if *sandbox {
+		newInstance.Sandbox = session.NewSandboxConfig(*sandboxImage)
+	}
+
+	// Apply SSH remote config if requested.
+	if *sshHost != "" {
+		if *sandbox {
+			fmt.Println("Error: --ssh and --sandbox cannot be used together")
+			os.Exit(1)
+		}
+		newInstance.SSHHost = *sshHost
+		newInstance.SSHRemotePath = *sshRemotePath
+	}
+
+	// Handle --resume-session: set Claude session ID and resume mode
+	if *resumeSession != "" {
+		newInstance.ClaudeSessionID = *resumeSession
+		newInstance.ClaudeDetectedAt = time.Now()
+
+		opts := newInstance.GetClaudeOptions()
+		if opts == nil {
+			userConfig, _ := session.LoadUserConfig()
+			opts = session.NewClaudeOptions(userConfig)
+		}
+		opts.SessionMode = "resume"
+		opts.ResumeSessionID = *resumeSession
+		if err := newInstance.SetClaudeOptions(opts); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to set resume options: %v\n", err)
+		}
+	}
+
+	if err := applyCLIYoloOverride(newInstance, *yoloMode || *geminiYoloMode); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Add to instances
 	instances = append(instances, newInstance)
 
 	// Rebuild group tree and save
-	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	groupTree = session.NewGroupTreeWithGroups(instances, groups)
 	// Ensure the session's group exists
 	if newInstance.GroupPath != "" {
 		groupTree.CreateGroup(newInstance.GroupPath)
@@ -608,26 +1209,101 @@ func handleAdd(profile string, args []string) {
 		}
 	}
 
-	fmt.Printf("✓ Added session: %s\n", sessionTitle)
-	fmt.Printf("  Profile: %s\n", storage.Profile())
-	fmt.Printf("  Path:    %s\n", path)
-	fmt.Printf("  Group:   %s\n", newInstance.GroupPath)
-	fmt.Printf("  ID:      %s\n", newInstance.ID)
-	if sessionCommand != "" {
-		fmt.Printf("  Cmd:     %s\n", sessionCommand)
+	quietMode := *quiet || *quietShort
+	out := NewCLIOutput(*jsonOutput, quietMode)
+
+	// Build human-readable output
+	var humanLines []string
+	humanLines = append(humanLines, fmt.Sprintf("Added session: %s", sessionTitle))
+	humanLines = append(humanLines, fmt.Sprintf("  Profile: %s", storage.Profile()))
+	humanLines = append(humanLines, fmt.Sprintf("  Path:    %s", path))
+	humanLines = append(humanLines, fmt.Sprintf("  Group:   %s", newInstance.GroupPath))
+	humanLines = append(humanLines, fmt.Sprintf("  ID:      %s", newInstance.ID))
+	if sessionCommandInput != "" {
+		humanLines = append(humanLines, fmt.Sprintf("  Cmd:     %s", sessionCommandInput))
+		if newInstance.Wrapper != "" {
+			humanLines = append(humanLines, fmt.Sprintf("  Wrapper: %s", newInstance.Wrapper))
+		}
+		if sessionCommandNote != "" {
+			humanLines = append(humanLines, fmt.Sprintf("  Note:    %s", sessionCommandNote))
+		}
 	}
 	if len(mcpFlags) > 0 {
-		fmt.Printf("  MCPs:    %s\n", strings.Join(mcpFlags, ", "))
+		humanLines = append(humanLines, fmt.Sprintf("  MCPs:    %s", strings.Join(mcpFlags, ", ")))
 	}
 	if parentInstance != nil {
-		fmt.Printf("  Parent:  %s (%s)\n", parentInstance.Title, parentInstance.ID[:8])
+		humanLines = append(humanLines, fmt.Sprintf("  Parent:  %s (%s)", parentInstance.Title, parentInstance.ID[:8]))
+	}
+	if worktreePath != "" {
+		humanLines = append(humanLines, fmt.Sprintf("  Worktree: %s (branch: %s)", worktreePath, wtBranch))
+		humanLines = append(humanLines, fmt.Sprintf("  Repo:    %s", worktreeRepoRoot))
+	}
+	if *sshHost != "" {
+		humanLines = append(humanLines, fmt.Sprintf("  SSH:     %s", *sshHost))
+		if *sshRemotePath != "" {
+			humanLines = append(humanLines, fmt.Sprintf("  Remote:  %s", *sshRemotePath))
+		}
+	}
+	if *resumeSession != "" {
+		humanLines = append(humanLines, fmt.Sprintf("  Resume:  %s", *resumeSession))
+	}
+	humanLines = append(humanLines, "")
+	humanLines = append(humanLines, "Next steps:")
+	humanLines = append(humanLines, fmt.Sprintf("  agent-deck session start %s   # Start the session", sessionTitle))
+	humanLines = append(humanLines, "  agent-deck                         # Open TUI and press Enter to attach")
+
+	// Build JSON data
+	jsonData := map[string]interface{}{
+		"success": true,
+		"id":      newInstance.ID,
+		"title":   newInstance.Title,
+		"path":    path,
+		"tool":    newInstance.Tool,
+		"group":   newInstance.GroupPath,
+		"profile": storage.Profile(),
+	}
+	if sessionCommandInput != "" {
+		jsonData["command"] = sessionCommandInput
+		jsonData["resolved_command"] = newInstance.Command
+		if newInstance.Wrapper != "" {
+			jsonData["wrapper"] = newInstance.Wrapper
+		}
+		if sessionCommandNote != "" {
+			jsonData["command_note"] = sessionCommandNote
+		}
+	}
+	if len(mcpFlags) > 0 {
+		jsonData["mcps"] = mcpFlags
+	}
+	if parentInstance != nil {
+		jsonData["parent_id"] = parentInstance.ID
+		jsonData["parent_title"] = parentInstance.Title
+	}
+	if worktreePath != "" {
+		jsonData["worktree_path"] = worktreePath
+		jsonData["worktree_branch"] = wtBranch
+		jsonData["worktree_repo_root"] = worktreeRepoRoot
+	}
+	if *resumeSession != "" {
+		jsonData["resume_session"] = *resumeSession
+	}
+	if *sandbox {
+		jsonData["sandbox"] = true
+		humanLines = append(humanLines[:len(humanLines)-3],
+			"  Sandbox: enabled",
+		)
+		humanLines = append(humanLines, "", "Next steps:",
+			fmt.Sprintf("  agent-deck session start %s   # Start the session", sessionTitle),
+			"  agent-deck                         # Open TUI and press Enter to attach",
+		)
 	}
 
-	// Show helpful next steps
-	fmt.Println()
-	fmt.Println("Next steps:")
-	fmt.Printf("  agent-deck session start %s   # Start the session\n", sessionTitle)
-	fmt.Printf("  agent-deck                         # Open TUI and press Enter to attach\n")
+	out.Success(humanLines[0], jsonData)
+	if !*jsonOutput && !quietMode {
+		for _, line := range humanLines[1:] {
+			fmt.Println(line)
+		}
+	}
 }
 
 // handleList lists all sessions
@@ -650,7 +1326,7 @@ func handleList(profile string, args []string) {
 		fmt.Println("  agent-deck list --all              # List from all profiles")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -679,26 +1355,33 @@ func handleList(profile string, args []string) {
 	if *jsonOutput {
 		// JSON output for scripting
 		type sessionJSON struct {
-			ID        string    `json:"id"`
-			Title     string    `json:"title"`
-			Path      string    `json:"path"`
-			Group     string    `json:"group"`
-			Tool      string    `json:"tool"`
-			Command   string    `json:"command,omitempty"`
-			Profile   string    `json:"profile"`
-			CreatedAt time.Time `json:"created_at"`
+			ID            string    `json:"id"`
+			Title         string    `json:"title"`
+			Path          string    `json:"path"`
+			Group         string    `json:"group"`
+			Tool          string    `json:"tool"`
+			Command       string    `json:"command,omitempty"`
+			Status        string    `json:"status"`
+			Profile       string    `json:"profile"`
+			CreatedAt     time.Time `json:"created_at"`
+			SSHHost       string    `json:"ssh_host,omitempty"`
+			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
 		}
 		sessions := make([]sessionJSON, len(instances))
 		for i, inst := range instances {
+			_ = inst.UpdateStatus()
 			sessions[i] = sessionJSON{
-				ID:        inst.ID,
-				Title:     inst.Title,
-				Path:      inst.ProjectPath,
-				Group:     inst.GroupPath,
-				Tool:      inst.Tool,
-				Command:   inst.Command,
-				Profile:   storage.Profile(),
-				CreatedAt: inst.CreatedAt,
+				ID:            inst.ID,
+				Title:         inst.Title,
+				Path:          inst.ProjectPath,
+				Group:         inst.GroupPath,
+				Tool:          inst.Tool,
+				Command:       inst.Command,
+				Status:        StatusString(inst.Status),
+				Profile:       storage.Profile(),
+				CreatedAt:     inst.CreatedAt,
+				SSHHost:       inst.SSHHost,
+				SSHRemotePath: inst.SSHRemotePath,
 			}
 		}
 		output, err := json.MarshalIndent(sessions, "", "  ")
@@ -746,14 +1429,16 @@ func handleListAllProfiles(jsonOutput bool) {
 
 	if jsonOutput {
 		type sessionJSON struct {
-			ID        string    `json:"id"`
-			Title     string    `json:"title"`
-			Path      string    `json:"path"`
-			Group     string    `json:"group"`
-			Tool      string    `json:"tool"`
-			Command   string    `json:"command,omitempty"`
-			Profile   string    `json:"profile"`
-			CreatedAt time.Time `json:"created_at"`
+			ID            string    `json:"id"`
+			Title         string    `json:"title"`
+			Path          string    `json:"path"`
+			Group         string    `json:"group"`
+			Tool          string    `json:"tool"`
+			Command       string    `json:"command,omitempty"`
+			Profile       string    `json:"profile"`
+			CreatedAt     time.Time `json:"created_at"`
+			SSHHost       string    `json:"ssh_host,omitempty"`
+			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
 		}
 		var allSessions []sessionJSON
 
@@ -768,14 +1453,16 @@ func handleListAllProfiles(jsonOutput bool) {
 			}
 			for _, inst := range instances {
 				allSessions = append(allSessions, sessionJSON{
-					ID:        inst.ID,
-					Title:     inst.Title,
-					Path:      inst.ProjectPath,
-					Group:     inst.GroupPath,
-					Tool:      inst.Tool,
-					Command:   inst.Command,
-					Profile:   profileName,
-					CreatedAt: inst.CreatedAt,
+					ID:            inst.ID,
+					Title:         inst.Title,
+					Path:          inst.ProjectPath,
+					Group:         inst.GroupPath,
+					Tool:          inst.Tool,
+					Command:       inst.Command,
+					Profile:       profileName,
+					CreatedAt:     inst.CreatedAt,
+					SSHHost:       inst.SSHHost,
+					SSHRemotePath: inst.SSHRemotePath,
 				})
 			}
 		}
@@ -830,6 +1517,10 @@ func handleListAllProfiles(jsonOutput bool) {
 // handleRemove removes a session by ID or title
 func handleRemove(profile string, args []string) {
 	fs := flag.NewFlagSet("remove", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck remove <id|title>")
 		fmt.Println()
@@ -841,63 +1532,178 @@ func handleRemove(profile string, args []string) {
 		fmt.Println("  agent-deck -p work remove abc12345   # Remove from 'work' profile")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
+
+	quietMode := *quiet || *quietShort
+	out := NewCLIOutput(*jsonOutput, quietMode)
 
 	identifier := fs.Arg(0)
 	if identifier == "" {
-		fmt.Println("Error: session ID or title is required")
-		fs.Usage()
+		out.Error("session ID or title is required", ErrCodeNotFound)
+		if !*jsonOutput {
+			fs.Usage()
+		}
 		os.Exit(1)
 	}
 
-	storage, err := session.NewStorageWithProfile(profile)
+	storage, instances, groups, err := loadSessionData(profile)
 	if err != nil {
-		fmt.Printf("Error: failed to initialize storage: %v\n", err)
+		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
-	instances, groups, err := storage.LoadWithGroups()
-	if err != nil {
-		fmt.Printf("Error: failed to load sessions: %v\n", err)
+	// Use shared ResolveSession for consistent matching (ambiguity detection, min prefix length)
+	inst, errMsg, errCode := ResolveSession(identifier, instances)
+	if inst == nil {
+		out.Error(fmt.Sprintf("%s (profile '%s')", errMsg, storage.Profile()), errCode)
+		if errCode == ErrCodeNotFound {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 
-	// Find and remove the session
-	found := false
-	var removedTitle string
-	newInstances := make([]*session.Instance, 0, len(instances))
-	for _, inst := range instances {
-		if inst.ID == identifier || strings.HasPrefix(inst.ID, identifier) || inst.Title == identifier {
-			found = true
-			removedTitle = inst.Title
-			// Kill tmux session if it exists
-			if inst.Exists() {
-				if err := inst.Kill(); err != nil {
-					fmt.Printf("Warning: failed to kill tmux session: %v\n", err)
-					fmt.Println("Session removed from Agent Deck but may still be running in tmux")
-				}
-			}
-		} else {
-			newInstances = append(newInstances, inst)
+	removedID := inst.ID
+	removedTitle := inst.Title
+
+	// Always attempt to kill the tmux session, even if Exists() returns false.
+	// The saved status may be stale (e.g., "error" in DB but tmux session still alive).
+	// Kill() is safe to call on non-existent sessions (returns error which we handle).
+	if err := inst.Kill(); err != nil {
+		// Only warn if the session actually existed (ignore "not found" errors)
+		if inst.Exists() && !*jsonOutput {
+			fmt.Printf("Warning: failed to kill tmux session: %v\n", err)
+			fmt.Println("Session removed from Agent Deck but may still be running in tmux")
 		}
 	}
 
-	if !found {
-		fmt.Printf("Error: session not found in profile '%s': %s\n", storage.Profile(), identifier)
-		os.Exit(1)
+	// Clean up worktree directory if this is a worktree session
+	if inst.IsWorktree() {
+		if err := git.RemoveWorktree(inst.WorktreeRepoRoot, inst.WorktreePath, false); err != nil {
+			if !*jsonOutput {
+				fmt.Printf("Warning: failed to remove worktree: %v\n", err)
+			}
+		}
+		_ = git.PruneWorktrees(inst.WorktreeRepoRoot)
 	}
 
-	// Rebuild group tree and save
+	// Direct SQL DELETE first to prevent resurrection by concurrent TUI force saves.
+	// The TUI's forceSaveInstances() can race with CLI deletion and re-insert the session.
+	// By deleting the row directly, we ensure it's gone even if SaveWithGroups races.
+	if err := storage.DeleteInstance(removedID); err != nil {
+		if !*jsonOutput {
+			fmt.Printf("Warning: direct delete failed: %v\n", err)
+		}
+	}
+
+	// Rebuild instance list without the deleted session and save with groups
+	newInstances := make([]*session.Instance, 0, len(instances)-1)
+	for _, s := range instances {
+		if s.ID != removedID {
+			newInstances = append(newInstances, s)
+		}
+	}
 	groupTree := session.NewGroupTreeWithGroups(newInstances, groups)
 
 	if err := storage.SaveWithGroups(newInstances, groupTree); err != nil {
-		fmt.Printf("Error: failed to save: %v\n", err)
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ Removed session: %s (from profile '%s')\n", removedTitle, storage.Profile())
+	out.Success(
+		fmt.Sprintf("Removed session: %s (from profile '%s')", removedTitle, storage.Profile()),
+		map[string]interface{}{
+			"success": true,
+			"id":      removedID,
+			"title":   removedTitle,
+			"removed": true,
+			"profile": storage.Profile(),
+		},
+	)
+}
+
+func handleRename(profile string, args []string) {
+	fs := flag.NewFlagSet("rename", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	quiet := fs.Bool("quiet", false, "Minimal output")
+	quietShort := fs.Bool("q", false, "Minimal output (short)")
+
+	fs.Usage = func() {
+		fmt.Println("Usage: agent-deck rename <id|title> <new-title>")
+		fmt.Println()
+		fmt.Println("Rename a session by ID or title.")
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  agent-deck rename abc12345 \"New Name\"")
+		fmt.Println("  agent-deck rename \"Old Name\" \"New Name\"")
+		fmt.Println("  agent-deck -p work rename abc12345 \"New Name\"   # Rename in 'work' profile")
+	}
+
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	quietMode := *quiet || *quietShort
+	out := NewCLIOutput(*jsonOutput, quietMode)
+
+	identifier := fs.Arg(0)
+	newTitle := fs.Arg(1)
+	if identifier == "" || newTitle == "" {
+		out.Error("session ID/title and new title are required", ErrCodeInvalidOperation)
+		if !*jsonOutput {
+			fs.Usage()
+		}
+		os.Exit(1)
+	}
+
+	storage, instances, groups, err := loadSessionData(profile)
+	if err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	inst, errMsg, errCode := ResolveSession(identifier, instances)
+	if inst == nil {
+		out.Error(fmt.Sprintf("%s (profile '%s')", errMsg, storage.Profile()), errCode)
+		if errCode == ErrCodeNotFound {
+			os.Exit(2)
+		}
+		os.Exit(1)
+	}
+
+	oldTitle := inst.Title
+
+	// Check for duplicate title at the same path (but allow renaming to same title)
+	if newTitle != oldTitle {
+		if isDup, existing := isDuplicateSession(instances, newTitle, inst.ProjectPath); isDup {
+			out.Error(
+				fmt.Sprintf("session with title %q already exists at path %q (id: %s)", newTitle, inst.ProjectPath, existing.ID),
+				ErrCodeInvalidOperation,
+			)
+			os.Exit(1)
+		}
+	}
+
+	inst.Title = newTitle
+	inst.SyncTmuxDisplayName()
+
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
+		out.Error(fmt.Sprintf("failed to save: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
+	out.Success(
+		fmt.Sprintf("Renamed session: %q → %q (profile '%s')", oldTitle, newTitle, storage.Profile()),
+		map[string]interface{}{
+			"success":   true,
+			"id":        inst.ID,
+			"old_title": oldTitle,
+			"new_title": newTitle,
+			"profile":   storage.Profile(),
+		},
+	)
 }
 
 // statusCounts holds session counts by status
@@ -906,6 +1712,7 @@ type statusCounts struct {
 	waiting int
 	idle    int
 	err     int
+	stopped int
 	total   int
 }
 
@@ -923,6 +1730,8 @@ func countByStatus(instances []*session.Instance) statusCounts {
 			counts.idle++
 		case session.StatusError:
 			counts.err++
+		case session.StatusStopped:
+			counts.stopped++
 		}
 		counts.total++
 	}
@@ -953,7 +1762,7 @@ func handleStatus(profile string, args []string) {
 		fmt.Println("  agent-deck -p work status      # Status for 'work' profile")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -972,7 +1781,7 @@ func handleStatus(profile string, args []string) {
 
 	if len(instances) == 0 {
 		if *jsonOutput {
-			fmt.Println(`{"waiting": 0, "running": 0, "idle": 0, "error": 0, "total": 0}`)
+			fmt.Println(`{"waiting": 0, "running": 0, "idle": 0, "error": 0, "stopped": 0, "total": 0}`)
 		} else if *quiet || *quietShort {
 			fmt.Println("0")
 		} else {
@@ -991,6 +1800,7 @@ func handleStatus(profile string, args []string) {
 			Running int `json:"running"`
 			Idle    int `json:"idle"`
 			Error   int `json:"error"`
+			Stopped int `json:"stopped"`
 			Total   int `json:"total"`
 		}
 		output, _ := json.Marshal(statusJSON{
@@ -998,6 +1808,7 @@ func handleStatus(profile string, args []string) {
 			Running: counts.running,
 			Idle:    counts.idle,
 			Error:   counts.err,
+			Stopped: counts.stopped,
 			Total:   counts.total,
 		})
 		fmt.Println(string(output))
@@ -1030,6 +1841,7 @@ func handleStatus(profile string, args []string) {
 		printStatusGroup("WAITING", "◐", session.StatusWaiting)
 		printStatusGroup("RUNNING", "●", session.StatusRunning)
 		printStatusGroup("IDLE", "○", session.StatusIdle)
+		printStatusGroup("STOPPED", "■", session.StatusStopped)
 		printStatusGroup("ERROR", "✕", session.StatusError)
 
 		fmt.Printf("Total: %d sessions in profile '%s'\n", counts.total, storage.Profile())
@@ -1047,59 +1859,122 @@ func handleStatus(profile string, args []string) {
 
 // handleProfile manages profiles (list, create, delete, default)
 func handleProfile(args []string) {
-	if len(args) == 0 {
+	// Extract --json and -q/--quiet flags from anywhere in args
+	var jsonMode, quietMode bool
+	var filteredArgs []string
+	for _, arg := range args {
+		switch arg {
+		case "--json":
+			jsonMode = true
+		case "--quiet", "-q":
+			quietMode = true
+		default:
+			filteredArgs = append(filteredArgs, arg)
+		}
+	}
+	out := NewCLIOutput(jsonMode, quietMode)
+
+	if len(filteredArgs) == 0 {
 		// Default to list
-		handleProfileList()
+		handleProfileList(out, jsonMode)
 		return
 	}
 
-	switch args[0] {
+	if filteredArgs[0] == "help" || filteredArgs[0] == "--help" || filteredArgs[0] == "-h" {
+		printProfileHelp()
+		return
+	}
+
+	switch filteredArgs[0] {
 	case "list", "ls":
-		handleProfileList()
+		handleProfileList(out, jsonMode)
 	case "create", "new":
-		if len(args) < 2 {
-			fmt.Println("Error: profile name is required")
-			fmt.Println("Usage: agent-deck profile create <name>")
+		if len(filteredArgs) >= 2 && isHelpArg(filteredArgs[1]) {
+			printProfileCreateHelp()
+			return
+		}
+		if len(filteredArgs) < 2 {
+			out.Error("profile name is required", ErrCodeInvalidOperation)
+			if !jsonMode {
+				printProfileCreateHelp()
+			}
 			os.Exit(1)
 		}
-		handleProfileCreate(args[1])
+		handleProfileCreate(out, filteredArgs[1])
 	case "delete", "rm":
-		if len(args) < 2 {
-			fmt.Println("Error: profile name is required")
-			fmt.Println("Usage: agent-deck profile delete <name>")
+		if len(filteredArgs) >= 2 && isHelpArg(filteredArgs[1]) {
+			printProfileDeleteHelp()
+			return
+		}
+		if len(filteredArgs) < 2 {
+			out.Error("profile name is required", ErrCodeInvalidOperation)
+			if !jsonMode {
+				printProfileDeleteHelp()
+			}
 			os.Exit(1)
 		}
-		handleProfileDelete(args[1])
+		handleProfileDelete(out, jsonMode, filteredArgs[1])
 	case "default":
-		if len(args) < 2 {
+		if len(filteredArgs) >= 2 && isHelpArg(filteredArgs[1]) {
+			printProfileDefaultHelp()
+			return
+		}
+		if len(filteredArgs) < 2 {
 			// Show current default
 			config, err := session.LoadConfig()
 			if err != nil {
-				fmt.Printf("Error: failed to load config: %v\n", err)
+				out.Error(fmt.Sprintf("failed to load config: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
 			}
-			fmt.Printf("Default profile: %s\n", config.DefaultProfile)
+			out.Success(fmt.Sprintf("Default profile: %s", config.DefaultProfile), map[string]interface{}{
+				"success":         true,
+				"default_profile": config.DefaultProfile,
+			})
 			return
 		}
-		handleProfileSetDefault(args[1])
+		handleProfileSetDefault(out, filteredArgs[1])
 	default:
-		fmt.Printf("Unknown profile command: %s\n", args[0])
-		fmt.Println()
-		fmt.Println("Usage: agent-deck profile <command>")
-		fmt.Println()
-		fmt.Println("Commands:")
-		fmt.Println("  list              List all profiles")
-		fmt.Println("  create <name>     Create a new profile")
-		fmt.Println("  delete <name>     Delete a profile")
-		fmt.Println("  default [name]    Show or set default profile")
+		out.Error(fmt.Sprintf("unknown profile command: %s", filteredArgs[0]), ErrCodeInvalidOperation)
+		if !jsonMode {
+			fmt.Println()
+			printProfileHelp()
+		}
 		os.Exit(1)
 	}
 }
 
-func handleProfileList() {
+func printProfileHelp() {
+	fmt.Println("Usage: agent-deck profile <command>")
+	fmt.Println()
+	fmt.Println("Manage named Agent Deck profiles.")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  list              List all profiles")
+	fmt.Println("  create <name>     Create a new profile")
+	fmt.Println("  delete <name>     Delete a profile")
+	fmt.Println("  default [name]    Show or set default profile")
+}
+
+func printProfileCreateHelp() {
+	fmt.Println("Usage: agent-deck profile create <name>")
+}
+
+func printProfileDeleteHelp() {
+	fmt.Println("Usage: agent-deck profile delete <name>")
+}
+
+func printProfileDefaultHelp() {
+	fmt.Println("Usage: agent-deck profile default [name]")
+}
+
+func isHelpArg(arg string) bool {
+	return arg == "help" || arg == "--help" || arg == "-h"
+}
+
+func handleProfileList(out *CLIOutput, jsonMode bool) {
 	profiles, err := session.ListProfiles()
 	if err != nil {
-		fmt.Printf("Error: failed to list profiles: %v\n", err)
+		out.Error(fmt.Sprintf("failed to list profiles: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 
@@ -1107,6 +1982,23 @@ func handleProfileList() {
 	defaultProfile := session.DefaultProfile
 	if config != nil {
 		defaultProfile = config.DefaultProfile
+	}
+
+	if jsonMode {
+		var profileList []map[string]interface{}
+		for _, p := range profiles {
+			profileList = append(profileList, map[string]interface{}{
+				"name":       p,
+				"is_default": p == defaultProfile,
+			})
+		}
+		out.Success("", map[string]interface{}{
+			"success":         true,
+			"profiles":        profileList,
+			"default_profile": defaultProfile,
+			"total":           len(profiles),
+		})
+		return
 	}
 
 	if len(profiles) == 0 {
@@ -1126,38 +2018,54 @@ func handleProfileList() {
 	fmt.Printf("\nTotal: %d profiles\n", len(profiles))
 }
 
-func handleProfileCreate(name string) {
+func handleProfileCreate(out *CLIOutput, name string) {
 	if err := session.CreateProfile(name); err != nil {
-		fmt.Printf("Error: %v\n", err)
+		out.Error(fmt.Sprintf("%v", err), ErrCodeAlreadyExists)
 		os.Exit(1)
 	}
-	fmt.Printf("✓ Created profile: %s\n", name)
-	fmt.Printf("  Use with: agent-deck -p %s\n", name)
+	out.Success(fmt.Sprintf("Created profile: %s", name), map[string]interface{}{
+		"success": true,
+		"name":    name,
+		"created": true,
+	})
 }
 
-func handleProfileDelete(name string) {
-	// Confirm deletion
-	fmt.Printf("Are you sure you want to delete profile '%s'? This will remove all sessions in this profile. [y/N] ", name)
-	var response string
-	_, _ = fmt.Scanln(&response)
-	if response != "y" && response != "Y" {
-		fmt.Println("Cancelled.")
-		return
+func handleProfileDelete(out *CLIOutput, jsonMode bool, name string) {
+	// Skip confirmation in JSON mode (for automation)
+	if !jsonMode {
+		fmt.Printf(
+			"Are you sure you want to delete profile '%s'? This will remove all sessions in this profile. [y/N] ",
+			name,
+		)
+		var response string
+		_, _ = fmt.Scanln(&response)
+		if response != "y" && response != "Y" {
+			fmt.Println("Cancelled.")
+			return
+		}
 	}
 
 	if err := session.DeleteProfile(name); err != nil {
-		fmt.Printf("Error: %v\n", err)
+		out.Error(fmt.Sprintf("%v", err), ErrCodeNotFound)
 		os.Exit(1)
 	}
-	fmt.Printf("✓ Deleted profile: %s\n", name)
+	out.Success(fmt.Sprintf("Deleted profile: %s", name), map[string]interface{}{
+		"success": true,
+		"name":    name,
+		"deleted": true,
+	})
 }
 
-func handleProfileSetDefault(name string) {
+func handleProfileSetDefault(out *CLIOutput, name string) {
 	if err := session.SetDefaultProfile(name); err != nil {
-		fmt.Printf("Error: %v\n", err)
+		out.Error(fmt.Sprintf("%v", err), ErrCodeNotFound)
 		os.Exit(1)
 	}
-	fmt.Printf("✓ Default profile set to: %s\n", name)
+	out.Success(fmt.Sprintf("Default profile set to: %s", name), map[string]interface{}{
+		"success":         true,
+		"name":            name,
+		"default_profile": name,
+	})
 }
 
 // handleUpdate checks for and performs updates
@@ -1178,7 +2086,7 @@ func handleUpdate(args []string) {
 		fmt.Println("  agent-deck update --check   # Only check, don't install")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -1201,29 +2109,144 @@ func handleUpdate(args []string) {
 	fmt.Printf("\n⬆ Update available: v%s → v%s\n", info.CurrentVersion, info.LatestVersion)
 	fmt.Printf("  Release: %s\n", info.ReleaseURL)
 
+	// Fetch and display changelog
+	displayChangelog(info.CurrentVersion, info.LatestVersion)
+
+	installPath, homebrewUpgradeCmd, homebrewManaged, hbErr := update.DetectHomebrewManagedInstall()
+	if hbErr != nil {
+		// Non-fatal: fall back to direct updater flow.
+		homebrewManaged = false
+	}
+	homebrewInstallCmd := homebrewUpgradeCmd
+	if homebrewManaged {
+		homebrewInstallCmd = fmt.Sprintf("brew update && %s", homebrewUpgradeCmd)
+	}
+
 	if *checkOnly {
-		fmt.Println("\nRun 'agent-deck update' to install.")
+		if homebrewManaged {
+			fmt.Printf("\nHomebrew-managed install detected at %s\n", installPath)
+			fmt.Printf("Run `%s` to install.\n", homebrewInstallCmd)
+		} else {
+			fmt.Println("\nRun 'agent-deck update' to install.")
+		}
 		return
 	}
 
-	// Confirm update
-	fmt.Print("\nInstall update? [Y/n] ")
-	var response string
-	_, _ = fmt.Scanln(&response)
+	if homebrewManaged {
+		fmt.Printf("\nHomebrew-managed install detected at %s\n", installPath)
+		fmt.Printf("Will run: %s\n", homebrewInstallCmd)
+	}
+
+	// Confirm update - drain any buffered input first to avoid garbage
+	drainStdin()
+	if homebrewManaged {
+		fmt.Print("\nInstall update via Homebrew now? [Y/n] ")
+	} else {
+		fmt.Print("\nInstall update? [Y/n] ")
+	}
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(response)
 	if response != "" && response != "y" && response != "Y" {
 		fmt.Println("Update cancelled.")
 		return
 	}
 
-	// Perform update
+	// Perform update (direct binary replacement or Homebrew upgrade)
 	fmt.Println()
-	if err := update.PerformUpdate(info.DownloadURL); err != nil {
-		fmt.Printf("Error installing update: %v\n", err)
-		os.Exit(1)
+	if homebrewManaged {
+		if err := runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd); err != nil {
+			fmt.Printf("Error installing update via Homebrew: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		if err := update.PerformUpdate(info.DownloadURL); err != nil {
+			fmt.Printf("Error installing update: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Update bridge.py if conductor is installed
+	if err := update.UpdateBridgePy(); err != nil {
+		fmt.Printf("Warning: Failed to update bridge.py: %v\n", err)
+		fmt.Println("  You can manually refresh it with: agent-deck conductor setup <name>")
 	}
 
 	fmt.Printf("\n✓ Updated to v%s\n", info.LatestVersion)
 	fmt.Println("  Restart agent-deck to use the new version.")
+
+	// Offer to update remotes
+	updateRemotesAfterLocalUpdate(info.LatestVersion)
+}
+
+func runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd string) error {
+	cmdParts := strings.Fields(homebrewUpgradeCmd)
+	if len(cmdParts) == 0 {
+		return fmt.Errorf("empty Homebrew upgrade command")
+	}
+
+	brewBin := cmdParts[0]
+	refreshCmd := exec.Command(brewBin, "update")
+	refreshCmd.Stdout = os.Stdout
+	refreshCmd.Stderr = os.Stderr
+	refreshCmd.Stdin = os.Stdin
+	if err := refreshCmd.Run(); err != nil {
+		return fmt.Errorf("failed to refresh Homebrew metadata: %w", err)
+	}
+
+	upgradeCmd := exec.Command(brewBin, cmdParts[1:]...)
+	upgradeCmd.Stdout = os.Stdout
+	upgradeCmd.Stderr = os.Stderr
+	upgradeCmd.Stdin = os.Stdin
+	if err := upgradeCmd.Run(); err != nil {
+		return fmt.Errorf("failed to run `%s`: %w", homebrewUpgradeCmd, err)
+	}
+
+	return nil
+}
+
+// displayChangelog fetches and displays changelog between versions
+func displayChangelog(currentVersion, latestVersion string) {
+	changelog, err := update.FetchChangelog()
+	if err != nil {
+		fmt.Println("\n  (Could not fetch changelog. See release notes at the URL above.)")
+		return
+	}
+
+	entries := update.ParseChangelog(changelog)
+	changes := update.GetChangesBetweenVersions(entries, currentVersion, latestVersion)
+
+	if len(changes) > 0 {
+		fmt.Print(update.FormatChangelogForDisplay(changes))
+	}
+}
+
+// drainStdin discards any pending input in stdin to prevent garbage from being read
+// This is needed before prompts because ANSI escape sequences or user keypresses
+// may have buffered during the changelog display
+func drainStdin() {
+	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return
+	}
+
+	// Use TCIFLUSH via ioctl to flush the terminal input queue
+	// This is the proper Unix way to discard pending input
+	// TCIFLUSH = 0 (flush input), TCIOFLUSH = 2 (flush both)
+	// The syscall is: ioctl(fd, TCFLSH, TCIFLUSH)
+	// On macOS/Darwin, TCFLSH = 0x80047410 (from termios.h)
+	// On Linux, TCFLSH = 0x540B
+	const (
+		tcflshDarwin = 0x80047410
+		tcflshLinux  = 0x540B
+		tciflush     = 0 // flush input queue
+	)
+
+	// Try Darwin first, then Linux
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), tcflshDarwin, tciflush)
+	if errno != 0 {
+		_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), tcflshLinux, tciflush)
+	}
 }
 
 func printHelp() {
@@ -1238,14 +2261,24 @@ func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  (none)           Start the TUI")
 	fmt.Println("  add <path>       Add a new session")
+	fmt.Println("  launch [path]    Add, start, and optionally send a message in one step")
+	fmt.Println("  try <name>       Quick experiment (create/find dated folder + session)")
 	fmt.Println("  list, ls         List all sessions")
 	fmt.Println("  remove, rm       Remove a session")
+	fmt.Println("  rename, mv       Rename a session")
 	fmt.Println("  status           Show session status summary")
 	fmt.Println("  session          Manage session lifecycle")
 	fmt.Println("  mcp              Manage MCP servers")
+	fmt.Println("  skill            Manage Claude skills")
+	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
+	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
 	fmt.Println("  group            Manage groups")
+	fmt.Println("  worktree, wt     Manage git worktrees")
+	fmt.Println("  web              Start TUI with web UI server running alongside")
+	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
+	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")
 	fmt.Println("  uninstall        Uninstall Agent Deck")
 	fmt.Println("  version          Show version")
 	fmt.Println("  help             Show this help")
@@ -1264,11 +2297,37 @@ func printHelp() {
 	fmt.Println("  mcp attach <id> <mcp>     Attach MCP to session")
 	fmt.Println("  mcp detach <id> <mcp>     Detach MCP from session")
 	fmt.Println()
+	fmt.Println("Skill Commands:")
+	fmt.Println("  skill list                List discoverable skills")
+	fmt.Println("  skill attached [id]       Show skills attached to a session")
+	fmt.Println("  skill attach <id> <name>  Attach skill to session project")
+	fmt.Println("  skill detach <id> <name>  Detach skill from session project")
+	fmt.Println("  skill source list         List global skill sources")
+	fmt.Println()
+	fmt.Println("Codex Hook Commands:")
+	fmt.Println("  codex-hooks install       Install or upgrade Codex notify hook")
+	fmt.Println("  codex-hooks uninstall     Remove Codex notify hook")
+	fmt.Println("  codex-hooks status        Show Codex hook install status")
+	fmt.Println("  gemini-hooks install      Install Gemini hooks")
+	fmt.Println("  gemini-hooks uninstall    Remove Gemini hooks")
+	fmt.Println("  gemini-hooks status       Show Gemini hooks install status")
+	fmt.Println()
 	fmt.Println("Group Commands:")
 	fmt.Println("  group list                List all groups")
 	fmt.Println("  group create <name>       Create a new group")
 	fmt.Println("  group delete <name>       Delete a group")
 	fmt.Println("  group move <id> <group>   Move session to group")
+	fmt.Println()
+	fmt.Println("Conductor Commands:")
+	fmt.Println("  conductor setup           Set up conductor (Telegram bridge + sessions)")
+	fmt.Println("  conductor teardown        Stop conductor and remove bridge daemon")
+	fmt.Println("  conductor status          Show conductor health across profiles")
+	fmt.Println("  conductor list            List configured conductors")
+	fmt.Println()
+	fmt.Println("Worktree Commands:")
+	fmt.Println("  worktree list             List worktrees with session associations")
+	fmt.Println("  worktree info <session>   Show worktree info for a session")
+	fmt.Println("  worktree cleanup          Find and remove orphaned worktrees/sessions")
 	fmt.Println()
 	fmt.Println("Profile Commands:")
 	fmt.Println("  profile list              List all profiles")
@@ -1285,7 +2344,13 @@ func printHelp() {
 	fmt.Println("  agent-deck session show               # Show current session (in tmux)")
 	fmt.Println("  agent-deck mcp list --json            # List MCPs as JSON")
 	fmt.Println("  agent-deck mcp attach my-app exa      # Attach MCP to session")
+	fmt.Println("  agent-deck skill attach my-app react  # Attach skill to project")
 	fmt.Println("  agent-deck group move my-app work     # Move session to group")
+	fmt.Println("  agent-deck web                        # TUI + web server on 127.0.0.1:8420")
+	fmt.Println("  agent-deck web --listen :9000         # TUI + web on custom port")
+	fmt.Println("  agent-deck web --read-only            # TUI + web in read-only mode")
+	fmt.Println("  agent-deck web --token secret         # TUI + web with auth token")
+	fmt.Println("  agent-deck web --help                 # Show web command flags")
 	fmt.Println()
 	fmt.Println("Environment Variables:")
 	fmt.Println("  AGENTDECK_PROFILE    Default profile to use")
@@ -1295,9 +2360,13 @@ func printHelp() {
 	fmt.Println("  n          New session")
 	fmt.Println("  g          New group")
 	fmt.Println("  Enter      Attach to session")
+	fmt.Println("  m          MCP Manager")
+	fmt.Println("  s          Skills Manager (Claude)")
+	fmt.Println("  M          Move session to group")
+	fmt.Println("  r          Rename session/group")
+	fmt.Println("  R          Restart session")
 	fmt.Println("  d          Delete session/group")
-	fmt.Println("  m          Move session to group")
-	fmt.Println("  R          Rename session/group")
+	fmt.Println("  S          Settings")
 	fmt.Println("  /          Search")
 	fmt.Println("  Ctrl+Q     Detach from session")
 	fmt.Println("  q          Quit")
@@ -1324,6 +2393,11 @@ func truncate(s string, max int) string {
 
 // detectTool determines the tool type from command
 func detectTool(cmd string) string {
+	// Check custom tools first (exact match on original case)
+	if session.GetToolDef(cmd) != nil {
+		return cmd
+	}
+
 	cmd = strings.ToLower(cmd)
 	switch {
 	case strings.Contains(cmd, "claude"):
@@ -1341,92 +2415,37 @@ func detectTool(cmd string) string {
 	}
 }
 
-// getLockFilePath returns the path to the lock file for a profile
-func getLockFilePath(profile string) string {
-	if profile == "" {
-		profile = session.DefaultProfile
-	}
-	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".agent-deck", "profiles", profile, ".lock")
-}
-
-// isProcessRunning checks if a process with the given PID is still running
-func isProcessRunning(pid int) bool {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Unix, FindProcess always succeeds, so we need to send signal 0 to check
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
-}
-
-// acquireLock attempts to acquire an exclusive lock for the profile
-// Uses O_EXCL for atomic file creation to prevent race conditions
-func acquireLock(profile string) error {
-	lockPath := getLockFilePath(profile)
-
-	// Ensure the directory exists
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
-		return fmt.Errorf("failed to create lock directory: %w", err)
-	}
-
-	// Attempt atomic lock file creation (up to 2 attempts for stale lock cleanup)
-	for attempt := 0; attempt < 2; attempt++ {
-		// O_EXCL ensures atomic creation - fails if file exists
-		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-		if err == nil {
-			// Successfully created lock file atomically
-			defer f.Close()
-			if _, writeErr := f.WriteString(strconv.Itoa(os.Getpid())); writeErr != nil {
-				os.Remove(lockPath)
-				return fmt.Errorf("failed to write PID to lock file: %w", writeErr)
-			}
-			return nil
-		}
-
-		if !os.IsExist(err) {
-			return fmt.Errorf("failed to create lock file: %w", err)
-		}
-
-		// Lock file exists - check if stale
-		data, readErr := os.ReadFile(lockPath)
-		if readErr != nil {
-			// Cannot read lock file, try removing it
-			os.Remove(lockPath)
-			continue
-		}
-
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if parseErr == nil && isProcessRunning(pid) {
-			// Another instance is running
-			effectiveProfile := profile
-			if effectiveProfile == "" {
-				effectiveProfile = session.DefaultProfile
-			}
-			return fmt.Errorf("agent-deck is already running for profile '%s' (PID %d)\n\nIf this is incorrect, remove the lock file:\n  rm %s", effectiveProfile, pid, lockPath)
-		}
-
-		// Stale lock - remove and retry
-		os.Remove(lockPath)
-	}
-
-	return fmt.Errorf("failed to acquire lock after multiple attempts")
-}
-
-// releaseLock removes the lock file for the profile
-func releaseLock(profile string) {
-	lockPath := getLockFilePath(profile)
-	// Only remove if it's our lock (contains our PID)
-	if data, err := os.ReadFile(lockPath); err == nil {
-		pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-		if pid == os.Getpid() {
-			os.Remove(lockPath)
-		}
-	}
-}
-
 // handleUninstall removes agent-deck from the system
+func handleDebugDump() {
+	baseDir, err := session.GetAgentDeckDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot determine agent-deck dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize logging just enough to populate the ring buffer from the log file
+	logging.Init(logging.Config{
+		Debug:  true,
+		LogDir: baseDir,
+		Level:  "debug",
+	})
+	defer logging.Shutdown()
+
+	dumpPath := filepath.Join(baseDir, fmt.Sprintf("debug-dump-%d.jsonl", time.Now().Unix()))
+	if err := logging.DumpRingBuffer(dumpPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to dump ring buffer: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Also check if the debug.log file exists and report its path
+	debugLogPath := filepath.Join(baseDir, "debug.log")
+	if info, statErr := os.Stat(debugLogPath); statErr == nil {
+		fmt.Printf("Debug log: %s (%.1f MB)\n", debugLogPath, float64(info.Size())/(1024*1024))
+	}
+	fmt.Printf("Ring buffer dumped to: %s\n", dumpPath)
+	fmt.Println("Share this file when reporting lag or stuck issues.")
+}
+
 func handleUninstall(args []string) {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	keepData := fs.Bool("keep-data", false, "Keep ~/.agent-deck/ (sessions, config, logs)")
@@ -1452,7 +2471,7 @@ func handleUninstall(args []string) {
 		fmt.Println("  agent-deck uninstall -y           # Uninstall without prompts")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
 
@@ -1503,7 +2522,10 @@ func handleUninstall(args []string) {
 
 		if info.Mode()&os.ModeSymlink != 0 {
 			target, _ := os.Readlink(loc)
-			foundItems = append(foundItems, foundItem{"binary-symlink", loc, fmt.Sprintf("Binary (symlink) → %s", target)})
+			foundItems = append(
+				foundItems,
+				foundItem{"binary-symlink", loc, fmt.Sprintf("Binary (symlink) → %s", target)},
+			)
 			fmt.Printf("Found: Binary (symlink) at %s\n", loc)
 			fmt.Printf("       → %s\n", target)
 		} else {
@@ -1521,9 +2543,18 @@ func handleUninstall(args []string) {
 		if entries, err := os.ReadDir(profilesDir); err == nil {
 			for _, entry := range entries {
 				if entry.IsDir() {
-					profileCount++
-					sessionsFile := filepath.Join(profilesDir, entry.Name(), "sessions.json")
-					if data, err := os.ReadFile(sessionsFile); err == nil {
+					// Check for state.db (SQLite, v0.11.0+) or sessions.json (legacy)
+					dbFile := filepath.Join(profilesDir, entry.Name(), "state.db")
+					jsonFile := filepath.Join(profilesDir, entry.Name(), "sessions.json")
+					if _, err := os.Stat(dbFile); err == nil {
+						profileCount++
+						if s, err := session.NewStorageWithProfile(entry.Name()); err == nil {
+							if instances, _, err := s.LoadWithGroups(); err == nil {
+								sessionCount += len(instances)
+							}
+						}
+					} else if data, err := os.ReadFile(jsonFile); err == nil {
+						profileCount++
 						sessionCount += strings.Count(string(data), `"id"`)
 					}
 				}
@@ -1532,7 +2563,7 @@ func handleUninstall(args []string) {
 
 		// Get total size
 		var totalSize int64
-		filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error {
+		_ = filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error {
 			if err == nil && !info.IsDir() {
 				totalSize += info.Size()
 			}
@@ -1540,7 +2571,14 @@ func handleUninstall(args []string) {
 		})
 		sizeStr := formatSize(totalSize)
 
-		foundItems = append(foundItems, foundItem{"data", dataDir, fmt.Sprintf("%d profiles, %d sessions, %s", profileCount, sessionCount, sizeStr)})
+		foundItems = append(
+			foundItems,
+			foundItem{
+				"data",
+				dataDir,
+				fmt.Sprintf("%d profiles, %d sessions, %s", profileCount, sessionCount, sizeStr),
+			},
+		)
 		fmt.Printf("Found: Data directory at %s\n", dataDir)
 		fmt.Printf("       %d profiles, %d sessions, %s\n", profileCount, sessionCount, sizeStr)
 	}
@@ -1601,7 +2639,7 @@ func handleUninstall(args []string) {
 	if !*yes && !*dryRun {
 		fmt.Print("Proceed with uninstall? [y/N] ")
 		var response string
-		fmt.Scanln(&response)
+		_, _ = fmt.Scanln(&response)
 		if strings.ToLower(response) != "y" {
 			fmt.Println("Uninstall cancelled.")
 			return
@@ -1694,7 +2732,7 @@ func handleUninstall(args []string) {
 
 			// Create backup
 			backupPath := tmuxConf + ".bak.agentdeck-uninstall"
-			if err := os.WriteFile(backupPath, data, 0644); err != nil {
+			if err := os.WriteFile(backupPath, data, 0o644); err != nil {
 				fmt.Printf("Warning: failed to create backup: %v\n", err)
 			}
 
@@ -1721,7 +2759,7 @@ func handleUninstall(args []string) {
 				}
 				newContent = strings.TrimRight(newContent, "\n") + "\n"
 
-				if err := os.WriteFile(tmuxConf, []byte(newContent), 0644); err != nil {
+				if err := os.WriteFile(tmuxConf, []byte(newContent), 0o644); err != nil {
 					fmt.Printf("Warning: failed to update tmux config: %v\n", err)
 				} else {
 					fmt.Printf("✓ tmux configuration removed (backup: %s)\n", backupPath)
@@ -1741,9 +2779,12 @@ func handleUninstall(args []string) {
 			if !*yes {
 				fmt.Print("Create backup of data before removing? [Y/n] ")
 				var response string
-				fmt.Scanln(&response)
+				_, _ = fmt.Scanln(&response)
 				if strings.ToLower(response) != "n" {
-					backupFile := filepath.Join(homeDir, fmt.Sprintf("agent-deck-backup-%s.tar.gz", time.Now().Format("20060102-150405")))
+					backupFile := filepath.Join(
+						homeDir,
+						fmt.Sprintf("agent-deck-backup-%s.tar.gz", time.Now().Format("20060102-150405")),
+					)
 					fmt.Printf("Creating backup at %s...\n", backupFile)
 
 					cmd := exec.Command("tar", "-czf", backupFile, "-C", homeDir, ".agent-deck")
@@ -1783,6 +2824,12 @@ func handleUninstall(args []string) {
 	fmt.Println()
 	fmt.Println("Thank you for using Agent Deck!")
 	fmt.Println("Feedback: https://github.com/asheshgoplani/agent-deck/issues")
+}
+
+// isNestedSession returns true if we're running inside an agent-deck managed tmux session.
+// Uses GetCurrentSessionID() which checks if the current tmux session name matches agentdeck_*.
+func isNestedSession() bool {
+	return GetCurrentSessionID() != ""
 }
 
 // formatSize formats bytes into human-readable size

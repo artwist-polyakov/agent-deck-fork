@@ -3,10 +3,14 @@ package session
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
+
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
+
+var migrationLog = logging.ForComponent(logging.CompSession)
 
 // MigrationResult contains information about the migration outcome
 type MigrationResult struct {
@@ -68,7 +72,7 @@ func MigrateToProfiles() (*MigrationResult, error) {
 	}
 
 	// Case 3: Old file exists, new doesn't - perform migration
-	log.Printf("Migrating sessions to profiles layout...")
+	migrationLog.Info("migrating_to_profiles_layout")
 
 	// Step 1: Read and validate old sessions file
 	oldData, err := os.ReadFile(oldSessionsPath)
@@ -83,7 +87,7 @@ func MigrateToProfiles() (*MigrationResult, error) {
 	}
 
 	sessionCount := len(storageData.Instances)
-	log.Printf("Found %d sessions to migrate", sessionCount)
+	migrationLog.Info("sessions_found_for_migration", slog.Int("count", sessionCount))
 
 	// Step 2: Create profiles/default directory
 	if err := os.MkdirAll(defaultProfileDir, 0700); err != nil {
@@ -108,7 +112,7 @@ func MigrateToProfiles() (*MigrationResult, error) {
 				os.RemoveAll(defaultProfileDir)
 				return nil, fmt.Errorf("failed to copy %s: %w", filename, err)
 			}
-			log.Printf("Copied %s to profiles/default/", filename)
+			migrationLog.Info("file_copied_to_profile", slog.String("filename", filename))
 		}
 	}
 
@@ -138,7 +142,7 @@ func MigrateToProfiles() (*MigrationResult, error) {
 	}
 	if err := SaveConfig(config); err != nil {
 		// Non-fatal - config can be recreated
-		log.Printf("Warning: failed to create config.json: %v", err)
+		migrationLog.Warn("config_json_creation_failed", slog.String("error", err.Error()))
 	}
 
 	// Step 6: Remove old files (only after successful verification)
@@ -147,12 +151,12 @@ func MigrateToProfiles() (*MigrationResult, error) {
 		if fileExists(oldPath) {
 			if err := os.Remove(oldPath); err != nil {
 				// Non-fatal - just log it
-				log.Printf("Warning: failed to remove old %s: %v", filename, err)
+				migrationLog.Warn("old_file_removal_failed", slog.String("filename", filename), slog.String("error", err.Error()))
 			}
 		}
 	}
 
-	log.Printf("Migration complete! %d sessions moved to profiles/default/", sessionCount)
+	migrationLog.Info("migration_complete", slog.Int("session_count", sessionCount))
 
 	return &MigrationResult{
 		Migrated:     true,

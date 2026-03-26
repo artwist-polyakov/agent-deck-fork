@@ -21,9 +21,6 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X main.version={{.Version}}
-      - -X main.commit={{.Commit}}
-      - -X main.date={{.Date}}
 
 archives:
   - id: default
@@ -62,11 +59,44 @@ release:
   draft: false
   prerelease: auto
   mode: append
+  name_template: "v{{.Version}}"
   header: |
-    ## Agent Deck {{ .Tag }}
+    ## Agent Deck v{{.Version}}
 
     Terminal session manager for AI coding agents.
+
+    ### Installation
+
+    **Homebrew (recommended):**
+    ```bash
+    brew install asheshgoplani/tap/agent-deck
+    ```
+
+    **Quick Install:**
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash
+    ```
+
+    **Go Install:**
+    ```bash
+    go install github.com/asheshgoplani/agent-deck/cmd/agent-deck@v{{.Version}}
+    ```
   footer: |
     ---
 
     **Full Changelog**: https://github.com/asheshgoplani/agent-deck/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+brews:
+  - name: agent-deck
+    repository:
+      owner: asheshgoplani
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/asheshgoplani/agent-deck"
+    description: "Terminal session manager for AI coding agents"
+    license: "MIT"
+    dependencies:
+      - name: tmux
+    test: |
+      system "#{bin}/agent-deck", "version"

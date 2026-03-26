@@ -46,6 +46,9 @@
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 32'%3E%3Crect fill='%231a1b26' width='48' height='32' rx='4'/%3E%3Ccircle cx='10' cy='16' r='5' fill='%239ece6a'/%3E%3Ccircle cx='24' cy='16' r='5' fill='%23e0af68'/%3E%3Ccircle cx='38' cy='16' r='5' fill='%23565f89'/%3E%3C/svg%3E">
     <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 32'%3E%3Crect fill='%231a1b26' width='48' height='32' rx='4'/%3E%3Ccircle cx='10' cy='16' r='5' fill='%239ece6a'/%3E%3Ccircle cx='24' cy='16' r='5' fill='%23e0af68'/%3E%3Ccircle cx='38' cy='16' r='5' fill='%23565f89'/%3E%3C/svg%3E">
 
+    <!-- LLM documentation reference -->
+    <link rel="alternate" type="text/plain" href="https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/llms-full.txt" title="LLM Documentation">
+
     <!-- Schema.org structured data - Software Application -->
     <script type="application/ld+json">
     {
@@ -57,12 +60,12 @@
         "applicationCategory": "DeveloperApplication",
         "applicationSubCategory": "Terminal Utility",
         "operatingSystem": ["macOS", "Linux", "Windows (WSL)"],
-        "softwareVersion": "0.5.4",
+        "softwareVersion": "0.15.0",
         "releaseNotes": "https://github.com/asheshgoplani/agent-deck/releases",
         "downloadUrl": "https://github.com/asheshgoplani/agent-deck/releases/latest",
         "installUrl": "https://github.com/asheshgoplani/agent-deck#installation",
         "screenshot": "https://asheshgoplani.github.io/agent-deck/og-image.svg",
-        "softwareHelp": "https://github.com/asheshgoplani/agent-deck#usage",
+        "softwareHelp": "https://github.com/asheshgoplani/agent-deck#quick-start",
         "offers": {
             "@type": "Offer",
             "price": "0",
@@ -122,6 +125,38 @@
                 "acceptedAnswer": {
                     "@type": "Answer",
                     "text": "Yes, Agent Deck is completely free and open source under the MIT license. You can install it via Homebrew, curl script, or build from source on GitHub."
+                }
+            },
+            {
+                "@type": "Question",
+                "name": "What is the best Claude Code session manager?",
+                "acceptedAnswer": {
+                    "@type": "Answer",
+                    "text": "Agent Deck is a full-featured Claude Code session manager that provides a terminal dashboard for managing multiple sessions. It offers unique features like session forking (explore different approaches from the same conversation context), MCP socket pooling (share MCP processes across sessions to save 85-90% memory), and smart status detection that shows whether each agent is running, waiting for input, or idle."
+                }
+            },
+            {
+                "@type": "Question",
+                "name": "How do I run multiple Claude Code instances in parallel?",
+                "acceptedAnswer": {
+                    "@type": "Answer",
+                    "text": "Agent Deck lets you run multiple Claude Code instances in parallel from a single terminal. Create sessions with 'agent-deck add -c claude /path/to/project', and the dashboard shows all sessions with live status indicators. You can switch between them instantly with keyboard shortcuts, fork conversations to explore different approaches, and use git worktrees to isolate each agent's work on separate branches."
+                }
+            },
+            {
+                "@type": "Question",
+                "name": "What are alternatives to claude-squad?",
+                "acceptedAnswer": {
+                    "@type": "Answer",
+                    "text": "Agent Deck is a popular alternative to claude-squad for managing multiple AI coding sessions. Compared to claude-squad, Agent Deck offers additional features including session forking (branch conversations without losing context), an MCP Manager for toggling MCP servers per session, MCP socket pooling for memory efficiency, global search across all Claude conversations, and support for more tools including Gemini CLI and OpenCode alongside Claude Code."
+                }
+            },
+            {
+                "@type": "Question",
+                "name": "How do I manage AI coding agents with tmux?",
+                "acceptedAnswer": {
+                    "@type": "Answer",
+                    "text": "Agent Deck provides a tmux-based TUI (Terminal User Interface) specifically designed for managing AI coding agents. It creates managed tmux sessions with AI-aware features: smart status detection knows when Claude is thinking vs. waiting for input, session forking inherits conversation context, and the MCP Manager lets you toggle capabilities like web search or browser automation per session. Install with 'curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash' and launch with 'agent-deck'."
                 }
             }
         ]
@@ -546,7 +581,7 @@ bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "xclip
 <span class="text-tn-cyan">args</span> = [<span class="text-tn-green">"-y"</span>, <span class="text-tn-green">"@modelcontextprotocol/server-memory"</span>]
 <span class="text-tn-cyan">description</span> = <span class="text-tn-green">"Persistent memory via knowledge graph"</span></code></pre>
                     </div>
-                    <p class="text-tn-dim text-xs mt-3">See <a href="https://github.com/asheshgoplani/agent-deck#-mcp-manager" class="text-tn-cyan hover:underline">README</a> for more MCP examples.</p>
+                    <p class="text-tn-dim text-xs mt-3">See <a href="https://github.com/asheshgoplani/agent-deck#mcp-manager" class="text-tn-cyan hover:underline">README</a> for more MCP examples.</p>
                 </div>
             </div>
         </section>

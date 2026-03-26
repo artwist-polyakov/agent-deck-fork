@@ -6,15 +6,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
+
+var proxyLog = logging.ForComponent(logging.CompPool)
+
+// idMapping holds the reverse-lookup data for a single in-flight JSON-RPC request.
+// The proxy rewrites the client-supplied ID to a proxy-scoped atomic counter value
+// before forwarding to the MCP process. This struct stores both the original client
+// ID (to restore in the response) and the session that issued the request (to route
+// the response back to the correct client).
+type idMapping struct {
+	sessionID  string
+	originalID interface{}
+	sentAt     time.Time // For round-trip latency tracking (debug mode only)
+}
 
 // SocketProxy wraps a stdio MCP process with a Unix socket
 type SocketProxy struct {
@@ -33,8 +49,14 @@ type SocketProxy struct {
 	clients   map[string]net.Conn
 	clientsMu sync.RWMutex
 
-	requestMap map[interface{}]string
-	requestMu  sync.Mutex
+	// nextID is a proxy-scoped monotonic counter. Every incoming request ID is
+	// replaced with nextID.Add(1) before being forwarded to the MCP process,
+	// ensuring globally unique IDs across all sessions sharing this proxy.
+	nextID atomic.Int64
+	// idMap maps proxy-assigned int64 IDs to the original idMapping so responses
+	// can be routed back to the correct session with the original ID restored.
+	// Key type: int64; value type: idMapping.
+	idMap sync.Map
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -42,10 +64,12 @@ type SocketProxy struct {
 	logFile   string
 	logWriter io.WriteCloser
 
-	Status       ServerStatus
-	statusMu     sync.RWMutex // Protects Status field
-	lastRestart  time.Time    // For rate limiting restarts
-	restartCount int          // Track restart attempts
+	Status        ServerStatus
+	statusMu      sync.RWMutex // Protects Status field
+	lastRestart   time.Time    // For rate limiting restarts
+	restartCount  int          // Track restart attempts
+	totalFailures int          // Cumulative failures across all restarts
+	successSince  time.Time    // When the proxy last became StatusRunning
 }
 
 // SetStatus safely updates the proxy status
@@ -99,8 +123,9 @@ func NewSocketProxy(ctx context.Context, name, command string, args []string, en
 
 	// Check if socket already exists and is alive (another agent-deck instance owns it)
 	if isSocketAlive(socketPath) {
-		log.Printf("[Pool] Socket %s already alive (owned by another agent-deck), reusing", name)
-		// Return a proxy that just points to the existing socket (no process to manage)
+		proxyLog.Info("socket_reuse_external", slog.String("mcp", name))
+		// Return a proxy that just points to the existing socket (no process to manage).
+		// nextID and idMap zero values are ready to use without explicit initialization.
 		return &SocketProxy{
 			name:       name,
 			socketPath: socketPath,
@@ -108,7 +133,6 @@ func NewSocketProxy(ctx context.Context, name, command string, args []string, en
 			args:       args,
 			env:        env,
 			clients:    make(map[string]net.Conn),
-			requestMap: make(map[interface{}]string),
 			ctx:        ctx,
 			cancel:     cancel,
 			Status:     StatusRunning, // Mark as running since external socket is alive
@@ -125,7 +149,6 @@ func NewSocketProxy(ctx context.Context, name, command string, args []string, en
 		args:       args,
 		env:        env,
 		clients:    make(map[string]net.Conn),
-		requestMap: make(map[interface{}]string),
 		ctx:        ctx,
 		cancel:     cancel,
 		Status:     StatusStarting,
@@ -135,7 +158,7 @@ func NewSocketProxy(ctx context.Context, name, command string, args []string, en
 func (p *SocketProxy) Start() error {
 	// If already running (reusing external socket), skip process creation
 	if p.GetStatus() == StatusRunning {
-		log.Printf("[Pool] %s: Reusing existing socket, no process to start", p.name)
+		proxyLog.Info("socket_reuse_existing", slog.String("mcp", p.name))
 		return nil
 	}
 
@@ -156,6 +179,22 @@ func (p *SocketProxy) Start() error {
 	}
 	p.mcpProcess.Env = cmdEnv
 
+	// Create a new process group so grandchild processes (e.g., node spawned by npx,
+	// python spawned by uvx) can be killed together. Without this, killing npx leaves
+	// the actual MCP server process orphaned under PID 1.
+	p.mcpProcess.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Graceful shutdown: send SIGTERM to the entire process group on context cancel.
+	// WaitDelay gives the group time to exit after SIGTERM before Go forcibly
+	// closes I/O pipes and sends SIGKILL. This prevents shutdown hangs when child
+	// processes (e.g., node spawned by npx) inherit stdout/stderr and keep Wait() blocked.
+	// See: https://github.com/golang/go/issues/50436
+	p.mcpProcess.Cancel = func() error {
+		// Kill entire process group (negative PID) so grandchildren die too
+		return syscall.Kill(-p.mcpProcess.Process.Pid, syscall.SIGTERM)
+	}
+	p.mcpProcess.WaitDelay = 3 * time.Second
+
 	p.mcpStdin, err = p.mcpProcess.StdinPipe()
 	if err != nil {
 		return err
@@ -170,7 +209,7 @@ func (p *SocketProxy) Start() error {
 		return err
 	}
 
-	log.Printf("Started MCP %s (PID: %d)", p.name, p.mcpProcess.Process.Pid)
+	proxyLog.Info("mcp_started", slog.String("mcp", p.name), slog.Int("pid", p.mcpProcess.Process.Pid))
 	go func() { _, _ = io.Copy(p.logWriter, stderr) }()
 
 	listener, err := net.Listen("unix", p.socketPath)
@@ -180,14 +219,22 @@ func (p *SocketProxy) Start() error {
 	}
 	p.listener = listener
 
-	log.Printf("Socket proxy %s at: %s", p.name, p.socketPath)
+	proxyLog.Info("socket_listening", slog.String("mcp", p.name), slog.String("path", p.socketPath))
 
 	go p.acceptConnections()
 	go p.broadcastResponses()
 
 	p.SetStatus(StatusRunning)
+	p.statusMu.Lock()
+	p.successSince = time.Now()
+	p.statusMu.Unlock()
 	return nil
 }
+
+// maxClientsPerProxy caps the number of concurrent client connections per MCP
+// socket proxy. Each client spawns a goroutine with a scanner buffer, so
+// unbounded connections (e.g., from reconnect loops) can leak gigabytes of RAM.
+const maxClientsPerProxy = 100
 
 func (p *SocketProxy) acceptConnections() {
 	clientCounter := 0
@@ -198,8 +245,21 @@ func (p *SocketProxy) acceptConnections() {
 			case <-p.ctx.Done():
 				return
 			default:
-				continue
+				// Listener was closed (e.g., MCP process crashed and broadcastResponses
+				// closed the listener). Exit to avoid spinning in a tight loop.
+				proxyLog.Warn("accept_listener_error", slog.String("mcp", p.name), slog.String("error", err.Error()))
+				return
 			}
+		}
+
+		// Reject new connections if at capacity to prevent unbounded goroutine growth
+		p.clientsMu.RLock()
+		clientCount := len(p.clients)
+		p.clientsMu.RUnlock()
+		if clientCount >= maxClientsPerProxy {
+			proxyLog.Warn("max_clients_reached", slog.String("mcp", p.name), slog.Int("max", maxClientsPerProxy))
+			conn.Close()
+			continue
 		}
 
 		sessionID := fmt.Sprintf("%s-client-%d", p.name, clientCounter)
@@ -209,21 +269,31 @@ func (p *SocketProxy) acceptConnections() {
 		p.clients[sessionID] = conn
 		p.clientsMu.Unlock()
 
-		log.Printf("[%s] Client connected: %s", p.name, sessionID)
+		logging.Aggregate(logging.CompPool, "client_connect", slog.String("mcp", p.name), slog.String("client", sessionID))
 		go p.handleClient(sessionID, conn)
 	}
 }
 
 func (p *SocketProxy) handleClient(sessionID string, conn net.Conn) {
 	defer func() {
+		// Clean up all idMap entries that belong to this session so in-flight
+		// requests for a disconnected client don't linger and accumulate.
+		p.idMap.Range(func(k, v interface{}) bool {
+			if v.(idMapping).sessionID == sessionID {
+				p.idMap.Delete(k)
+			}
+			return true
+		})
+
 		p.clientsMu.Lock()
 		delete(p.clients, sessionID)
 		p.clientsMu.Unlock()
 		conn.Close()
-		log.Printf("[%s] Client disconnected: %s", p.name, sessionID)
+		logging.Aggregate(logging.CompPool, "client_disconnect", slog.String("mcp", p.name), slog.String("client", sessionID))
 	}()
 
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024) // 10MB max for large MCP requests
 	for scanner.Scan() {
 		line := scanner.Bytes()
 
@@ -233,18 +303,38 @@ func (p *SocketProxy) handleClient(sessionID string, conn net.Conn) {
 		}
 
 		if req.ID != nil {
-			p.requestMu.Lock()
-			p.requestMap[req.ID] = sessionID
-			p.requestMu.Unlock()
+			// Rewrite the client-supplied ID with a proxy-scoped unique int64.
+			// This prevents collisions when multiple sessions send requests with
+			// the same ID (e.g., Claude Code always starts at id:1).
+			proxyID := p.nextID.Add(1)
+			var sentAt time.Time
+			if logging.IsDebugEnabled() {
+				sentAt = time.Now()
+			}
+			p.idMap.Store(proxyID, idMapping{
+				sessionID:  sessionID,
+				originalID: req.ID,
+				sentAt:     sentAt,
+			})
+			req.ID = proxyID
+			if rewritten, err := json.Marshal(req); err == nil {
+				line = rewritten
+			}
 		}
 
 		_, _ = p.mcpStdin.Write(line)
 		_, _ = p.mcpStdin.Write([]byte("\n"))
+
+		logging.Aggregate(logging.CompPool, "mcp_request",
+			slog.String("mcp", p.name),
+			slog.String("client", sessionID),
+			slog.String("method", req.Method))
 	}
 }
 
 func (p *SocketProxy) broadcastResponses() {
 	scanner := bufio.NewScanner(p.mcpStdout)
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024) // 10MB max for large MCP responses
 	for scanner.Scan() {
 		line := scanner.Bytes()
 
@@ -263,30 +353,91 @@ func (p *SocketProxy) broadcastResponses() {
 
 	// Log error when scanner exits
 	if err := scanner.Err(); err != nil {
-		log.Printf("[Pool] %s: broadcastResponses scanner error: %v", p.name, err)
+		proxyLog.Warn("broadcast_scanner_error", slog.String("mcp", p.name), slog.String("error", err.Error()))
 	} else {
-		log.Printf("[Pool] %s: broadcastResponses exited (MCP stdout closed)", p.name)
+		proxyLog.Info("broadcast_exited", slog.String("mcp", p.name))
 	}
 
 	// Mark proxy as failed so health monitor can restart it
 	p.SetStatus(StatusFailed)
+
+	// Close all client connections so reconnecting proxies know to retry
+	p.closeAllClientsOnFailure()
+
+	// Close listener so new connections fail fast (will be recreated on restart)
+	if p.listener != nil {
+		p.listener.Close()
+	}
+}
+
+// closeAllClientsOnFailure closes all client connections when the MCP process dies.
+// This signals reconnecting proxies to retry their connection.
+func (p *SocketProxy) closeAllClientsOnFailure() {
+	p.clientsMu.Lock()
+	for sessionID, conn := range p.clients {
+		conn.Close()
+		proxyLog.Debug("client_closed_on_failure", slog.String("mcp", p.name), slog.String("client", sessionID))
+	}
+	p.clients = make(map[string]net.Conn)
+	p.clientsMu.Unlock()
+
+	// Clear all in-flight ID mappings to prevent stale entries across proxy restarts.
+	p.idMap.Clear()
 }
 
 func (p *SocketProxy) routeToClient(responseID interface{}, line []byte) {
-	p.requestMu.Lock()
-	sessionID, exists := p.requestMap[responseID]
-	if exists {
-		delete(p.requestMap, responseID)
-	}
-	p.requestMu.Unlock()
-
-	if !exists {
+	// Responses from the MCP process use the proxy-assigned int64 IDs.
+	// encoding/json unmarshals JSON numbers into float64 when the target is interface{},
+	// so we must normalize to int64 via a type switch before looking up the idMap.
+	var proxyKey int64
+	switch v := responseID.(type) {
+	case float64:
+		proxyKey = int64(v)
+	case int64:
+		proxyKey = v
+	case json.Number:
+		n, _ := v.Int64()
+		proxyKey = n
+	default:
+		// Non-integer IDs were not proxy-assigned; broadcast to all clients.
 		p.broadcastToAll(line)
 		return
 	}
 
+	val, ok := p.idMap.LoadAndDelete(proxyKey)
+	if !ok {
+		p.broadcastToAll(line)
+		return
+	}
+
+	mapping := val.(idMapping)
+
+	// Track round-trip latency (debug mode only)
+	if !mapping.sentAt.IsZero() {
+		rtt := time.Since(mapping.sentAt)
+		logging.Aggregate(logging.CompPool, "mcp_rtt",
+			slog.String("mcp", p.name),
+			slog.String("client", mapping.sessionID),
+			slog.Duration("rtt", rtt))
+		if rtt > 1*time.Second {
+			proxyLog.Warn("slow_mcp_rtt",
+				slog.String("mcp", p.name),
+				slog.String("client", mapping.sessionID),
+				slog.Duration("rtt", rtt))
+		}
+	}
+
+	// Restore the original client-supplied ID before forwarding the response.
+	var resp JSONRPCResponse
+	if err := json.Unmarshal(line, &resp); err == nil {
+		resp.ID = mapping.originalID
+		if restored, err := json.Marshal(resp); err == nil {
+			line = restored
+		}
+	}
+
 	p.clientsMu.RLock()
-	conn, exists := p.clients[sessionID]
+	conn, exists := p.clients[mapping.sessionID]
 	p.clientsMu.RUnlock()
 
 	if exists {
@@ -315,15 +466,13 @@ func (p *SocketProxy) Stop() error {
 	p.clientsMu.Lock()
 	for sessionID, conn := range p.clients {
 		conn.Close()
-		log.Printf("[Pool] %s: Closed client connection: %s", p.name, sessionID)
+		proxyLog.Debug("client_closed_on_stop", slog.String("mcp", p.name), slog.String("client", sessionID))
 	}
 	p.clients = make(map[string]net.Conn)
 	p.clientsMu.Unlock()
 
-	// Clear request map to prevent memory leak
-	p.requestMu.Lock()
-	p.requestMap = make(map[interface{}]string)
-	p.requestMu.Unlock()
+	// Clear in-flight ID mappings to prevent memory leak on shutdown.
+	p.idMap.Clear()
 
 	if p.listener != nil {
 		p.listener.Close()
@@ -332,12 +481,29 @@ func (p *SocketProxy) Stop() error {
 	// Only kill process and remove socket if we OWN it (mcpProcess != nil)
 	if p.mcpProcess != nil {
 		p.mcpStdin.Close()
-		_ = p.mcpProcess.Process.Signal(syscall.SIGTERM)
-		_ = p.mcpProcess.Wait()
+		// Context cancel above triggers cmd.Cancel (SIGTERM), then WaitDelay handles
+		// escalation to SIGKILL + pipe close after 3s. Add 5s safety net.
+		done := make(chan error, 1)
+		go func() {
+			done <- p.mcpProcess.Wait()
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				proxyLog.Warn("process_exit_error", slog.String("mcp", p.name), slog.String("error", err.Error()))
+			}
+		case <-time.After(5 * time.Second):
+			// Final safety net: force kill entire process group if SIGTERM didn't work
+			proxyLog.Warn("process_wait_timeout", slog.String("mcp", p.name))
+			_ = syscall.Kill(-p.mcpProcess.Process.Pid, syscall.SIGKILL)
+			<-done // Wait must return after Kill
+		}
 		os.Remove(p.socketPath)
-		log.Printf("[Pool] %s: Stopped owned process and removed socket", p.name)
+		proxyLog.Info("proxy_stopped", slog.String("mcp", p.name))
 	} else {
-		log.Printf("[Pool] %s: Disconnected from external socket (not removing)", p.name)
+		// Clean up external socket files on shutdown to prevent stale sockets
+		os.Remove(p.socketPath)
+		proxyLog.Info("external_socket_disconnected", slog.String("mcp", p.name))
 	}
 
 	if p.logWriter != nil {

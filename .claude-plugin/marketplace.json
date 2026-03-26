@@ -15,7 +15,8 @@
       "source": "./",
       "strict": false,
       "skills": [
-        "./skills/agent-deck"
+        "./skills/agent-deck",
+        "./skills/session-share"
       ]
     }
   ]

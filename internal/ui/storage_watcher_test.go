@@ -1,100 +1,56 @@
 package ui
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewStorageWatcher(t *testing.T) {
-	tmpDir := t.TempDir()
-	testFile := filepath.Join(tmpDir, "sessions.json")
-
-	// Create test file
-	err := os.WriteFile(testFile, []byte("{}"), 0644)
+func newTestDB(t *testing.T) *statedb.StateDB {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := statedb.Open(dbPath)
 	require.NoError(t, err)
+	require.NoError(t, db.Migrate())
+	t.Cleanup(func() { db.Close() })
+	return db
+}
 
-	watcher, err := NewStorageWatcher(testFile)
+func TestNewStorageWatcher(t *testing.T) {
+	db := newTestDB(t)
+	watcher, err := NewStorageWatcher(db)
 	require.NoError(t, err)
 	require.NotNil(t, watcher)
-
 	defer watcher.Close()
 }
 
 func TestStorageWatcher_DetectsChanges(t *testing.T) {
-	tmpDir := t.TempDir()
-	testFile := filepath.Join(tmpDir, "sessions.json")
-
-	// Create initial file
-	err := os.WriteFile(testFile, []byte("{}"), 0644)
-	require.NoError(t, err)
-
-	watcher, err := NewStorageWatcher(testFile)
+	db := newTestDB(t)
+	watcher, err := NewStorageWatcher(db)
 	require.NoError(t, err)
 	defer watcher.Close()
 
-	// Start watching
 	watcher.Start()
 
-	// Modify file
+	// Simulate an external change (another instance touching the metadata)
 	time.Sleep(50 * time.Millisecond)
-	err = os.WriteFile(testFile, []byte(`{"test": "data"}`), 0644)
-	require.NoError(t, err)
+	require.NoError(t, db.Touch())
 
-	// Should receive reload signal
+	// Should receive reload signal within the poll interval
 	select {
 	case <-watcher.ReloadChannel():
 		// Success
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Expected reload signal but got timeout")
 	}
 }
 
-func TestStorageWatcher_Debouncing(t *testing.T) {
-	tmpDir := t.TempDir()
-	testFile := filepath.Join(tmpDir, "sessions.json")
-
-	err := os.WriteFile(testFile, []byte("{}"), 0644)
-	require.NoError(t, err)
-
-	watcher, err := NewStorageWatcher(testFile)
-	require.NoError(t, err)
-	defer watcher.Close()
-
-	watcher.Start()
-
-	// Rapid writes (simulate CLI making multiple changes)
-	for i := 0; i < 5; i++ {
-		time.Sleep(10 * time.Millisecond)
-		_ = os.WriteFile(testFile, []byte(`{"count": `+string(rune('0'+i))+`}`), 0644)
-	}
-
-	// Should only get ONE reload signal (debounced)
-	reloadCount := 0
-	timeout := time.After(300 * time.Millisecond)
-
-	for {
-		select {
-		case <-watcher.ReloadChannel():
-			reloadCount++
-		case <-timeout:
-			require.Equal(t, 1, reloadCount, "Should debounce rapid writes to single reload")
-			return
-		}
-	}
-}
-
 func TestStorageWatcher_NotifySaveIgnoresOwnChanges(t *testing.T) {
-	tmpDir := t.TempDir()
-	testFile := filepath.Join(tmpDir, "sessions.json")
-
-	err := os.WriteFile(testFile, []byte("{}"), 0644)
-	require.NoError(t, err)
-
-	watcher, err := NewStorageWatcher(testFile)
+	db := newTestDB(t)
+	watcher, err := NewStorageWatcher(db)
 	require.NoError(t, err)
 	defer watcher.Close()
 
@@ -103,28 +59,22 @@ func TestStorageWatcher_NotifySaveIgnoresOwnChanges(t *testing.T) {
 	// Notify that we're about to save (simulating TUI save)
 	watcher.NotifySave()
 
-	// Write to file (this simulates TUI's own save)
+	// Touch metadata (this simulates TUI's own save via storage.SaveWithGroups)
 	time.Sleep(10 * time.Millisecond)
-	err = os.WriteFile(testFile, []byte(`{"from_tui": true}`), 0644)
-	require.NoError(t, err)
+	require.NoError(t, db.Touch())
 
 	// Should NOT receive reload signal (within ignore window)
 	select {
 	case <-watcher.ReloadChannel():
 		t.Fatal("Should not receive reload signal for TUI's own save")
-	case <-time.After(600 * time.Millisecond):
-		// Success - no reload signal received
+	case <-time.After(3 * time.Second):
+		// Success: no reload signal received
 	}
 }
 
 func TestStorageWatcher_ExternalChangesStillDetected(t *testing.T) {
-	tmpDir := t.TempDir()
-	testFile := filepath.Join(tmpDir, "sessions.json")
-
-	err := os.WriteFile(testFile, []byte("{}"), 0644)
-	require.NoError(t, err)
-
-	watcher, err := NewStorageWatcher(testFile)
+	db := newTestDB(t)
+	watcher, err := NewStorageWatcher(db)
 	require.NoError(t, err)
 	defer watcher.Close()
 
@@ -133,67 +83,58 @@ func TestStorageWatcher_ExternalChangesStillDetected(t *testing.T) {
 	// Notify that we saved
 	watcher.NotifySave()
 
-	// Wait for ignore window to expire
-	time.Sleep(600 * time.Millisecond)
+	// Wait for ignore window to expire (ignoreWindow is 3s)
+	time.Sleep(4 * time.Second)
 
 	// Now an external change should be detected
-	err = os.WriteFile(testFile, []byte(`{"from_cli": true}`), 0644)
-	require.NoError(t, err)
+	require.NoError(t, db.Touch())
 
 	// Should receive reload signal (outside ignore window)
 	select {
 	case <-watcher.ReloadChannel():
 		// Success
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Expected reload signal for external change but got timeout")
 	}
 }
 
-// TestStorageWatcher_CrossProfileIsolation verifies that watchers for different profiles
-// do NOT trigger on each other's file changes. This prevents the catastrophic data loss
-// bug where creating a session in work profile would wipe out default profile sessions.
+// TestStorageWatcher_CrossProfileIsolation verifies that separate SQLite databases
+// for different profiles are naturally isolated (each has its own metadata).
 func TestStorageWatcher_CrossProfileIsolation(t *testing.T) {
-	// Create two profile directories simulating ~/.agent-deck/profiles/default and /work
-	profile1Dir := filepath.Join(t.TempDir(), "profile1")
-	profile2Dir := filepath.Join(t.TempDir(), "profile2")
-	require.NoError(t, os.MkdirAll(profile1Dir, 0700))
-	require.NoError(t, os.MkdirAll(profile2Dir, 0700))
+	db1 := newTestDB(t)
+	db2 := newTestDB(t)
 
-	// Create sessions.json in each profile
-	profile1File := filepath.Join(profile1Dir, "sessions.json")
-	profile2File := filepath.Join(profile2Dir, "sessions.json")
-	require.NoError(t, os.WriteFile(profile1File, []byte(`{"instances":[]}`), 0644))
-	require.NoError(t, os.WriteFile(profile2File, []byte(`{"instances":[]}`), 0644))
-
-	// Create watcher for profile1 only
-	watcher1, err := NewStorageWatcher(profile1File)
+	// Create watcher for db1 only
+	watcher1, err := NewStorageWatcher(db1)
 	require.NoError(t, err)
 	defer watcher1.Close()
 	watcher1.Start()
 
-	// Wait for watcher to initialize
+	// Touch db2's metadata (simulating another profile saving)
 	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, db2.Touch())
 
-	// Modify profile2's sessions.json (simulating work profile TUI saving)
-	err = os.WriteFile(profile2File, []byte(`{"instances":[{"id":"test"}]}`), 0644)
-	require.NoError(t, err)
-
-	// Profile1's watcher should NOT fire (this is the critical test!)
+	// Watcher1 should NOT fire (it's watching a different database)
 	select {
 	case <-watcher1.ReloadChannel():
-		t.Fatal("CRITICAL BUG: Profile1 watcher fired when profile2 file changed! Cross-profile contamination detected!")
-	case <-time.After(500 * time.Millisecond):
-		// Success - watcher correctly ignored the other profile's change
+		t.Fatal("CRITICAL BUG: Watcher1 fired when db2 was modified!")
+	case <-time.After(3 * time.Second):
+		// Success: isolated correctly
 	}
 
-	// Verify profile1 watcher DOES fire when its own file changes
-	err = os.WriteFile(profile1File, []byte(`{"instances":[{"id":"profile1-session"}]}`), 0644)
-	require.NoError(t, err)
+	// Watcher1 SHOULD fire when its own database changes
+	require.NoError(t, db1.Touch())
 
 	select {
 	case <-watcher1.ReloadChannel():
-		// Success - detected change to its own file
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Profile1 watcher should have detected change to its own file")
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Fatal("Watcher1 should have detected change to its own database")
 	}
+}
+
+func TestStorageWatcher_NilDB(t *testing.T) {
+	watcher, err := NewStorageWatcher(nil)
+	require.NoError(t, err)
+	require.Nil(t, watcher)
 }

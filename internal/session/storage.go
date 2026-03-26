@@ -3,53 +3,31 @@ package session
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
-const (
-	// maxBackupGenerations is the number of rolling backups to keep
-	maxBackupGenerations = 3
-)
+var storageLog = logging.ForComponent(logging.CompStorage)
 
-// expandTilde expands ~ to the user's home directory with path traversal protection
-// It also fixes malformed paths that have ~ in the middle (e.g., "/some/path~/actual/path")
-func expandTilde(path string) string {
-	// Fix malformed paths that have ~ in the middle
-	// This can happen when textinput suggestion appends instead of replaces
+// fixMalformedTildePath fixes paths where the UI textinput suggestion appended
+// instead of replacing, producing paths like "/some/path~/actual/path".
+// Returns the path starting from the last "~/" occurrence.
+func fixMalformedTildePath(path string) string {
 	if idx := strings.Index(path, "~/"); idx > 0 {
-		path = path[idx:]
-	}
-
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			// Clean the path to resolve .. and other special sequences
-			expanded := filepath.Join(home, path[2:])
-			cleaned := filepath.Clean(expanded)
-			// Verify the cleaned path is still under home directory (prevent path traversal)
-			if strings.HasPrefix(cleaned, home) {
-				return cleaned
-			}
-			// Path traversal detected - log and return original
-			log.Printf("Warning: path traversal detected in %q, ignoring expansion", path)
-		}
-	} else if path == "~" {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			return home
-		}
+		return path[idx:]
 	}
 	return path
 }
 
-// StorageData represents the JSON structure for persistence
+// StorageData represents the JSON structure for persistence (kept for migration/compat)
 type StorageData struct {
 	Instances []*InstanceData `json:"instances"`
 	Groups    []*GroupData    `json:"groups,omitempty"` // Persist empty groups
@@ -62,13 +40,20 @@ type InstanceData struct {
 	Title           string    `json:"title"`
 	ProjectPath     string    `json:"project_path"`
 	GroupPath       string    `json:"group_path"`
+	Order           int       `json:"order"`
 	ParentSessionID string    `json:"parent_session_id,omitempty"` // Links to parent session (sub-session support)
 	Command         string    `json:"command"`
+	Wrapper         string    `json:"wrapper,omitempty"`
 	Tool            string    `json:"tool"`
 	Status          Status    `json:"status"`
 	CreatedAt       time.Time `json:"created_at"`
 	LastAccessedAt  time.Time `json:"last_accessed_at,omitempty"`
 	TmuxSession     string    `json:"tmux_session"`
+
+	// Worktree support
+	WorktreePath     string `json:"worktree_path,omitempty"`
+	WorktreeRepoRoot string `json:"worktree_repo_root,omitempty"`
+	WorktreeBranch   string `json:"worktree_branch,omitempty"`
 
 	// Claude session (persisted for resume after app restart)
 	ClaudeSessionID  string    `json:"claude_session_id,omitempty"`
@@ -77,76 +62,136 @@ type InstanceData struct {
 	// Gemini session (persisted for resume after app restart)
 	GeminiSessionID  string    `json:"gemini_session_id,omitempty"`
 	GeminiDetectedAt time.Time `json:"gemini_detected_at,omitempty"`
+	GeminiYoloMode   *bool     `json:"gemini_yolo_mode,omitempty"`
+	GeminiModel      string    `json:"gemini_model,omitempty"`
+
+	// OpenCode session (persisted for resume after app restart)
+	OpenCodeSessionID  string    `json:"opencode_session_id,omitempty"`
+	OpenCodeDetectedAt time.Time `json:"opencode_detected_at,omitempty"`
+
+	// Codex session (persisted for resume after app restart)
+	CodexSessionID  string    `json:"codex_session_id,omitempty"`
+	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
+
+	// Latest user input for context
+	LatestPrompt string `json:"latest_prompt,omitempty"`
+	Notes        string `json:"notes,omitempty"`
+
+	// Tool-specific launch options (generic for all tools: claude, codex, etc.)
+	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
 
 	// MCP tracking (persisted for sync status display)
 	LoadedMCPNames []string `json:"loaded_mcp_names,omitempty"`
+
+	// Sandbox support
+	Sandbox          *SandboxConfig `json:"sandbox,omitempty"`
+	SandboxContainer string         `json:"sandbox_container,omitempty"`
+
+	// SSH remote support
+	SSHHost       string `json:"ssh_host,omitempty"`
+	SSHRemotePath string `json:"ssh_remote_path,omitempty"`
+
+	// Multi-repo support
+	MultiRepoEnabled   bool                            `json:"multi_repo_enabled,omitempty"`
+	AdditionalPaths    []string                        `json:"additional_paths,omitempty"`
+	MultiRepoTempDir   string                          `json:"multi_repo_temp_dir,omitempty"`
+	MultiRepoWorktrees []statedb.MultiRepoWorktreeData `json:"multi_repo_worktrees,omitempty"`
 }
 
 // GroupData represents serializable group data
 type GroupData struct {
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Expanded bool   `json:"expanded"`
-	Order    int    `json:"order"`
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	Expanded    bool   `json:"expanded"`
+	Order       int    `json:"order"`
+	DefaultPath string `json:"default_path,omitempty"`
 }
 
-// Storage handles persistence of session data
-// Thread-safe with mutex protection for concurrent access
+// Storage handles persistence of session data via SQLite.
+// Thread-safe with mutex protection for concurrent access within a single process.
+// Multiple processes share data via SQLite WAL mode.
 type Storage struct {
-	path    string
+	db      *statedb.StateDB
+	dbPath  string     // Path to state.db (for change detection)
 	profile string     // The profile this storage is for
-	mu      sync.Mutex // Protects all file operations
-}
-
-// NewStorage creates a new storage instance using the default profile.
-// It automatically runs migration from old layout if needed.
-func NewStorage() (*Storage, error) {
-	return NewStorageWithProfile("")
+	mu      sync.Mutex // Protects operations during transition
 }
 
 // NewStorageWithProfile creates a storage instance for a specific profile.
 // If profile is empty, uses the effective profile (from env var or config).
-// Automatically runs migration from old layout if needed.
+// Automatically runs migration from old layout if needed, then opens SQLite.
+// If sessions.json exists and state.db is empty, auto-migrates data.
 func NewStorageWithProfile(profile string) (*Storage, error) {
-	// Run migration if needed (safe to call multiple times)
+	// Run profile layout migration if needed (safe to call multiple times)
 	needsMigration, err := NeedsMigration()
 	if err != nil {
-		log.Printf("Warning: failed to check migration status: %v", err)
+		storageLog.Warn("migration_check_failed", slog.String("error", err.Error()))
 	} else if needsMigration {
 		result, err := MigrateToProfiles()
 		if err != nil {
 			return nil, fmt.Errorf("migration failed: %w", err)
 		}
 		if result.Migrated {
-			log.Printf("Migration: %s", result.Message)
+			storageLog.Info("migration_complete", slog.String("message", result.Message))
 		}
 	}
 
 	// Get effective profile
 	effectiveProfile := GetEffectiveProfile(profile)
 
-	// Get storage path for this profile
-	path, err := GetStoragePathForProfile(effectiveProfile)
+	// Get profile directory
+	profileDir, err := GetProfileDir(effectiveProfile)
 	if err != nil {
 		return nil, err
 	}
 
 	// Ensure directory exists with secure permissions (0700 = owner only)
-	// This protects session data on shared systems
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create storage directory: %w", err)
 	}
 
-	s := &Storage{
-		path:    path,
-		profile: effectiveProfile,
+	// Open SQLite database
+	dbPath := filepath.Join(profileDir, "state.db")
+	db, err := statedb.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open state database: %w", err)
 	}
 
-	// Clean up any leftover temp files from previous crashes
-	s.cleanupTempFiles()
+	// Create tables if they don't exist.
+	// Retry transient lock contention because daemon/background writers may hold
+	// short-lived transactions during startup.
+	if err := migrateStateDBWithRetry(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate state database: %w", err)
+	}
 
-	return s, nil
+	// Auto-migrate from sessions.json if state.db is empty
+	jsonPath := filepath.Join(profileDir, "sessions.json")
+	if _, jsonErr := os.Stat(jsonPath); jsonErr == nil {
+		empty, emptyErr := db.IsEmpty()
+		if emptyErr == nil && empty {
+			nInst, nGroups, migrateErr := statedb.MigrateFromJSON(jsonPath, db)
+			if migrateErr != nil {
+				storageLog.Warn("json_migration_failed", slog.String("error", migrateErr.Error()))
+				// Continue with empty database rather than failing completely
+			} else {
+				storageLog.Info("migrated_from_json",
+					slog.Int("instances", nInst),
+					slog.Int("groups", nGroups))
+				// Rename sessions.json to sessions.json.migrated as safety backup
+				migratedPath := jsonPath + ".migrated"
+				if renameErr := os.Rename(jsonPath, migratedPath); renameErr != nil {
+					storageLog.Warn("json_rename_failed", slog.String("error", renameErr.Error()))
+				}
+			}
+		}
+	}
+
+	return &Storage{
+		db:      db,
+		dbPath:  dbPath,
+		profile: effectiveProfile,
+	}, nil
 }
 
 // Profile returns the profile name this storage is using
@@ -154,291 +199,484 @@ func (s *Storage) Profile() string {
 	return s.profile
 }
 
-// Path returns the file path this storage is using
+// Path returns the database path this storage is using
 func (s *Storage) Path() string {
-	return s.path
+	return s.dbPath
 }
 
-// cleanupTempFiles removes any leftover .tmp files from previous crashes
-func (s *Storage) cleanupTempFiles() {
-	tmpPath := s.path + ".tmp"
-	if _, err := os.Stat(tmpPath); err == nil {
-		if err := os.Remove(tmpPath); err != nil {
-			log.Printf("Warning: failed to clean up temp file %s: %v", tmpPath, err)
-		} else {
-			log.Printf("Cleaned up leftover temp file from previous session")
-		}
+// GetDB returns the underlying StateDB for direct access (status writes, heartbeat, etc.)
+func (s *Storage) GetDB() *statedb.StateDB {
+	return s.db
+}
+
+// Close closes the underlying database connection.
+func (s *Storage) Close() error {
+	if s.db != nil {
+		return s.db.Close()
 	}
+	return nil
 }
 
-// Save persists instances to JSON file
+func migrateStateDBWithRetry(db *statedb.StateDB) error {
+	var lastErr error
+	for attempt := 0; attempt < 6; attempt++ {
+		if err := db.Migrate(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if !isSQLiteBusyError(err) {
+				return err
+			}
+		}
+		time.Sleep(time.Duration(100*(attempt+1)) * time.Millisecond)
+	}
+	return lastErr
+}
+
+func isSQLiteBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "database is locked")
+}
+
+// Save persists instances to SQLite
 // DEPRECATED: Use SaveWithGroups to ensure groups are not lost
 func (s *Storage) Save(instances []*Instance) error {
 	return s.SaveWithGroups(instances, nil)
 }
 
-// SaveWithGroups persists instances and groups to JSON file
-// Uses atomic write pattern with:
-// - Mutex for thread safety
-// - Rolling backups (3 generations)
-// - fsync for durability
-// - Data validation
+// SaveWithGroups persists instances and groups to SQLite.
+// Converts Instance objects to database rows, then batch-inserts in a transaction.
 func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Convert instances to serializable format
-	data := StorageData{
-		Instances: make([]*InstanceData, len(instances)),
-		UpdatedAt: time.Now(),
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
 	}
 
+	// Enforce one Claude conversation owner across persisted sessions.
+	// This protects CLI-only flows as well (the TUI already applies this in-memory).
+	UpdateClaudeSessionsWithDedup(instances)
+
+	// Convert instances to database rows
+	rows := make([]*statedb.InstanceRow, len(instances))
 	for i, inst := range instances {
 		tmuxName := ""
 		if inst.tmuxSession != nil {
 			tmuxName = inst.tmuxSession.Name
 		}
-		data.Instances[i] = &InstanceData{
-			ID:               inst.ID,
-			Title:            inst.Title,
-			ProjectPath:      inst.ProjectPath,
-			GroupPath:        inst.GroupPath,
-			ParentSessionID:  inst.ParentSessionID,
-			Command:          inst.Command,
-			Tool:             inst.Tool,
-			Status:           inst.Status,
-			CreatedAt:        inst.CreatedAt,
-			LastAccessedAt:   inst.LastAccessedAt,
-			TmuxSession:      tmuxName,
-			ClaudeSessionID:  inst.ClaudeSessionID,
-			ClaudeDetectedAt: inst.ClaudeDetectedAt,
-			GeminiSessionID:  inst.GeminiSessionID,
-			GeminiDetectedAt: inst.GeminiDetectedAt,
-			LoadedMCPNames:   inst.LoadedMCPNames,
+		var sandboxJSON json.RawMessage
+		if inst.Sandbox != nil {
+			data, err := json.Marshal(inst.Sandbox)
+			if err != nil {
+				return fmt.Errorf("failed to marshal sandbox for %s: %w", inst.ID, err)
+			}
+			sandboxJSON = data
 		}
+
+		var mrWorktrees []statedb.MultiRepoWorktreeData
+		for _, wt := range inst.MultiRepoWorktrees {
+			mrWorktrees = append(mrWorktrees, statedb.MultiRepoWorktreeData{
+				OriginalPath: wt.OriginalPath,
+				WorktreePath: wt.WorktreePath,
+				RepoRoot:     wt.RepoRoot,
+				Branch:       wt.Branch,
+			})
+		}
+		toolData := statedb.MarshalToolData(
+			inst.ClaudeSessionID, inst.ClaudeDetectedAt,
+			inst.GeminiSessionID, inst.GeminiDetectedAt,
+			inst.GeminiYoloMode, inst.GeminiModel,
+			inst.OpenCodeSessionID, inst.OpenCodeDetectedAt,
+			inst.CodexSessionID, inst.CodexDetectedAt,
+			inst.LatestPrompt, inst.Notes, inst.LoadedMCPNames,
+			inst.ToolOptionsJSON,
+			sandboxJSON, inst.SandboxContainer,
+			inst.SSHHost, inst.SSHRemotePath,
+			inst.MultiRepoEnabled, inst.AdditionalPaths,
+			inst.MultiRepoTempDir, mrWorktrees,
+		)
+
+		rows[i] = &statedb.InstanceRow{
+			ID:              inst.ID,
+			Title:           inst.Title,
+			ProjectPath:     inst.ProjectPath,
+			GroupPath:       inst.GroupPath,
+			Order:           inst.Order,
+			Command:         inst.Command,
+			Wrapper:         inst.Wrapper,
+			Tool:            inst.Tool,
+			Status:          string(inst.Status),
+			TmuxSession:     tmuxName,
+			CreatedAt:       inst.CreatedAt,
+			LastAccessed:    inst.LastAccessedAt,
+			ParentSessionID: inst.ParentSessionID,
+			WorktreePath:    inst.WorktreePath,
+			WorktreeRepo:    inst.WorktreeRepoRoot,
+			WorktreeBranch:  inst.WorktreeBranch,
+			ToolData:        toolData,
+		}
+	}
+
+	if err := s.db.SaveInstances(rows); err != nil {
+		return fmt.Errorf("failed to save instances: %w", err)
 	}
 
 	// Save groups (including empty ones)
 	if groupTree != nil {
-		data.Groups = make([]*GroupData, 0, len(groupTree.GroupList))
+		groupRows := make([]*statedb.GroupRow, 0, len(groupTree.GroupList))
 		for _, g := range groupTree.GroupList {
-			data.Groups = append(data.Groups, &GroupData{
-				Name:     g.Name,
-				Path:     g.Path,
-				Expanded: g.Expanded,
-				Order:    g.Order,
+			groupRows = append(groupRows, &statedb.GroupRow{
+				Path:        g.Path,
+				Name:        g.Name,
+				Expanded:    g.Expanded,
+				Order:       g.Order,
+				DefaultPath: g.DefaultPath,
 			})
 		}
+		if err := s.db.SaveGroups(groupRows); err != nil {
+			return fmt.Errorf("failed to save groups: %w", err)
+		}
 	}
 
-	// Validate data before saving
-	if err := validateStorageData(&data); err != nil {
-		return fmt.Errorf("data validation failed: %w", err)
+	// Touch metadata for change detection by other instances
+	_ = s.db.Touch()
+
+	return nil
+}
+
+// DeleteInstance removes a single instance from the database by ID.
+// This ensures the row is immediately removed, preventing resurrection on reload.
+func (s *Storage) DeleteInstance(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
 	}
 
-	// Marshal to JSON
-	jsonData, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
+	if err := s.db.DeleteInstance(id); err != nil {
+		return fmt.Errorf("failed to delete instance %s: %w", id, err)
 	}
 
-	// ═══════════════════════════════════════════════════════════════════
-	// ATOMIC WRITE PATTERN: Prevents data corruption on crash/power loss
-	// 1. Write to temporary file
-	// 2. fsync the temp file (ensures data reaches disk)
-	// 3. Rotate backups (rolling 3 generations)
-	// 4. Atomic rename temp to final
-	// ═══════════════════════════════════════════════════════════════════
+	_ = s.db.Touch()
+	return nil
+}
 
-	tmpPath := s.path + ".tmp"
+// SaveGroupsOnly persists only the groups table to SQLite.
+// This is a lightweight save for visual state like group expanded/collapsed.
+// It does NOT call Touch() to avoid triggering StorageWatcher reloads on other instances.
+func (s *Storage) SaveGroupsOnly(groupTree *GroupTree) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	// Step 1: Write to temporary file (0600 = owner read/write only for security)
-	if err := os.WriteFile(tmpPath, jsonData, 0600); err != nil {
-		return fmt.Errorf("failed to write temp file: %w", err)
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
 	}
 
-	// Step 2: fsync the temp file to ensure data reaches disk before rename
-	// This is critical for crash safety - without fsync, data could be lost
-	if err := syncFile(tmpPath); err != nil {
-		// Log but don't fail - atomic rename still provides some safety
-		log.Printf("Warning: fsync failed for %s: %v", tmpPath, err)
+	if groupTree == nil {
+		return nil
 	}
 
-	// Step 3: Rotate backups before overwriting
-	if _, err := os.Stat(s.path); err == nil {
-		s.rotateBackups()
+	groupRows := make([]*statedb.GroupRow, 0, len(groupTree.GroupList))
+	for _, g := range groupTree.GroupList {
+		groupRows = append(groupRows, &statedb.GroupRow{
+			Path:        g.Path,
+			Name:        g.Name,
+			Expanded:    g.Expanded,
+			Order:       g.Order,
+			DefaultPath: g.DefaultPath,
+		})
 	}
 
-	// Step 4: Atomic rename (this is atomic on POSIX systems)
-	if err := os.Rename(tmpPath, s.path); err != nil {
-		return fmt.Errorf("failed to finalize save: %w", err)
+	if err := s.db.SaveGroups(groupRows); err != nil {
+		return fmt.Errorf("failed to save groups: %w", err)
 	}
 
 	return nil
 }
 
-// validateStorageData checks data integrity before saving
-func validateStorageData(data *StorageData) error {
-	if data == nil {
-		return fmt.Errorf("data is nil")
-	}
-
-	// Check for duplicate session IDs
-	seenIDs := make(map[string]bool)
-	for _, inst := range data.Instances {
-		if inst.ID == "" {
-			return fmt.Errorf("instance has empty ID")
-		}
-		if seenIDs[inst.ID] {
-			return fmt.Errorf("duplicate instance ID: %s", inst.ID)
-		}
-		seenIDs[inst.ID] = true
-	}
-
-	// Check for duplicate group paths
-	seenPaths := make(map[string]bool)
-	for _, g := range data.Groups {
-		if g.Path == "" {
-			return fmt.Errorf("group has empty path")
-		}
-		if seenPaths[g.Path] {
-			return fmt.Errorf("duplicate group path: %s", g.Path)
-		}
-		seenPaths[g.Path] = true
-	}
-
-	return nil
-}
-
-// syncFile calls fsync on a file to ensure data is written to disk
-func syncFile(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
-}
-
-// rotateBackups maintains rolling backups: .bak, .bak.1, .bak.2
-func (s *Storage) rotateBackups() {
-	bakPath := s.path + ".bak"
-
-	// Shift existing backups: .bak.2 <- .bak.1 <- .bak <- current
-	for i := maxBackupGenerations - 1; i > 0; i-- {
-		oldPath := fmt.Sprintf("%s.%d", bakPath, i-1)
-		if i == 1 {
-			oldPath = bakPath
-		}
-		newPath := fmt.Sprintf("%s.%d", bakPath, i)
-
-		// Remove the oldest backup to make room
-		if i == maxBackupGenerations-1 {
-			os.Remove(newPath)
-		}
-
-		// Rename to shift
-		if _, err := os.Stat(oldPath); err == nil {
-			if err := os.Rename(oldPath, newPath); err != nil {
-				log.Printf("Warning: failed to rotate backup %s -> %s: %v", oldPath, newPath, err)
-			}
-		}
-	}
-
-	// Copy current file to .bak
-	if err := copyFile(s.path, bakPath); err != nil {
-		log.Printf("Warning: failed to create backup file %s: %v", bakPath, err)
-	}
-}
-
-// copyFile copies a file from src to dst (0600 = owner read/write only for security)
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, 0600)
-}
-
-// Load reads instances from JSON file
+// Load reads instances from SQLite
 func (s *Storage) Load() ([]*Instance, error) {
 	instances, _, err := s.LoadWithGroups()
 	return instances, err
 }
 
-// LoadWithGroups reads instances and groups from JSON file
-// Automatically recovers from backup if main file is corrupted
+// LoadLite reads session data from SQLite without tmux reconnection.
+// This is a fast path for operations that only need to read session metadata
+// (e.g., finding current session by tmux name) without initializing full Instance objects.
+// Returns raw InstanceData and GroupData without any subprocess calls.
+func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return []*InstanceData{}, nil, nil
+	}
+
+	// Load from SQLite
+	dbRows, err := s.db.LoadInstances()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load instances: %w", err)
+	}
+
+	dbGroups, err := s.db.LoadGroups()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load groups: %w", err)
+	}
+
+	// Convert to InstanceData format (for backward compat with CLI commands)
+	instances := make([]*InstanceData, len(dbRows))
+	for i, r := range dbRows {
+		claudeSID, claudeAt,
+			geminiSID, geminiAt,
+			geminiYolo, geminiModel,
+			opencodeSID, opencodeAt,
+			codexSID, codexAt,
+			latestPrompt, notes, loadedMCPs,
+			toolOpts,
+			sandboxJSON, sandboxContainer,
+			sshHost2, sshRemotePath2,
+			mrEnabled2, addPaths2,
+			mrTempDir2, mrWorktrees2 := statedb.UnmarshalToolData(r.ToolData)
+		sandboxCfg := decodeSandboxConfig(sandboxJSON)
+
+		instances[i] = &InstanceData{
+			ID:                 r.ID,
+			Title:              r.Title,
+			ProjectPath:        r.ProjectPath,
+			GroupPath:          r.GroupPath,
+			Order:              r.Order,
+			ParentSessionID:    r.ParentSessionID,
+			Command:            r.Command,
+			Wrapper:            r.Wrapper,
+			Tool:               r.Tool,
+			Status:             Status(r.Status),
+			CreatedAt:          r.CreatedAt,
+			LastAccessedAt:     r.LastAccessed,
+			TmuxSession:        r.TmuxSession,
+			WorktreePath:       r.WorktreePath,
+			WorktreeRepoRoot:   r.WorktreeRepo,
+			WorktreeBranch:     r.WorktreeBranch,
+			ClaudeSessionID:    claudeSID,
+			ClaudeDetectedAt:   claudeAt,
+			GeminiSessionID:    geminiSID,
+			GeminiDetectedAt:   geminiAt,
+			GeminiYoloMode:     geminiYolo,
+			GeminiModel:        geminiModel,
+			OpenCodeSessionID:  opencodeSID,
+			OpenCodeDetectedAt: opencodeAt,
+			CodexSessionID:     codexSID,
+			CodexDetectedAt:    codexAt,
+			LatestPrompt:       latestPrompt,
+			Notes:              notes,
+			ToolOptionsJSON:    toolOpts,
+			LoadedMCPNames:     loadedMCPs,
+			Sandbox:            sandboxCfg,
+			SandboxContainer:   sandboxContainer,
+			SSHHost:            sshHost2,
+			SSHRemotePath:      sshRemotePath2,
+			MultiRepoEnabled:   mrEnabled2,
+			AdditionalPaths:    addPaths2,
+			MultiRepoTempDir:   mrTempDir2,
+			MultiRepoWorktrees: mrWorktrees2,
+		}
+	}
+
+	// Convert groups
+	groups := make([]*GroupData, len(dbGroups))
+	for i, g := range dbGroups {
+		groups[i] = &GroupData{
+			Path:        g.Path,
+			Name:        g.Name,
+			Expanded:    g.Expanded,
+			Order:       g.Order,
+			DefaultPath: g.DefaultPath,
+		}
+	}
+
+	return instances, groups, nil
+}
+
+// LoadWithGroups reads instances and groups from SQLite, reconnects tmux sessions.
 func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if file exists
-	if _, err := os.Stat(s.path); os.IsNotExist(err) {
-		log.Printf("[STORAGE-DEBUG] LoadWithGroups: file does not exist (profile=%s, path=%s), returning empty instances", s.profile, s.path)
+	if s.db == nil {
+		storageLog.Debug("load_db_not_initialized", slog.String("profile", s.profile))
 		return []*Instance{}, nil, nil
 	}
 
-	// Try to load from main file first
-	data, err := s.loadFromFile(s.path)
+	// Load from SQLite
+	dbRows, err := s.db.LoadInstances()
 	if err != nil {
-		// Main file is corrupted - try to recover from backups
-		log.Printf("Warning: main storage file corrupted (%v), attempting recovery from backup", err)
-		data, err = s.recoverFromBackups()
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to load and no valid backup found: %w", err)
-		}
-		log.Printf("Successfully recovered from backup")
+		return nil, nil, fmt.Errorf("failed to load instances: %w", err)
+	}
 
-		// Save the recovered data back to main file
-		// (this will create a new backup of the corrupted file first)
-		// Note: We don't call SaveWithGroups here to avoid deadlock (we hold the mutex)
-		// Instead, we'll just write directly
+	dbGroups, err := s.db.LoadGroups()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load groups: %w", err)
+	}
+
+	// Convert to InstanceData for the existing convertToInstances pipeline
+	data := &StorageData{
+		Instances: make([]*InstanceData, len(dbRows)),
+	}
+	for i, r := range dbRows {
+		claudeSID, claudeAt,
+			geminiSID, geminiAt,
+			geminiYolo, geminiModel,
+			opencodeSID, opencodeAt,
+			codexSID, codexAt,
+			latestPrompt, notes, loadedMCPs,
+			toolOpts,
+			sandboxJSON, sandboxContainer,
+			sshHost, sshRemotePath,
+			mrEnabled, addPaths,
+			mrTempDir, mrWorktrees := statedb.UnmarshalToolData(r.ToolData)
+		sandboxCfg := decodeSandboxConfig(sandboxJSON)
+
+		data.Instances[i] = &InstanceData{
+			ID:                 r.ID,
+			Title:              r.Title,
+			ProjectPath:        r.ProjectPath,
+			GroupPath:          r.GroupPath,
+			Order:              r.Order,
+			ParentSessionID:    r.ParentSessionID,
+			Command:            r.Command,
+			Wrapper:            r.Wrapper,
+			Tool:               r.Tool,
+			Status:             Status(r.Status),
+			CreatedAt:          r.CreatedAt,
+			LastAccessedAt:     r.LastAccessed,
+			TmuxSession:        r.TmuxSession,
+			WorktreePath:       r.WorktreePath,
+			WorktreeRepoRoot:   r.WorktreeRepo,
+			WorktreeBranch:     r.WorktreeBranch,
+			ClaudeSessionID:    claudeSID,
+			ClaudeDetectedAt:   claudeAt,
+			GeminiSessionID:    geminiSID,
+			GeminiDetectedAt:   geminiAt,
+			GeminiYoloMode:     geminiYolo,
+			GeminiModel:        geminiModel,
+			OpenCodeSessionID:  opencodeSID,
+			OpenCodeDetectedAt: opencodeAt,
+			CodexSessionID:     codexSID,
+			CodexDetectedAt:    codexAt,
+			LatestPrompt:       latestPrompt,
+			Notes:              notes,
+			ToolOptionsJSON:    toolOpts,
+			LoadedMCPNames:     loadedMCPs,
+			Sandbox:            sandboxCfg,
+			SandboxContainer:   sandboxContainer,
+			SSHHost:            sshHost,
+			SSHRemotePath:      sshRemotePath,
+			MultiRepoEnabled:   mrEnabled,
+			AdditionalPaths:    addPaths,
+			MultiRepoTempDir:   mrTempDir,
+			MultiRepoWorktrees: mrWorktrees,
+		}
+	}
+
+	// Convert groups
+	data.Groups = make([]*GroupData, len(dbGroups))
+	for i, g := range dbGroups {
+		data.Groups[i] = &GroupData{
+			Path:        g.Path,
+			Name:        g.Name,
+			Expanded:    g.Expanded,
+			Order:       g.Order,
+			DefaultPath: g.DefaultPath,
+		}
 	}
 
 	return s.convertToInstances(data)
 }
 
-// loadFromFile reads and parses a storage file
-func (s *Storage) loadFromFile(path string) (*StorageData, error) {
-	jsonData, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+// SaveRecentSession captures a deleted session's config for quick re-creation.
+func (s *Storage) SaveRecentSession(inst *Instance) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
 	}
 
-	var data StorageData
-	if err := json.Unmarshal(jsonData, &data); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	row := &statedb.RecentSessionRow{
+		Title:          inst.Title,
+		ProjectPath:    inst.ProjectPath,
+		GroupPath:      inst.GroupPath,
+		Command:        inst.Command,
+		Wrapper:        inst.Wrapper,
+		Tool:           inst.Tool,
+		ToolOptions:    inst.ToolOptionsJSON,
+		SandboxEnabled: inst.Sandbox != nil,
+		GeminiYoloMode: inst.GeminiYoloMode,
 	}
 
-	return &data, nil
+	return s.db.SaveRecentSession(row)
 }
 
-// recoverFromBackups tries to load data from backup files in order
-func (s *Storage) recoverFromBackups() (*StorageData, error) {
-	bakPath := s.path + ".bak"
+// LoadRecentSessions returns recently deleted session configs for the picker.
+func (s *Storage) LoadRecentSessions() ([]*statedb.RecentSessionRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	// Try backups in order: .bak, .bak.1, .bak.2
-	backupPaths := []string{bakPath}
-	for i := 1; i < maxBackupGenerations; i++ {
-		backupPaths = append(backupPaths, fmt.Sprintf("%s.%d", bakPath, i))
+	if s.db == nil {
+		return nil, fmt.Errorf("storage database not initialized")
 	}
 
-	for _, tryPath := range backupPaths {
-		if _, err := os.Stat(tryPath); os.IsNotExist(err) {
-			continue
-		}
+	return s.db.LoadRecentSessions()
+}
 
-		data, err := s.loadFromFile(tryPath)
-		if err != nil {
-			log.Printf("Backup %s also corrupted: %v", tryPath, err)
-			continue
-		}
-
-		log.Printf("Recovered data from backup: %s", tryPath)
-		return data, nil
+// GetDBPathForProfile returns the path to the state.db file for a specific profile.
+func GetDBPathForProfile(profile string) (string, error) {
+	if profile == "" {
+		profile = DefaultProfile
 	}
 
-	return nil, fmt.Errorf("all backups corrupted or missing")
+	profileDir, err := GetProfileDir(profile)
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(profileDir, "state.db"), nil
+}
+
+// GetUpdatedAt returns the last modification timestamp from SQLite metadata.
+func (s *Storage) GetUpdatedAt() (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return time.Time{}, fmt.Errorf("database not initialized")
+	}
+
+	ts, err := s.db.LastModified()
+	if err != nil {
+		return time.Time{}, err
+	}
+	if ts == 0 {
+		return time.Time{}, nil
+	}
+	return time.Unix(0, ts), nil
+}
+
+// GetFileMtime returns the filesystem modification time of the database file.
+// This is useful for detecting external changes when polling.
+func (s *Storage) GetFileMtime() (time.Time, error) {
+	info, err := os.Stat(s.dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
 }
 
 // convertToInstances converts StorageData to Instance slice
@@ -455,7 +693,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		if g.Path == DefaultGroupName {
 			data.Groups[i].Path = DefaultGroupPath
 			migratedGroups = true
-			log.Printf("Migration: Converted group path '%s' -> '%s'", DefaultGroupName, DefaultGroupPath)
+			storageLog.Info("group_path_migrated", slog.String("old_path", DefaultGroupName), slog.String("new_path", DefaultGroupPath))
 		}
 	}
 	for i, inst := range data.Instances {
@@ -465,32 +703,33 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		}
 	}
 	if migratedGroups {
-		log.Printf("Migration: Updated default group paths from '%s' to '%s'", DefaultGroupName, DefaultGroupPath)
+		storageLog.Info("default_group_paths_migrated", slog.String("old_name", DefaultGroupName), slog.String("new_path", DefaultGroupPath))
 	}
 
 	// Convert to instances
 	instances := make([]*Instance, len(data.Instances))
 	for i, instData := range data.Instances {
-		// Recreate tmux session object from stored name
-		// Use ReconnectSessionWithStatus to restore the exact status state
+		// PERFORMANCE: Use lazy reconnect to defer tmux configuration until first attach
+		// This reduces TUI startup from ~6s to ~2s by avoiding subprocess overhead.
+		// Configuration (EnableMouseMode, ConfigureStatusBar) runs
+		// on-demand via EnsureConfigured() when user interacts with the session.
 		var tmuxSess *tmux.Session
 		if instData.TmuxSession != "" {
 			// Convert Status enum to string for tmux package
 			// This restores the exact status across app restarts
 			previousStatus := statusToString(instData.Status)
-			tmuxSess = tmux.ReconnectSessionWithStatus(
+			tmuxSess = tmux.ReconnectSessionLazy(
 				instData.TmuxSession,
 				instData.Title,
 				instData.ProjectPath,
 				instData.Command,
 				previousStatus,
 			)
-			// Enable mouse mode for proper scrolling (only if session still exists)
-			// Sessions may no longer exist after tmux server restart
-			if tmuxSess.Exists() {
-				// Ignore errors - non-fatal, older tmux versions may not support all options
-				_ = tmuxSess.EnableMouseMode()
-			}
+			// Pass instance ID for activity hooks (enables real-time status updates)
+			tmuxSess.InstanceID = instData.ID
+			tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
+			// Note: EnableMouseMode and ConfigureStatusBar are deferred to EnsureConfigured()
+			// Called automatically when user attaches to session
 		}
 
 		// Migrate old sessions without GroupPath
@@ -500,78 +739,77 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		}
 
 		// Expand tilde in project path (handles paths like ~/project saved from UI)
-		projectPath := expandTilde(instData.ProjectPath)
+		// fixMalformedTildePath handles the case where the textinput suggestion
+		// appended instead of replacing, producing "/some/path~/actual/path".
+		projectPath := ExpandPath(fixMalformedTildePath(instData.ProjectPath))
 
 		inst := &Instance{
-			ID:               instData.ID,
-			Title:            instData.Title,
-			ProjectPath:      projectPath,
-			GroupPath:        groupPath,
-			ParentSessionID:  instData.ParentSessionID,
-			Command:          instData.Command,
-			Tool:             instData.Tool,
-			Status:           instData.Status,
-			CreatedAt:        instData.CreatedAt,
-			LastAccessedAt:   instData.LastAccessedAt,
-			ClaudeSessionID:  instData.ClaudeSessionID,
-			ClaudeDetectedAt: instData.ClaudeDetectedAt,
-			GeminiSessionID:  instData.GeminiSessionID,
-			GeminiDetectedAt: instData.GeminiDetectedAt,
-			LoadedMCPNames:   instData.LoadedMCPNames,
-			tmuxSession:      tmuxSess,
+			ID:                 instData.ID,
+			Title:              instData.Title,
+			ProjectPath:        projectPath,
+			GroupPath:          groupPath,
+			Order:              instData.Order,
+			ParentSessionID:    instData.ParentSessionID,
+			Command:            instData.Command,
+			Wrapper:            instData.Wrapper,
+			Tool:               instData.Tool,
+			Status:             instData.Status,
+			CreatedAt:          instData.CreatedAt,
+			LastAccessedAt:     instData.LastAccessedAt,
+			WorktreePath:       instData.WorktreePath,
+			WorktreeRepoRoot:   instData.WorktreeRepoRoot,
+			WorktreeBranch:     instData.WorktreeBranch,
+			ClaudeSessionID:    instData.ClaudeSessionID,
+			ClaudeDetectedAt:   instData.ClaudeDetectedAt,
+			GeminiSessionID:    instData.GeminiSessionID,
+			GeminiDetectedAt:   instData.GeminiDetectedAt,
+			GeminiYoloMode:     instData.GeminiYoloMode,
+			GeminiModel:        instData.GeminiModel,
+			OpenCodeSessionID:  instData.OpenCodeSessionID,
+			OpenCodeDetectedAt: instData.OpenCodeDetectedAt,
+			CodexSessionID:     instData.CodexSessionID,
+			CodexDetectedAt:    instData.CodexDetectedAt,
+			ToolOptionsJSON:    instData.ToolOptionsJSON,
+			LatestPrompt:       instData.LatestPrompt,
+			Notes:              instData.Notes,
+			LoadedMCPNames:     instData.LoadedMCPNames,
+			Sandbox:            instData.Sandbox,
+			SandboxContainer:   instData.SandboxContainer,
+			SSHHost:            instData.SSHHost,
+			SSHRemotePath:      instData.SSHRemotePath,
+			MultiRepoEnabled:   instData.MultiRepoEnabled,
+			AdditionalPaths:    instData.AdditionalPaths,
+			MultiRepoTempDir:   instData.MultiRepoTempDir,
+			tmuxSession:        tmuxSess,
+		}
+		// Convert multi-repo worktree data
+		for _, wt := range instData.MultiRepoWorktrees {
+			inst.MultiRepoWorktrees = append(inst.MultiRepoWorktrees, MultiRepoWorktree{
+				OriginalPath: wt.OriginalPath,
+				WorktreePath: wt.WorktreePath,
+				RepoRoot:     wt.RepoRoot,
+				Branch:       wt.Branch,
+			})
 		}
 
-		// Update status immediately to prevent flickering on startup
-		// Without this, UI renders saved status, then first tick changes it
+		// Set tmux option overrides so EnsureConfigured/ConfigureStatusBar
+		// respects user-defined keys (e.g. status = "2" for multi-line bar).
 		if tmuxSess != nil {
-			_ = inst.UpdateStatus()
+			tmuxSess.OptionOverrides = inst.buildTmuxOptionOverrides()
 		}
+
+		// PERFORMANCE: Skip UpdateStatus at load time - use cached status from SQLite
+		// The background worker will update status on first tick.
+		// This saves one subprocess call per session at startup.
+
+		// PERFORMANCE: Skip session ID sync at load time
+		// Session ID syncing (SetEnvironment calls) will happen on EnsureConfigured()
+		// or when the session is restarted. This saves 0-4 subprocess calls per session.
 
 		instances[i] = inst
 	}
 
 	return instances, data.Groups, nil
-}
-
-// GetStoragePath returns the path to the sessions.json file for the default profile.
-// DEPRECATED: Use GetStoragePathForProfile for explicit profile support.
-func GetStoragePath() (string, error) {
-	return GetStoragePathForProfile(DefaultProfile)
-}
-
-// GetStoragePathForProfile returns the path to the sessions.json file for a specific profile.
-func GetStoragePathForProfile(profile string) (string, error) {
-	if profile == "" {
-		profile = DefaultProfile
-	}
-
-	profileDir, err := GetProfileDir(profile)
-	if err != nil {
-		return "", err
-	}
-
-	return filepath.Join(profileDir, "sessions.json"), nil
-}
-
-// GetUpdatedAt returns the last modification timestamp of the storage file
-// This is read from the UpdatedAt field in the JSON file.
-// Returns an error if the file doesn't exist or can't be read.
-func (s *Storage) GetUpdatedAt() (time.Time, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Check if file exists
-	if _, err := os.Stat(s.path); os.IsNotExist(err) {
-		return time.Time{}, err
-	}
-
-	// Load and parse the file
-	data, err := s.loadFromFile(s.path)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to load storage file: %w", err)
-	}
-
-	return data.UpdatedAt, nil
 }
 
 // statusToString converts a Status enum to the string expected by tmux.ReconnectSessionWithStatus
@@ -585,7 +823,21 @@ func statusToString(s Status) string {
 		return "idle"
 	case StatusError:
 		return "waiting" // Treat errors as needing attention
+	case StatusStopped:
+		return "inactive" // Stopped sessions are intentionally inactive
 	default:
 		return "waiting"
 	}
+}
+
+func decodeSandboxConfig(data json.RawMessage) *SandboxConfig {
+	if len(data) == 0 {
+		return nil
+	}
+
+	var cfg SandboxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil
+	}
+	return &cfg
 }

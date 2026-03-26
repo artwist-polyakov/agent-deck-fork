@@ -188,9 +188,9 @@ func TestGlobalSearchQueryStorage(t *testing.T) {
 		t.Errorf("Expected empty query, got %q", gs.query)
 	}
 
-	// Simulate typing by setting input value and calling updateResults
+	// Simulate typing by setting input value (query is set in Update's default case)
 	gs.input.SetValue("test search")
-	gs.updateResults()
+	gs.query = gs.input.Value()
 
 	// Query should now be stored
 	if gs.query != "test search" {

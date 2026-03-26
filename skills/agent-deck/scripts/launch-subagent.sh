@@ -5,6 +5,8 @@
 #
 # Options:
 #   --mcp <name>     Attach MCP (can repeat)
+#   --tool <type>    Agent tool: claude, codex, gemini (default: claude)
+#   --path <dir>     Working directory for the agent (default: /tmp/<title>)
 #   --wait           Poll until complete, return output
 #   --timeout <sec>  Wait timeout (default: 300)
 #
@@ -12,12 +14,16 @@
 #   launch-subagent.sh "Research" "Find info about X"
 #   launch-subagent.sh "Task" "Do Y" --mcp exa --mcp firecrawl
 #   launch-subagent.sh "Query" "Answer Z" --wait --timeout 120
+#   launch-subagent.sh "Consult" "Review this approach" --tool codex --wait
+#   launch-subagent.sh "Review" "Review the session_cmd.go" --tool codex --path /path/to/project --wait
 
 set -e
 
 # Parse arguments
 TITLE=""
 PROMPT=""
+TOOL="claude"
+WORK_PATH=""
 MCPS=()
 WAIT=false
 TIMEOUT=300
@@ -26,6 +32,14 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --mcp)
             MCPS+=("$2")
+            shift 2
+            ;;
+        --tool)
+            TOOL="$2"
+            shift 2
+            ;;
+        --path)
+            WORK_PATH="$2"
             shift 2
             ;;
         --wait)
@@ -48,7 +62,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$TITLE" ] || [ -z "$PROMPT" ]; then
-    echo "Usage: launch-subagent.sh \"Title\" \"Prompt\" [--mcp name] [--wait]" >&2
+    echo "Usage: launch-subagent.sh \"Title\" \"Prompt\" [--tool codex] [--path /dir] [--mcp name] [--wait]" >&2
     exit 1
 fi
 
@@ -56,52 +70,38 @@ fi
 CURRENT_JSON=$(agent-deck session current --json 2>/dev/null | grep -v '^20')
 PARENT=$(echo "$CURRENT_JSON" | jq -r '.session')
 PROFILE=$(echo "$CURRENT_JSON" | jq -r '.profile')
+PARENT_PATH=$(echo "$CURRENT_JSON" | jq -r '.path')
 
 if [ -z "$PARENT" ] || [ "$PARENT" = "null" ]; then
     echo "Error: Not in an agent-deck session" >&2
     exit 1
 fi
 
-# Create work directory
-SAFE_TITLE=$(echo "$TITLE" | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
-WORK_DIR="/tmp/${SAFE_TITLE}"
+# Determine work directory: --path flag > parent session path > /tmp fallback
+if [ -n "$WORK_PATH" ]; then
+    WORK_DIR="$WORK_PATH"
+elif [ -n "$PARENT_PATH" ] && [ "$PARENT_PATH" != "null" ]; then
+    WORK_DIR="$PARENT_PATH"
+else
+    SAFE_TITLE=$(echo "$TITLE" | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')
+    WORK_DIR="/tmp/${SAFE_TITLE}"
+fi
 mkdir -p "$WORK_DIR"
 
-# Build add command
-ADD_CMD="agent-deck -p $PROFILE add -t \"$TITLE\" --parent \"$PARENT\" -c claude"
+# Launch session and send initial prompt in one command
+LAUNCH_CMD=(agent-deck -p "$PROFILE" launch "$WORK_DIR" -t "$TITLE" --parent "$PARENT" -c "$TOOL" -m "$PROMPT")
 for mcp in "${MCPS[@]}"; do
-    ADD_CMD="$ADD_CMD --mcp $mcp"
+    LAUNCH_CMD+=(--mcp "$mcp")
 done
-ADD_CMD="$ADD_CMD \"$WORK_DIR\""
+"${LAUNCH_CMD[@]}"
 
-# Create and start session
-eval "$ADD_CMD"
-agent-deck -p "$PROFILE" session start "$TITLE"
-
-# Get tmux session name for readiness check
+# Get tmux session name (used for optional --wait fallback capture)
 TMUX_SESSION=$(agent-deck -p "$PROFILE" session show "$TITLE" 2>/dev/null | grep '^Tmux:' | awk '{print $2}')
-
-# Wait for Claude to be ready (check for prompt character in pane)
-# Claude shows ">" or has content when ready
-echo "Waiting for Claude to initialize..."
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    # Check if Claude is showing a prompt (has substantial content)
-    PANE_CONTENT=$(tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null | tail -5)
-
-    # Claude is ready when it shows the project path or prompt
-    if echo "$PANE_CONTENT" | grep -qE "(>|claude|Claude Code|/tmp/)" 2>/dev/null; then
-        sleep 2  # Extra buffer for stability
-        break
-    fi
-    sleep 1
-done
-
-# Send prompt
-agent-deck -p "$PROFILE" session send "$TITLE" "$PROMPT"
 
 echo ""
 echo "Sub-agent launched:"
 echo "  Title:   $TITLE"
+echo "  Tool:    $TOOL"
 echo "  Parent:  $PARENT"
 echo "  Profile: $PROFILE"
 echo "  Path:    $WORK_DIR"
@@ -124,7 +124,10 @@ if [ "$WAIT" = "true" ]; then
             echo "Complete!"
             echo ""
             echo "=== Response ==="
-            agent-deck -p "$PROFILE" session output "$TITLE"
+            # Try native output first, fall back to full scrollback capture
+            if ! agent-deck -p "$PROFILE" session output "$TITLE" 2>/dev/null; then
+                tmux capture-pane -t "$TMUX_SESSION" -p -S - 2>/dev/null
+            fi
             exit 0
         fi
 

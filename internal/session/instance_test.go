@@ -1,19 +1,25 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/docker"
+	"github.com/stretchr/testify/require"
 )
 
 // TestNewSessionStatusFlicker tests for green flicker on new session creation
 // This reproduces the issue where a session briefly shows green before first poll
 func TestNewSessionStatusFlicker(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 
 	// Create a new session with a command (like user would do)
 	inst := NewInstance("test-flicker", "/tmp")
@@ -116,7 +122,7 @@ func TestInstance_Fork(t *testing.T) {
 		t.Error("Fork() should fail without ClaudeSessionID")
 	}
 
-	// With session ID, Fork returns capture-resume command
+	// With session ID, Fork returns uuidgen + --session-id command
 	inst.ClaudeSessionID = "abc-123"
 	inst.ClaudeDetectedAt = time.Now()
 	cmd, err := inst.Fork("forked-test", "")
@@ -124,30 +130,56 @@ func TestInstance_Fork(t *testing.T) {
 		t.Errorf("Fork() failed: %v", err)
 	}
 
-	// Command should use --session-id pattern (avoids capture-resume with "." prompt)
+	// Command should use Go-side UUID + --session-id pattern (no shell uuidgen dependency)
 	// When not explicitly configured, CLAUDE_CONFIG_DIR should NOT be set
 	// (allows shell environment to take precedence)
 	if strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
 		t.Errorf("Fork() should NOT set CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
+	// Must NOT use shell uuidgen (replaced with Go-side generateUUID())
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork() should NOT use shell uuidgen (replaced with Go-side UUID), got: %s", cmd)
+	}
+	// Should NOT use -p "." or jq (old capture-resume pattern)
+	if strings.Contains(cmd, `-p "."`) {
+		t.Errorf("Fork() should NOT use -p \".\" (old pattern), got: %s", cmd)
+	}
+	if strings.Contains(cmd, "jq") {
+		t.Errorf("Fork() should NOT use jq (old pattern), got: %s", cmd)
+	}
+	// Must use --session-id flag with a literal Go-generated UUID
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("Fork() should use --session-id flag, got: %s", cmd)
+	}
+	// Must NOT use shell variable substitution for session ID
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork() should NOT use shell variable for session ID, got: %s", cmd)
+	}
+	// Include --resume with parent ID and --fork-session
 	if !strings.Contains(cmd, "--resume abc-123 --fork-session") {
 		t.Errorf("Fork() should include resume and fork-session flags, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, "uuidgen") {
-		t.Errorf("Fork() should generate UUID with uuidgen, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
-		t.Errorf("Fork() should store session ID in tmux env, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, `--session-id "$session_id"`) {
-		t.Errorf("Fork() should pass session ID to claude CLI, got: %s", cmd)
+	// CLAUDE_SESSION_ID must NOT be embedded in the shell command string;
+	// it is propagated via host-side SetEnvironment after tmux start.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("Fork() should NOT embed tmux set-environment (use host-side SetEnvironment), got: %s", cmd)
 	}
 }
 
 // TestInstance_Fork_ExplicitConfig tests Fork with explicit CLAUDE_CONFIG_DIR
 func TestInstance_Fork_ExplicitConfig(t *testing.T) {
+	// Isolate from user's environment (don't pick up their config.toml)
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+	ClearUserConfigCache()
+
 	os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/test-claude-config")
-	defer os.Unsetenv("CLAUDE_CONFIG_DIR")
+	defer func() {
+		os.Unsetenv("CLAUDE_CONFIG_DIR")
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
 
 	inst := NewInstance("test", "/tmp/test")
 	inst.ClaudeSessionID = "abc-123"
@@ -161,6 +193,38 @@ func TestInstance_Fork_ExplicitConfig(t *testing.T) {
 	// When explicitly configured, CLAUDE_CONFIG_DIR SHOULD be set
 	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=/tmp/test-claude-config") {
 		t.Errorf("Fork() should set CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
+	}
+}
+
+func TestInstance_CreateForkedInstance_ExportsForkedInstanceID(t *testing.T) {
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir())
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
+	inst.ClaudeSessionID = "abc-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	forked, cmd, err := inst.CreateForkedInstance("forked-test", "")
+	if err != nil {
+		t.Fatalf("CreateForkedInstance() failed: %v", err)
+	}
+
+	expectedPrefix := "AGENTDECK_INSTANCE_ID=" + forked.ID
+	if !strings.Contains(cmd, expectedPrefix) {
+		t.Fatalf("Fork command should contain %q, got: %s", expectedPrefix, cmd)
+	}
+	if strings.Contains(cmd, "AGENTDECK_INSTANCE_ID="+inst.ID) {
+		t.Fatalf("Fork command should not export the parent instance ID, got: %s", cmd)
 	}
 }
 
@@ -235,8 +299,18 @@ func TestInstance_CreateForkedInstance(t *testing.T) {
 
 // TestInstance_CreateForkedInstance_ExplicitConfig tests CreateForkedInstance with explicit config
 func TestInstance_CreateForkedInstance_ExplicitConfig(t *testing.T) {
+	// Isolate from user's environment (don't pick up their config.toml)
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+	ClearUserConfigCache()
+
 	os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/test-claude-config")
-	defer os.Unsetenv("CLAUDE_CONFIG_DIR")
+	defer func() {
+		os.Unsetenv("CLAUDE_CONFIG_DIR")
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
 
 	inst := NewInstance("original", "/tmp/test")
 	inst.ClaudeSessionID = "abc-123"
@@ -264,7 +338,10 @@ func TestNewInstanceWithTool(t *testing.T) {
 	// Claude tool should NOT have pre-assigned ID (detection happens later)
 	claudeInst := NewInstanceWithTool("claude-test", "/tmp/test", "claude")
 	if claudeInst.ClaudeSessionID != "" {
-		t.Errorf("Claude session should NOT have pre-assigned ClaudeSessionID (detection-based), got: %s", claudeInst.ClaudeSessionID)
+		t.Errorf(
+			"Claude session should NOT have pre-assigned ClaudeSessionID (detection-based), got: %s",
+			claudeInst.ClaudeSessionID,
+		)
 	}
 	if claudeInst.Tool != "claude" {
 		t.Errorf("Tool = %s, want claude", claudeInst.Tool)
@@ -296,74 +373,276 @@ func TestBuildClaudeCommand(t *testing.T) {
 	// Test with simple "claude" command
 	cmd := inst.buildClaudeCommand("claude")
 
-	// When CLAUDE_CONFIG_DIR is NOT explicitly configured (no env var, no config),
-	// the command should NOT include CLAUDE_CONFIG_DIR - let the shell handle it
-	// This is critical for WSL and other environments where users have
-	// CLAUDE_CONFIG_DIR set in their .bashrc/.zshrc
+	// When CLAUDE_CONFIG_DIR is NOT explicitly configured,
+	// the command should NOT include CLAUDE_CONFIG_DIR
 	if strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
 		t.Errorf("Should NOT contain CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
 
-	// Should use capture-resume pattern: -p "." --output-format json
-	if !strings.Contains(cmd, `-p "."`) {
-		t.Errorf("Should contain -p \".\" for print mode, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Errorf("Should contain --output-format json, got: %s", cmd)
+	// Must NOT use shell uuidgen (replaced with Go-side generateUUID())
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Should NOT use shell uuidgen (replaced with Go-side UUID), got: %s", cmd)
 	}
 
-	// Should store session ID in tmux environment
-	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
-		t.Errorf("Should store session ID in tmux env, got: %s", cmd)
+	// CLAUDE_SESSION_ID must NOT be in the shell command string;
+	// it is propagated via host-side SetEnvironment after tmux start.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("Should NOT embed tmux set-environment (use host-side SetEnvironment), got: %s", cmd)
 	}
 
-	// Should resume the captured session
-	if !strings.Contains(cmd, `--resume "$session_id"`) {
-		t.Errorf("Should resume the captured session ID, got: %s", cmd)
+	// Should use --session-id flag for new sessions with a literal UUID (not $session_id)
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("Should use --session-id flag for new sessions, got: %s", cmd)
+	}
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should NOT use shell variable for session ID, got: %s", cmd)
 	}
 
-	// Should have fallback when capture fails (Issue #19: WSL jq parse error)
-	if !strings.Contains(cmd, `|| session_id=""`) {
-		t.Errorf("Should have fallback when capture fails, got: %s", cmd)
+	// Should NOT use capture-resume pattern anymore
+	if strings.Contains(cmd, `-p "."`) {
+		t.Errorf("Should NOT use -p \".\" capture pattern anymore, got: %s", cmd)
 	}
-	// Should check for null jq output
-	if !strings.Contains(cmd, `!= "null"`) {
-		t.Errorf("Should check for null session_id from jq, got: %s", cmd)
+	if strings.Contains(cmd, "--output-format json") {
+		t.Errorf("Should NOT use --output-format json anymore, got: %s", cmd)
 	}
-	// Should have else branch to start Claude without session
-	if !strings.Contains(cmd, "else claude") {
-		t.Errorf("Should have else branch to start Claude without session, got: %s", cmd)
+	if strings.Contains(cmd, "jq") {
+		t.Errorf("Should NOT use jq anymore, got: %s", cmd)
 	}
 
 	// Note: --dangerously-skip-permissions is conditional on user config (dangerous_mode)
 	// The command should work with or without it depending on config
 
-	// Test with non-claude tool (should not modify)
+	// Test with non-claude tool (inner command should not be modified,
+	// though env prefix like COLORFGBG may be prepended by buildEnvSourceCommand)
 	shellInst := NewInstance("shell-test", "/tmp/test")
 	shellCmd := shellInst.buildClaudeCommand("bash")
-	if shellCmd != "bash" {
-		t.Errorf("Non-claude command should not be modified, got: %s", shellCmd)
+	if !strings.HasSuffix(shellCmd, "bash") {
+		t.Errorf("Non-claude command should end with 'bash', got: %s", shellCmd)
 	}
 }
 
 // TestBuildClaudeCommand_ExplicitConfig tests that CLAUDE_CONFIG_DIR is set when explicitly configured
 func TestBuildClaudeCommand_ExplicitConfig(t *testing.T) {
-	// Set environment variable to explicitly configure
+	// Isolate from user's environment
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir) // Use temp dir so config.toml isn't found
+	ClearUserConfigCache()
+
+	// Set environment variable to explicitly configure CLAUDE_CONFIG_DIR
 	os.Setenv("CLAUDE_CONFIG_DIR", "/tmp/test-claude-config")
-	defer os.Unsetenv("CLAUDE_CONFIG_DIR")
+	defer func() {
+		os.Unsetenv("CLAUDE_CONFIG_DIR")
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
 
 	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
 	cmd := inst.buildClaudeCommand("claude")
 
 	// When CLAUDE_CONFIG_DIR IS explicitly configured via env var,
-	// the command SHOULD include it
+	// the command SHOULD include it (and use default "claude" command)
 	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=/tmp/test-claude-config") {
 		t.Errorf("Should contain CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
+	}
+
+	// Should use --session-id flag with a literal Go-generated UUID
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("Should use --session-id flag with explicit config, got: %s", cmd)
+	}
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should NOT use shell variable for session ID, got: %s", cmd)
+	}
+	// Must NOT use shell uuidgen (replaced with Go-side generateUUID())
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Should NOT use shell uuidgen (replaced with Go-side UUID), got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_CustomAlias(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	// Create ~/.agent-deck/config.toml with custom command
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+command = "cdw"
+config_dir = "~/.claude-work"
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "cdw") {
+		t.Errorf("Should use custom command 'cdw' from config, got: %s", cmd)
+	}
+
+	// Should include CLAUDE_CONFIG_DIR since config_dir is explicitly set
+	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
+		t.Errorf("Should include CLAUDE_CONFIG_DIR for capture-resume commands, got: %s", cmd)
+	}
+
+	// Should use --session-id with a literal Go-generated UUID (not shell variable)
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("Should use --session-id flag for instant start pattern, got: %s", cmd)
+	}
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should NOT use shell variable for session ID, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("happy-claude", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "exec happy --session-id") {
+		t.Errorf("Should launch Claude via happy when use_happy=true, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_CustomAliasWinsOverHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+command = "cdw"
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("alias-claude", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "cdw") {
+		t.Errorf("Should use custom Claude command when configured, got: %s", cmd)
+	}
+	if strings.Contains(cmd, "exec happy") {
+		t.Errorf("Custom Claude command should win over happy, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_PerSessionUseHappyOverride(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("plain-claude", "/tmp/test", "claude")
+	if err := inst.SetClaudeOptions(&ClaudeOptions{SessionMode: "new", UseHappy: false}); err != nil {
+		t.Fatalf("SetClaudeOptions failed: %v", err)
+	}
+
+	cmd := inst.buildClaudeCommand("claude")
+	if strings.Contains(cmd, "exec happy") {
+		t.Errorf("Per-session UseHappy=false should override global config, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "exec claude --session-id") {
+		t.Errorf("Expected plain claude command when per-session UseHappy=false, got: %s", cmd)
+	}
+}
+
+// TestBuildClaudeCommand_SubagentAddDir tests that subagents get --add-dir
+// for access to parent's project directory (for worktrees, etc.)
+func TestBuildClaudeCommand_SubagentAddDir(t *testing.T) {
+	// Isolate from user's environment
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir())
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	// Create a subagent with parent project path
+	inst := NewInstanceWithTool("subagent", "/tmp/subagent-workdir", "claude")
+	inst.SetParentWithPath("parent-id-123", "/home/user/projects/main-project")
+
+	cmd := inst.buildClaudeCommand("claude")
+
+	// Should contain --add-dir with parent's project path
+	if !strings.Contains(cmd, "--add-dir /home/user/projects/main-project") {
+		t.Errorf("Subagent command should contain --add-dir with parent path, got: %s", cmd)
+	}
+
+	// Without parent, should NOT have --add-dir
+	instNoParent := NewInstanceWithTool("standalone", "/tmp/standalone", "claude")
+	cmdNoParent := instNoParent.buildClaudeCommand("claude")
+
+	if strings.Contains(cmdNoParent, "--add-dir") {
+		t.Errorf("Standalone agent should NOT have --add-dir, got: %s", cmdNoParent)
 	}
 }
 
 // TestCreateForkedInstance_SessionIDPattern tests that forked sessions
-// use the --session-id pattern with pre-generated UUID (avoids "." prompt)
+// use pre-generated UUID + --session-id pattern for instant start
 func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 	inst := NewInstance("original", "/tmp/test")
 	inst.ClaudeSessionID = "parent-abc-123"
@@ -374,24 +653,38 @@ func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 		t.Fatalf("CreateForkedInstance() failed: %v", err)
 	}
 
-	// Command SHOULD use --session-id pattern (not capture-resume with ".")
-	if !strings.Contains(cmd, "uuidgen") {
-		t.Errorf("Fork command should generate UUID with uuidgen, got: %s", cmd)
+	// Command should use Go-side UUID + --session-id pattern (no shell uuidgen dependency)
+	// Must NOT use shell uuidgen (replaced with Go-side generateUUID())
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command should NOT use shell uuidgen (replaced with Go-side UUID), got: %s", cmd)
 	}
+	// Should NOT use -p "." or jq (old capture-resume pattern)
+	if strings.Contains(cmd, `-p "."`) {
+		t.Errorf("Fork command should NOT use -p \".\" (old pattern), got: %s", cmd)
+	}
+	if strings.Contains(cmd, "jq") {
+		t.Errorf("Fork command should NOT use jq (old pattern), got: %s", cmd)
+	}
+	// Must use --session-id flag with a literal Go-generated UUID
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("Fork command should use --session-id flag, got: %s", cmd)
+	}
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork command should NOT use shell variable for session ID, got: %s", cmd)
+	}
+	// Include --resume with parent ID and --fork-session
 	if !strings.Contains(cmd, "--resume parent-abc-123 --fork-session") {
 		t.Errorf("Fork command should contain --resume with parent ID and --fork-session, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, "--session-id") {
-		t.Errorf("Fork command should use --session-id to specify UUID, got: %s", cmd)
-	}
-	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
-		t.Errorf("Fork command should store session ID in tmux env, got: %s", cmd)
+	// CLAUDE_SESSION_ID must NOT be embedded in the shell command string;
+	// it is propagated via host-side SetEnvironment after tmux start.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("Fork command should NOT embed tmux set-environment (use host-side SetEnvironment), got: %s", cmd)
 	}
 
-	// Forked instance should have empty ClaudeSessionID initially
-	// (will be populated from tmux env after start)
-	if forked.ClaudeSessionID != "" {
-		t.Errorf("Forked instance should have empty ClaudeSessionID initially, got: %s", forked.ClaudeSessionID)
+	// Forked instance should have its ClaudeSessionID set to the pre-generated UUID.
+	if forked.ClaudeSessionID == "" {
+		t.Errorf("Forked instance should have ClaudeSessionID pre-set by generateUUID()")
 	}
 
 	if forked.Tool != "claude" {
@@ -425,9 +718,7 @@ func TestWaitForClaudeSession(t *testing.T) {
 }
 
 func TestInstance_GetSessionIDFromTmux(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 
 	// Create instance with tmux session
 	inst := NewInstanceWithTool("tmux-env-test", "/tmp", "claude")
@@ -463,9 +754,7 @@ func TestInstance_GetSessionIDFromTmux(t *testing.T) {
 }
 
 func TestInstance_UpdateClaudeSession_TmuxFirst(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 
 	// Create and start instance
 	inst := NewInstanceWithTool("update-test", "/tmp", "claude")
@@ -522,36 +811,382 @@ func TestInstance_UpdateClaudeSession_PreservesExistingID(t *testing.T) {
 	}
 }
 
-// TestInstance_UpdateGeminiSession_PreservesExistingID verifies that existing
-// Gemini session IDs from storage are preserved when tmux env is empty.
-// With the new tmux-only approach, we only update when tmux env has a value.
-func TestInstance_UpdateGeminiSession_PreservesExistingID(t *testing.T) {
+// TestSyncClaudeSessionFromDisk_PicksUpNewerSession verifies that when a newer
+// session file appears on disk (e.g., after /clear), syncClaudeSessionFromDisk
+// updates the instance's ClaudeSessionID.
+func TestSyncClaudeSessionFromDisk_PicksUpNewerSession(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/sync-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldSessionID := "11111111-1111-1111-1111-111111111111"
+	newSessionID := "22222222-2222-2222-2222-222222222222"
+
+	// Both files need real conversation data (contain "sessionId") to pass the quality gate.
+	// This simulates /clear: old session had conversation, new session starts with data too.
+	oldContent := `{"sessionId":"` + oldSessionID + `","type":"progress"}`
+	oldPath := filepath.Join(projectDir, oldSessionID+".jsonl")
+	if err := os.WriteFile(oldPath, []byte(oldContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	pastTime := time.Now().Add(-30 * time.Second)
+	if err := os.Chtimes(oldPath, pastTime, pastTime); err != nil {
+		t.Fatal(err)
+	}
+
+	newContent := `{"sessionId":"` + newSessionID + `","type":"progress"}`
+	if err := os.WriteFile(filepath.Join(projectDir, newSessionID+".jsonl"), []byte(newContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("sync-test", projectPath, "claude")
+	inst.ClaudeSessionID = oldSessionID
+	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != newSessionID {
+		t.Errorf("ClaudeSessionID = %q, want %q (newer session from disk)", inst.ClaudeSessionID, newSessionID)
+	}
+	if inst.ClaudeDetectedAt.IsZero() {
+		t.Error("ClaudeDetectedAt should be set after sync")
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_NoChangeWhenCurrent verifies no update when
+// the current session is already the most recent file on disk.
+func TestSyncClaudeSessionFromDisk_NoChangeWhenCurrent(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/nochange-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	currentID := "33333333-3333-3333-3333-333333333333"
+	if err := os.WriteFile(filepath.Join(projectDir, currentID+".jsonl"), []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	originalDetectedAt := time.Now().Add(-1 * time.Minute)
+	inst := NewInstanceWithTool("nochange-test", projectPath, "claude")
+	inst.ClaudeSessionID = currentID
+	inst.ClaudeDetectedAt = originalDetectedAt
+
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != currentID {
+		t.Errorf("ClaudeSessionID changed to %q, should remain %q", inst.ClaudeSessionID, currentID)
+	}
+	if inst.ClaudeDetectedAt != originalDetectedAt {
+		t.Error("ClaudeDetectedAt should not change when session is already current")
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_IgnoresAgentFiles verifies that agent-*.jsonl files
+// are not picked up as the active session.
+func TestSyncClaudeSessionFromDisk_IgnoresAgentFiles(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/agent-files-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	realSession := "abcd1234-abcd-abcd-abcd-abcdabcdabcd"
+	agentSession := "agent-eeee5555-eeee-eeee-eeee-eeeeeeeeeeee"
+
+	realPath := filepath.Join(projectDir, realSession+".jsonl")
+	if err := os.WriteFile(realPath, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(realPath, time.Now().Add(-10*time.Second), time.Now().Add(-10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	agentPath := filepath.Join(projectDir, agentSession+".jsonl")
+	if err := os.WriteFile(agentPath, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("agent-files-test", projectPath, "claude")
+	inst.ClaudeSessionID = realSession
+	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != realSession {
+		t.Errorf("ClaudeSessionID = %q, want %q (agent files should be ignored)", inst.ClaudeSessionID, realSession)
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_SkipsNonClaude verifies non-claude tools are no-ops.
+func TestSyncClaudeSessionFromDisk_SkipsNonClaude(t *testing.T) {
+	inst := NewInstanceWithTool("shell-test", "/tmp", "shell")
+	inst.ClaudeSessionID = "should-not-change"
+	inst.syncClaudeSessionFromDisk()
+	if inst.ClaudeSessionID != "should-not-change" {
+		t.Error("syncClaudeSessionFromDisk should be a no-op for non-claude tools")
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_RejectsZombie verifies that a real current session
+// is NOT replaced by a zombie candidate (file with no conversation data).
+func TestSyncClaudeSessionFromDisk_RejectsZombie(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/zombie-reject-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	realID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	zombieID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+	// Real session: has conversation data
+	realContent := `{"sessionId":"` + realID + `","type":"progress"}`
+	realPath := filepath.Join(projectDir, realID+".jsonl")
+	if err := os.WriteFile(realPath, []byte(realContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(realPath, time.Now().Add(-30*time.Second), time.Now().Add(-30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Zombie session: newer modification time but no conversation data
+	zombiePath := filepath.Join(projectDir, zombieID+".jsonl")
+	if err := os.WriteFile(zombiePath, []byte(`{"type":"file-history-snapshot"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("zombie-reject-test", projectPath, "claude")
+	inst.ClaudeSessionID = realID
+	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != realID {
+		t.Errorf("ClaudeSessionID = %q, want %q (real session should NOT be replaced by zombie)", inst.ClaudeSessionID, realID)
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_AcceptsRealOverZombie verifies that a zombie current
+// session IS replaced by a real candidate (upgrade from zombie to real).
+func TestSyncClaudeSessionFromDisk_AcceptsRealOverZombie(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/zombie-upgrade-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	zombieID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	realID := "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+	// Zombie current: no conversation data
+	zombiePath := filepath.Join(projectDir, zombieID+".jsonl")
+	if err := os.WriteFile(zombiePath, []byte(`{"type":"file-history-snapshot"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(zombiePath, time.Now().Add(-30*time.Second), time.Now().Add(-30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Real candidate: has conversation data, newer
+	realContent := `{"sessionId":"` + realID + `","type":"progress"}`
+	realPath := filepath.Join(projectDir, realID+".jsonl")
+	if err := os.WriteFile(realPath, []byte(realContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("zombie-upgrade-test", projectPath, "claude")
+	inst.ClaudeSessionID = zombieID
+	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != realID {
+		t.Errorf("ClaudeSessionID = %q, want %q (zombie should be upgraded to real session)", inst.ClaudeSessionID, realID)
+	}
+}
+
+// TestSyncClaudeSessionFromDisk_RejectsBothZombies verifies that when both the
+// current and candidate sessions are zombies, the current is kept (no pointless swap).
+func TestSyncClaudeSessionFromDisk_RejectsBothZombies(t *testing.T) {
+	configDir := t.TempDir()
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		} else {
+			os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+	}()
+
+	projectPath := "/Users/test/both-zombies-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	zombieA := "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+	zombieB := "ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+	// Zombie A (current): no conversation data
+	zombieAPath := filepath.Join(projectDir, zombieA+".jsonl")
+	if err := os.WriteFile(zombieAPath, []byte(`{"type":"file-history-snapshot"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(zombieAPath, time.Now().Add(-30*time.Second), time.Now().Add(-30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Zombie B (candidate): also no conversation data, but newer
+	zombieBPath := filepath.Join(projectDir, zombieB+".jsonl")
+	if err := os.WriteFile(zombieBPath, []byte(`{"type":"file-history-snapshot"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstanceWithTool("both-zombies-test", projectPath, "claude")
+	inst.ClaudeSessionID = zombieA
+	inst.ClaudeDetectedAt = time.Now().Add(-1 * time.Minute)
+
+	inst.syncClaudeSessionFromDisk()
+
+	if inst.ClaudeSessionID != zombieA {
+		t.Errorf("ClaudeSessionID = %q, want %q (should not swap between zombies)", inst.ClaudeSessionID, zombieA)
+	}
+}
+
+// TestInstance_UpdateGeminiSession_UsesLatestFromFilesystem verifies that
+// UpdateGeminiSession ALWAYS scans filesystem for the most recent session,
+// even if we already have a cached session ID.
+// This is the Krudony fix: prevents stale session resume when user starts a NEW session.
+func TestInstance_UpdateGeminiSession_UsesLatestFromFilesystem(t *testing.T) {
+	// Create temp directory and redirect Gemini config
+	tmpDir := t.TempDir()
+	geminiConfigDirOverride = tmpDir
+	defer func() { geminiConfigDirOverride = "" }()
+
+	// Use a stable project path
+	projectPath := "/Users/test/my-project"
+
 	// Create instance with known session ID (simulating loaded from storage)
-	inst := NewInstanceWithTool("preserve-gemini-test", "/tmp", "gemini")
-	existingID := "existing-gemini-id-xyz789"
+	inst := NewInstanceWithTool("latest-gemini-test", projectPath, "gemini")
+	existingID := "old-cached-session-id"
 	inst.GeminiSessionID = existingID
 	oldDetectedAt := time.Now().Add(-10 * time.Minute)
 	inst.GeminiDetectedAt = oldDetectedAt
 
-	// Call UpdateGeminiSession - without tmux session, nothing should change
+	// Call UpdateGeminiSession - no sessions on filesystem, should keep existing
 	inst.UpdateGeminiSession(nil)
 
-	// Existing session ID must be preserved (tmux env is empty, so no change)
+	// With no sessions on filesystem, existing ID is preserved as fallback
 	if inst.GeminiSessionID != existingID {
-		t.Errorf("GeminiSessionID was changed from %q to %q - should preserve stored ID when tmux env is empty",
-			existingID, inst.GeminiSessionID)
+		t.Errorf(
+			"GeminiSessionID should preserve cached ID when no sessions on filesystem, got %q",
+			inst.GeminiSessionID,
+		)
 	}
 
-	// Timestamp should NOT change (no tmux env = no update)
-	if inst.GeminiDetectedAt != oldDetectedAt {
-		t.Error("GeminiDetectedAt should not change when tmux env is empty")
+	// Now create a "newer" session file on filesystem using correct directory structure
+	sessionsDir := GetGeminiSessionsDir(projectPath)
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("Failed to create sessions dir: %v", err)
+	}
+
+	newSessionID := "new-sess-from-filesystem-abc123"
+	sessionFile := filepath.Join(sessionsDir, "session-2025-01-25T10-00-"+newSessionID[:8]+".json")
+	sessionContent := fmt.Sprintf(`{
+		"sessionId": %q,
+		"startTime": "2025-01-25T10:00:00.000Z",
+		"lastUpdated": "2025-01-25T10:30:00.000Z",
+		"messages": [{"id": "1", "type": "user", "content": "hello"}]
+	}`, newSessionID)
+	if err := os.WriteFile(sessionFile, []byte(sessionContent), 0o644); err != nil {
+		t.Fatalf("Failed to write session file: %v", err)
+	}
+
+	// Call UpdateGeminiSession again - should pick up the new session
+	inst.UpdateGeminiSession(nil)
+
+	// Krudony fix: filesystem session should override cached ID
+	if inst.GeminiSessionID != newSessionID {
+		t.Errorf(
+			"GeminiSessionID should be updated to filesystem session %q, got %q",
+			newSessionID,
+			inst.GeminiSessionID,
+		)
+	}
+
+	// Timestamp should be updated
+	if !inst.GeminiDetectedAt.After(oldDetectedAt) {
+		t.Error("GeminiDetectedAt should be updated when new session found")
 	}
 }
 
 func TestInstance_Restart_ResumesClaudeSession(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 
 	// Create instance with known session ID (simulating previous session)
 	inst := NewInstanceWithTool("restart-test", "/tmp", "claude")
@@ -594,13 +1229,21 @@ func TestInstance_Restart_ResumesClaudeSession(t *testing.T) {
 }
 
 func TestInstance_Restart_InterruptsAndResumes(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 	// This test requires claude to be installed (restart generates claude --resume command)
 	if _, err := exec.LookPath("claude"); err != nil {
 		t.Skip("claude not available - test requires claude CLI for restart functionality")
 	}
+
+	// Isolate from user's environment (don't pick up their config.toml)
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
 
 	// Create instance with known session ID
 	inst := NewInstanceWithTool("restart-interrupt-test", "/tmp", "claude")
@@ -662,6 +1305,36 @@ func TestInstance_GeminiSessionFields(t *testing.T) {
 	}
 }
 
+func TestUpdateClaudeSessionsWithDedup_DoesNotReorderInput(t *testing.T) {
+	now := time.Now()
+	newer := &Instance{
+		ID:              "newer",
+		Tool:            "claude",
+		CreatedAt:       now,
+		ClaudeSessionID: "shared-id",
+	}
+	older := &Instance{
+		ID:              "older",
+		Tool:            "claude",
+		CreatedAt:       now.Add(-1 * time.Minute),
+		ClaudeSessionID: "shared-id",
+	}
+	input := []*Instance{newer, older}
+
+	UpdateClaudeSessionsWithDedup(input)
+
+	// Dedup should clear the newer duplicate but preserve caller order.
+	if input[0].ID != "newer" || input[1].ID != "older" {
+		t.Fatalf("input order was mutated: got [%s, %s]", input[0].ID, input[1].ID)
+	}
+	if older.ClaudeSessionID != "shared-id" {
+		t.Fatalf("older should keep shared ID, got %q", older.ClaudeSessionID)
+	}
+	if newer.ClaudeSessionID != "" {
+		t.Fatalf("newer duplicate should be cleared, got %q", newer.ClaudeSessionID)
+	}
+}
+
 func TestInstance_UpdateGeminiSession(t *testing.T) {
 	inst := NewInstanceWithTool("test", "/tmp/test", "gemini")
 	inst.CreatedAt = time.Now()
@@ -691,48 +1364,60 @@ func TestInstance_UpdateGeminiSession(t *testing.T) {
 func TestBuildGeminiCommand(t *testing.T) {
 	inst := NewInstanceWithTool("test", "/tmp/test", "gemini")
 
-	// Without session ID, should return capture-resume pattern
+	// Without session ID, should start Gemini fresh (no capture-resume for Gemini)
+	// NOTE: Gemini does NOT use capture-resume for new sessions because
+	// "gemini --output-format json ." would hang processing the prompt
 	cmd := inst.buildGeminiCommand("gemini")
 
-	// Should contain json output format and session ID capture
-	// NOTE: We use --output-format json (not stream-json) to let Gemini complete
-	// and save the session before extracting session_id
-	if !strings.Contains(cmd, "--output-format json") {
-		t.Error("Should use json output format for session ID capture")
+	// Should start Gemini fresh (no inline tmux set-environment; host-side SetEnvironment handles it)
+	if !strings.Contains(cmd, "gemini") {
+		t.Errorf("Should start gemini fresh for new session, got %q", cmd)
 	}
-	if !strings.Contains(cmd, "GEMINI_SESSION_ID") {
-		t.Error("Should set GEMINI_SESSION_ID in tmux environment")
+	// GEMINI_YOLO_MODE is now propagated via host-side SetEnvironment, not in the shell string
+	if strings.Contains(cmd, "tmux set-environment GEMINI_YOLO_MODE") {
+		t.Errorf("buildGeminiCommand should NOT embed 'tmux set-environment GEMINI_YOLO_MODE' in shell string, got %q", cmd)
 	}
-	if !strings.Contains(cmd, "--resume") {
-		t.Error("Should resume captured session")
+	// Should NOT use capture-resume pattern for new sessions
+	if strings.Contains(cmd, "--output-format json") {
+		t.Error("Should NOT use capture-resume pattern for new Gemini sessions")
 	}
-
-	// Should have fallback when capture fails (Issue #19: WSL jq parse error)
-	if !strings.Contains(cmd, `|| session_id=""`) {
-		t.Error("Should have fallback when capture fails")
-	}
-	// Should check for null jq output
-	if !strings.Contains(cmd, `!= "null"`) {
-		t.Error("Should check for null session_id from jq")
-	}
-	// Should start Gemini even without session ID (fallback path)
-	if !strings.Contains(cmd, "else gemini; fi") {
-		t.Error("Should have else branch to start Gemini fresh")
+	if strings.Contains(cmd, "--resume") && inst.GeminiSessionID == "" {
+		t.Error("Should NOT use --resume for new sessions without session ID")
 	}
 
-	// With session ID, should use simple resume
+	// With session ID, should use simple resume (no inline tmux set-environment)
 	inst.GeminiSessionID = "abc-123-def"
 	cmd = inst.buildGeminiCommand("gemini")
-	expected := "gemini --resume abc-123-def"
-	if cmd != expected {
-		t.Errorf("buildGeminiCommand('gemini') = %q, want %q", cmd, expected)
+	if !strings.Contains(cmd, "gemini --resume abc-123-def") {
+		t.Errorf("buildGeminiCommand('gemini') should contain resume command, got %q", cmd)
+	}
+	// GEMINI_YOLO_MODE and GEMINI_SESSION_ID are now propagated via host-side SetEnvironment
+	if strings.Contains(cmd, "tmux set-environment") {
+		t.Errorf("buildGeminiCommand('gemini') should NOT embed 'tmux set-environment' in shell string, got %q", cmd)
 	}
 
-	// Custom commands should pass through
+	// With explicit model set, should include --model flag
+	inst.GeminiModel = "gemini-2.5-pro"
+	cmd = inst.buildGeminiCommand("gemini")
+	if !strings.Contains(cmd, "--model gemini-2.5-pro") {
+		t.Errorf("buildGeminiCommand('gemini') should include --model flag, got %q", cmd)
+	}
+
+	// Without session ID but with model, should include --model flag
+	inst.GeminiSessionID = ""
+	cmd = inst.buildGeminiCommand("gemini")
+	if !strings.Contains(cmd, "--model gemini-2.5-pro") {
+		t.Errorf("buildGeminiCommand('gemini') with model should include --model flag, got %q", cmd)
+	}
+	if !strings.Contains(cmd, "gemini") {
+		t.Errorf("buildGeminiCommand('gemini') without session ID should start fresh, got %q", cmd)
+	}
+
+	// Custom commands should pass through (e.g., existing --resume commands)
 	customCmd := "gemini --some-flag"
 	cmd = inst.buildGeminiCommand(customCmd)
-	if cmd != customCmd {
-		t.Errorf("buildGeminiCommand(custom) = %q, want %q", cmd, customCmd)
+	if !strings.Contains(cmd, customCmd) {
+		t.Errorf("buildGeminiCommand(custom) should contain %q, got %q", customCmd, cmd)
 	}
 }
 
@@ -778,9 +1463,128 @@ func TestInstance_GetMCPInfo_Unknown(t *testing.T) {
 	}
 }
 
+func TestInstance_RegenerateMCPConfig_ReturnsError(t *testing.T) {
+	// This test verifies that regenerateMCPConfig() returns an error type
+	// The actual error propagation from WriteMCPJsonFromConfig is tested
+	// by verifying the function compiles with error return type and handles
+	// the various early-return cases correctly.
+
+	// Test case 1: No .mcp.json exists - returns nil (nothing to regenerate)
+	inst := &Instance{
+		ID:          "test-123",
+		Title:       "Test Session",
+		ProjectPath: "/nonexistent/path",
+		Tool:        "claude",
+	}
+	err := inst.regenerateMCPConfig()
+	if err != nil {
+		t.Errorf("expected nil error for nonexistent path (no MCPs to regenerate), got: %v", err)
+	}
+
+	// Test case 2: Valid path with empty .mcp.json - returns nil
+	tmpDir, err := os.MkdirTemp("", "agentdeck-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create an empty .mcp.json
+	mcpPath := filepath.Join(tmpDir, ".mcp.json")
+	if err := os.WriteFile(mcpPath, []byte(`{"mcpServers":{}}`), 0o644); err != nil {
+		t.Fatalf("failed to write .mcp.json: %v", err)
+	}
+
+	inst.ProjectPath = tmpDir
+	err = inst.regenerateMCPConfig()
+	if err != nil {
+		t.Errorf("expected nil error for empty .mcp.json, got: %v", err)
+	}
+
+	// Test case 3: .mcp.json with MCPs but not in config.toml - returns nil
+	// (Local() returns MCP names, but WriteMCPJsonFromConfig skips unknown MCPs)
+	mcpJSON := `{"mcpServers":{"unknown-mcp":{"command":"echo","args":["hello"]}}}`
+	if err := os.WriteFile(mcpPath, []byte(mcpJSON), 0o644); err != nil {
+		t.Fatalf("failed to write .mcp.json: %v", err)
+	}
+
+	err = inst.regenerateMCPConfig()
+	// This returns nil because "unknown-mcp" is not in GetAvailableMCPs()
+	// so WriteMCPJsonFromConfig writes an empty mcpServers, which succeeds
+	if err != nil {
+		t.Errorf("expected nil error for unknown MCP (not in config.toml), got: %v", err)
+	}
+
+	// Note: To test actual write failure would require:
+	// 1. An MCP defined in config.toml
+	// 2. That MCP also in .mcp.json
+	// 3. Directory made read-only after .mcp.json creation
+	// This is an integration test scenario rather than unit test
+}
+
+func TestInstance_RegenerateMCPConfig_WriteFailure(t *testing.T) {
+	// Skip on non-Unix systems where permission changes might not work
+	if os.Getenv("CI") != "" {
+		t.Skip("Skipping permission-based test in CI")
+	}
+
+	// Create a temp directory
+	tmpDir, err := os.MkdirTemp("", "agentdeck-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer func() {
+		// Restore permissions before cleanup
+		_ = os.Chmod(tmpDir, 0o755)
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	// Create .mcp.json with an MCP that exists in GetAvailableMCPs()
+	// We'll use a real MCP name that might exist, or the test gracefully handles it
+	mcpPath := filepath.Join(tmpDir, ".mcp.json")
+
+	// First, check what MCPs are available
+	availableMCPs := GetAvailableMCPs()
+	if len(availableMCPs) == 0 {
+		t.Skip("No MCPs configured in config.toml, skipping write failure test")
+	}
+
+	// Use the first available MCP
+	var mcpName string
+	for name := range availableMCPs {
+		mcpName = name
+		break
+	}
+
+	mcpJSON := `{"mcpServers":{"` + mcpName + `":{"command":"echo","args":["hello"]}}}`
+	if err := os.WriteFile(mcpPath, []byte(mcpJSON), 0o644); err != nil {
+		t.Fatalf("failed to write .mcp.json: %v", err)
+	}
+
+	// Make directory read-only AFTER writing .mcp.json
+	if err := os.Chmod(tmpDir, 0o555); err != nil {
+		t.Fatalf("failed to make directory read-only: %v", err)
+	}
+
+	inst := &Instance{
+		ID:          "test-write-failure",
+		Title:       "Test Write Failure",
+		ProjectPath: tmpDir,
+		Tool:        "claude",
+	}
+
+	// Clear MCP info cache to ensure fresh read
+	ClearMCPCache(tmpDir)
+
+	err = inst.regenerateMCPConfig()
+	// We expect an error because the directory is read-only
+	if err == nil {
+		t.Error("expected error for read-only directory, got nil")
+	} else {
+		t.Logf("Got expected error: %v", err)
+	}
+}
+
 func TestInstance_CanFork_Gemini(t *testing.T) {
-	// Test 1: Gemini tool with valid session ID should NOT be forkable
-	// Gemini CLI has NO --fork-session flag (unlike Claude)
 	inst := NewInstanceWithTool("test", "/tmp/test", "gemini")
 	inst.GeminiSessionID = "abc-123-def"
 	inst.GeminiDetectedAt = time.Now()
@@ -789,13 +1593,100 @@ func TestInstance_CanFork_Gemini(t *testing.T) {
 		t.Error("CanFork() should be false for Gemini (not supported by Gemini CLI)")
 	}
 
-	// Test 2: Even if ClaudeSessionID were somehow set, Gemini tool should not fork
-	// This tests the explicit tool check
 	inst.ClaudeSessionID = "claude-session-xyz"
 	inst.ClaudeDetectedAt = time.Now()
 
 	if inst.CanFork() {
 		t.Error("CanFork() should be false for Gemini tool even with ClaudeSessionID set")
+	}
+}
+
+func TestInstance_CanFork_OpenCode(t *testing.T) {
+	inst := NewInstanceWithTool("test", "/tmp/test", "opencode")
+
+	if inst.CanFork() {
+		t.Error("CanFork() should be false without OpenCodeSessionID")
+	}
+
+	inst.OpenCodeSessionID = "ses_abc123def456"
+	inst.OpenCodeDetectedAt = time.Now()
+	if !inst.CanFork() {
+		t.Error("CanFork() should be true with recent OpenCodeSessionID")
+	}
+
+	inst.OpenCodeDetectedAt = time.Now().Add(-10 * time.Minute)
+	if inst.CanFork() {
+		t.Error("CanFork() should be false with stale OpenCodeSessionID")
+	}
+}
+
+func TestInstance_ForkOpenCode(t *testing.T) {
+	inst := NewInstanceWithTool("test", "/tmp/test", "opencode")
+
+	_, err := inst.ForkOpenCode("forked-test", "")
+	if err == nil {
+		t.Error("ForkOpenCode() should fail without OpenCodeSessionID")
+	}
+
+	inst.OpenCodeSessionID = "ses_abc123def456ffe1234567890abcd"
+	inst.OpenCodeDetectedAt = time.Now()
+	cmd, err := inst.ForkOpenCode("forked-test", "")
+	if err != nil {
+		t.Errorf("ForkOpenCode() failed: %v", err)
+	}
+
+	// cmd is "bash '<script_path>'" - extract and read the script file
+	if !strings.HasPrefix(cmd, "bash '") {
+		t.Fatalf("ForkOpenCode() should return bash command, got: %s", cmd)
+	}
+	scriptPath := strings.TrimPrefix(cmd, "bash '")
+	scriptPath = strings.TrimSuffix(scriptPath, "'")
+	scriptContent, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("Failed to read fork script at %s: %v", scriptPath, err)
+	}
+	script := string(scriptContent)
+
+	if !strings.Contains(script, "opencode export") {
+		t.Errorf("Fork script should use opencode export, got: %s", script)
+	}
+	if !strings.Contains(script, "opencode import") {
+		t.Errorf("Fork script should use opencode import, got: %s", script)
+	}
+	if !strings.Contains(script, "ses_abc123def456ffe1234567890abcd") {
+		t.Errorf("Fork script should include original session ID, got: %s", script)
+	}
+	// tmux set-environment removed: host-side SetEnvironment handles propagation
+	if strings.Contains(script, "tmux set-environment") {
+		t.Errorf("Fork script should NOT contain tmux set-environment (host-side handles it), got: %s", script)
+	}
+}
+
+func TestInstance_CreateForkedOpenCodeInstance(t *testing.T) {
+	inst := NewInstanceWithTool("test", "/tmp/test", "opencode")
+	inst.OpenCodeSessionID = "ses_abc123def456ffe1234567890abcd"
+	inst.OpenCodeDetectedAt = time.Now()
+	inst.GroupPath = "projects/ai"
+
+	forked, cmd, err := inst.CreateForkedOpenCodeInstance("forked-test", "")
+	if err != nil {
+		t.Fatalf("CreateForkedOpenCodeInstance() failed: %v", err)
+	}
+
+	if forked.Title != "forked-test" {
+		t.Errorf("Forked instance title = %q, want %q", forked.Title, "forked-test")
+	}
+	if forked.Tool != "opencode" {
+		t.Errorf("Forked instance tool = %q, want %q", forked.Tool, "opencode")
+	}
+	if forked.GroupPath != "projects/ai" {
+		t.Errorf("Forked instance GroupPath = %q, want %q", forked.GroupPath, "projects/ai")
+	}
+	if forked.ProjectPath != "/tmp/test" {
+		t.Errorf("Forked instance ProjectPath = %q, want %q", forked.ProjectPath, "/tmp/test")
+	}
+	if cmd == "" {
+		t.Error("CreateForkedOpenCodeInstance() returned empty command")
 	}
 }
 
@@ -877,9 +1768,7 @@ func TestParseGeminiLastAssistantMessage_NoGeminiMessage(t *testing.T) {
 }
 
 func TestInstance_CanRestart_Gemini(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 
 	// Create and start a Gemini session so tmux session exists
 	inst := NewInstanceWithTool("gemini-restart-test", "/tmp", "gemini")
@@ -915,11 +1804,11 @@ func TestInstance_CanRestart_Gemini(t *testing.T) {
 // Issue #16: Fork command breaks for project paths with spaces
 func TestInstance_Fork_PathWithSpaces(t *testing.T) {
 	inst := &Instance{
-		ID:              "test-123",
-		Title:           "test-session",
-		ProjectPath:     "/tmp/Test Path With Spaces",
-		Tool:            "claude",
-		ClaudeSessionID: "session-abc-123",
+		ID:               "test-123",
+		Title:            "test-session",
+		ProjectPath:      "/tmp/Test Path With Spaces",
+		Tool:             "claude",
+		ClaudeSessionID:  "session-abc-123",
 		ClaudeDetectedAt: time.Now(),
 	}
 
@@ -939,25 +1828,114 @@ func TestInstance_Fork_PathWithSpaces(t *testing.T) {
 	}
 }
 
+// TestInstance_Restart_SkipMCPRegenerate tests that SkipMCPRegenerate prevents double-write
+// race condition when MCP dialog Apply() is followed immediately by Restart()
+func TestInstance_Restart_SkipMCPRegenerate(t *testing.T) {
+	// This test verifies that SkipMCPRegenerate prevents double-write
+	inst := &Instance{
+		ID:                "test-skip-123",
+		Title:             "Test Skip Regen",
+		ProjectPath:       t.TempDir(),
+		Tool:              "claude",
+		SkipMCPRegenerate: true,
+	}
+
+	// Write a marker file to detect if regenerateMCPConfig was called
+	mcpFile := filepath.Join(inst.ProjectPath, ".mcp.json")
+	originalContent := `{"mcpServers":{"marker":{"command":"test"}}}`
+	if err := os.WriteFile(mcpFile, []byte(originalContent), 0o644); err != nil {
+		t.Fatalf("failed to write marker file: %v", err)
+	}
+
+	// After Restart with SkipMCPRegenerate=true, original content should be preserved
+	// (In real scenario, Restart would fail because no tmux, but the flag check happens first)
+
+	// Verify the flag is set
+	if !inst.SkipMCPRegenerate {
+		t.Error("SkipMCPRegenerate should be true")
+	}
+
+	// Call Restart - it will fail due to no tmux session, but we can verify
+	// the flag was consumed by checking if it's now false
+	_ = inst.Restart() // Will fail, but that's expected
+
+	// Verify the flag was cleared after use
+	if inst.SkipMCPRegenerate {
+		t.Error("SkipMCPRegenerate should be false after Restart() consumes it")
+	}
+
+	// Verify the original content was preserved (regenerateMCPConfig was skipped)
+	content, err := os.ReadFile(mcpFile)
+	if err != nil {
+		t.Fatalf("failed to read marker file: %v", err)
+	}
+
+	if string(content) != originalContent {
+		t.Errorf(
+			"MCP config was modified when it should have been skipped.\nOriginal: %s\nActual: %s",
+			originalContent,
+			string(content),
+		)
+	}
+}
+
+// TestInstance_WorktreeFields tests the worktree-related fields and IsWorktree method
+func TestInstance_WorktreeFields(t *testing.T) {
+	// Test 1: Instance with worktree fields set should report IsWorktree() = true
+	inst := NewInstance("test", "/tmp/worktree-path")
+	inst.WorktreePath = "/tmp/worktree-path"
+	inst.WorktreeRepoRoot = "/tmp/original-repo"
+	inst.WorktreeBranch = "feature-x"
+
+	if !inst.IsWorktree() {
+		t.Error("IsWorktree should return true when WorktreePath is set")
+	}
+
+	// Verify all fields are set correctly
+	if inst.WorktreePath != "/tmp/worktree-path" {
+		t.Errorf("WorktreePath = %q, want %q", inst.WorktreePath, "/tmp/worktree-path")
+	}
+	if inst.WorktreeRepoRoot != "/tmp/original-repo" {
+		t.Errorf("WorktreeRepoRoot = %q, want %q", inst.WorktreeRepoRoot, "/tmp/original-repo")
+	}
+	if inst.WorktreeBranch != "feature-x" {
+		t.Errorf("WorktreeBranch = %q, want %q", inst.WorktreeBranch, "feature-x")
+	}
+
+	// Test 2: Instance without worktree fields should report IsWorktree() = false
+	inst2 := NewInstance("test2", "/tmp/regular-path")
+	if inst2.IsWorktree() {
+		t.Error("IsWorktree should return false when WorktreePath is empty")
+	}
+
+	// Test 3: Instance with only WorktreePath set (edge case)
+	inst3 := NewInstance("test3", "/tmp/edge-case")
+	inst3.WorktreePath = "/tmp/some-worktree"
+	if !inst3.IsWorktree() {
+		t.Error("IsWorktree should return true even when only WorktreePath is set")
+	}
+}
+
 // TestInstance_Fork_RespectsDangerousMode tests that Fork() respects dangerous_mode config
 // Issue #8: Fork command ignores dangerous_mode configuration
 func TestInstance_Fork_RespectsDangerousMode(t *testing.T) {
 	inst := &Instance{
-		ID:              "test-456",
-		Title:           "test-session",
-		ProjectPath:     "/tmp/test",
-		Tool:            "claude",
-		ClaudeSessionID: "session-xyz-789",
+		ID:               "test-456",
+		Title:            "test-session",
+		ProjectPath:      "/tmp/test",
+		Tool:             "claude",
+		ClaudeSessionID:  "session-xyz-789",
 		ClaudeDetectedAt: time.Now(),
 	}
 
 	// Test with dangerous_mode = false
 	t.Run("dangerous_mode=false", func(t *testing.T) {
 		// Set up config with dangerous_mode = false
+		dangerousModeFalse := false
 		userConfigCacheMu.Lock()
 		userConfigCache = &UserConfig{
 			Claude: ClaudeSettings{
-				DangerousMode: false,
+				DangerousMode: &dangerousModeFalse,
 			},
 		}
 		userConfigCacheMu.Unlock()
@@ -974,17 +1952,21 @@ func TestInstance_Fork_RespectsDangerousMode(t *testing.T) {
 
 		// Should NOT have --dangerously-skip-permissions when config is false
 		if strings.Contains(cmd, "--dangerously-skip-permissions") {
-			t.Errorf("Fork command should NOT include --dangerously-skip-permissions when dangerous_mode=false.\nGot: %s", cmd)
+			t.Errorf(
+				"Fork command should NOT include --dangerously-skip-permissions when dangerous_mode=false.\nGot: %s",
+				cmd,
+			)
 		}
 	})
 
 	// Test with dangerous_mode = true
 	t.Run("dangerous_mode=true", func(t *testing.T) {
 		// Set up config with dangerous_mode = true
+		dangerousModeTrue := true
 		userConfigCacheMu.Lock()
 		userConfigCache = &UserConfig{
 			Claude: ClaudeSettings{
-				DangerousMode: true,
+				DangerousMode: &dangerousModeTrue,
 			},
 		}
 		userConfigCacheMu.Unlock()
@@ -1001,7 +1983,1172 @@ func TestInstance_Fork_RespectsDangerousMode(t *testing.T) {
 
 		// SHOULD have --dangerously-skip-permissions when config is true
 		if !strings.Contains(cmd, "--dangerously-skip-permissions") {
-			t.Errorf("Fork command should include --dangerously-skip-permissions when dangerous_mode=true.\nGot: %s", cmd)
+			t.Errorf(
+				"Fork command should include --dangerously-skip-permissions when dangerous_mode=true.\nGot: %s",
+				cmd,
+			)
 		}
 	})
+}
+
+func TestInstance_GetJSONLPath(t *testing.T) {
+	t.Run("non-claude session returns empty", func(t *testing.T) {
+		inst := NewInstance("test", "/tmp/project")
+		inst.Tool = "shell"
+		inst.ClaudeSessionID = "abc123"
+
+		path := inst.GetJSONLPath()
+		if path != "" {
+			t.Errorf("GetJSONLPath() for non-claude should be empty, got: %s", path)
+		}
+	})
+
+	t.Run("claude session without session ID returns empty", func(t *testing.T) {
+		inst := NewInstance("test", "/tmp/project")
+		inst.Tool = "claude"
+		inst.ClaudeSessionID = ""
+
+		path := inst.GetJSONLPath()
+		if path != "" {
+			t.Errorf("GetJSONLPath() without session ID should be empty, got: %s", path)
+		}
+	})
+
+	t.Run("claude session with missing file returns empty", func(t *testing.T) {
+		inst := NewInstance("test", "/tmp/project")
+		inst.Tool = "claude"
+		inst.ClaudeSessionID = "nonexistent-session-id"
+
+		path := inst.GetJSONLPath()
+		if path != "" {
+			t.Errorf("GetJSONLPath() with missing file should be empty, got: %s", path)
+		}
+	})
+
+	t.Run("claude session with existing file returns path", func(t *testing.T) {
+		// Create a temp directory structure that mimics Claude's layout
+		tempDir := t.TempDir()
+		projectPath := filepath.Join(tempDir, "myproject")
+		if err := os.MkdirAll(projectPath, 0o755); err != nil {
+			t.Fatalf("Failed to create project dir: %v", err)
+		}
+
+		// Resolve symlinks in project path (same as GetJSONLPath does)
+		resolvedPath := projectPath
+		if resolved, err := filepath.EvalSymlinks(projectPath); err == nil {
+			resolvedPath = resolved
+		}
+
+		// Create mock Claude config structure using the RESOLVED path
+		claudeDir := filepath.Join(tempDir, ".claude")
+		projectDirName := ConvertToClaudeDirName(resolvedPath)
+		claudeProjectDir := filepath.Join(claudeDir, "projects", projectDirName)
+		if err := os.MkdirAll(claudeProjectDir, 0o755); err != nil {
+			t.Fatalf("Failed to create claude project dir: %v", err)
+		}
+
+		// Create a mock JSONL file
+		sessionID := "test-session-123"
+		jsonlFile := filepath.Join(claudeProjectDir, sessionID+".jsonl")
+		if err := os.WriteFile(jsonlFile, []byte(`{"type":"assistant"}`), 0o644); err != nil {
+			t.Fatalf("Failed to create jsonl file: %v", err)
+		}
+
+		// Resolve claudeDir too for comparison
+		resolvedClaudeDir := claudeDir
+		if resolved, err := filepath.EvalSymlinks(claudeDir); err == nil {
+			resolvedClaudeDir = resolved
+		}
+
+		// Override claude config dir for test - must be done BEFORE clearing cache
+		oldClaudeConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+		os.Setenv("CLAUDE_CONFIG_DIR", resolvedClaudeDir)
+		defer os.Setenv("CLAUDE_CONFIG_DIR", oldClaudeConfigDir)
+
+		// Clear cached config so GetClaudeConfigDir picks up the new env var
+		userConfigCacheMu.Lock()
+		userConfigCache = nil
+		userConfigCacheMu.Unlock()
+		defer func() {
+			userConfigCacheMu.Lock()
+			userConfigCache = nil
+			userConfigCacheMu.Unlock()
+		}()
+
+		// Verify GetClaudeConfigDir returns the right path
+		configDir := GetClaudeConfigDir()
+		t.Logf("GetClaudeConfigDir() = %s (expected: %s)", configDir, resolvedClaudeDir)
+
+		inst := NewInstance("test", projectPath)
+		inst.Tool = "claude"
+		inst.ClaudeSessionID = sessionID
+
+		path := inst.GetJSONLPath()
+		t.Logf("GetJSONLPath() = %s", path)
+		t.Logf("Expected jsonlFile = %s", jsonlFile)
+		if path == "" {
+			t.Errorf("GetJSONLPath() with existing file should return path")
+		}
+		// Compare resolved paths since EvalSymlinks might differ
+		expectedResolved := jsonlFile
+		if r, err := filepath.EvalSymlinks(jsonlFile); err == nil {
+			expectedResolved = r
+		}
+		if path != expectedResolved {
+			t.Errorf("GetJSONLPath() = %s, want %s", path, expectedResolved)
+		}
+	})
+}
+
+func TestInstance_GetLastResponseBestEffort_ClaudeNoSessionID(t *testing.T) {
+	inst := NewInstance("best-effort", t.TempDir())
+	inst.Tool = "claude"
+	inst.ClaudeSessionID = ""
+	inst.tmuxSession = nil // Avoid tmux dependencies for this fallback-path test
+
+	resp, err := inst.GetLastResponseBestEffort()
+	if err != nil {
+		t.Fatalf("GetLastResponseBestEffort() unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("GetLastResponseBestEffort() returned nil response")
+	}
+	if resp.Tool != "claude" {
+		t.Fatalf("Tool = %q, want %q", resp.Tool, "claude")
+	}
+	if resp.Role != "assistant" {
+		t.Fatalf("Role = %q, want %q", resp.Role, "assistant")
+	}
+	if resp.Content != "" {
+		t.Fatalf("Content = %q, want empty string", resp.Content)
+	}
+}
+
+func TestSessionHasConversationData(t *testing.T) {
+	// Create temp directory structure
+	tmpDir := t.TempDir()
+	projectPath := "/test/project"
+	encodedPath := "-test-project"
+
+	projectsDir := filepath.Join(tmpDir, "projects", encodedPath)
+	_ = os.MkdirAll(projectsDir, 0o755)
+
+	// Override config dir for test
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("CLAUDE_CONFIG_DIR", tmpDir)
+	defer os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+	ClearUserConfigCache()
+	defer ClearUserConfigCache()
+
+	t.Run("file with sessionId returns true", func(t *testing.T) {
+		sessionID := "has-session-id"
+		filePath := filepath.Join(projectsDir, sessionID+".jsonl")
+		content := `{"type":"summary","leafUuid":"abc"}
+{"type":"queue-operation","sessionId":"has-session-id","timestamp":"2026-01-01"}
+{"type":"user","sessionId":"has-session-id","text":"hello"}`
+		_ = os.WriteFile(filePath, []byte(content), 0o644)
+
+		if !sessionHasConversationData(sessionID, projectPath) {
+			t.Error("Expected true for file with sessionId")
+		}
+	})
+
+	t.Run("file without sessionId returns false", func(t *testing.T) {
+		sessionID := "no-session-id"
+		filePath := filepath.Join(projectsDir, sessionID+".jsonl")
+		content := `{"type":"summary","leafUuid":"abc"}
+{"type":"summary","leafUuid":"def"}`
+		_ = os.WriteFile(filePath, []byte(content), 0o644)
+
+		if sessionHasConversationData(sessionID, projectPath) {
+			t.Error("Expected false for file without sessionId")
+		}
+	})
+
+	t.Run("missing file returns false (use --session-id)", func(t *testing.T) {
+		if sessionHasConversationData("nonexistent-file", projectPath) {
+			t.Error("Expected false for missing file (nothing to resume)")
+		}
+	})
+}
+
+// TestRegenerate_MCPConfig_InvalidatesCache verifies that regenerateMCPConfig()
+// clears the MCP cache before reading, so externally-modified .mcp.json files
+// are picked up instead of stale cached data (fixes #97).
+func TestRegenerate_MCPConfig_InvalidatesCache(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agentdeck-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	defer ClearMCPCache(tmpDir) // Clean up cache after test
+
+	mcpPath := filepath.Join(tmpDir, ".mcp.json")
+
+	// Step 1: Write initial .mcp.json with one MCP
+	initialJSON := `{"mcpServers":{"mcp-a":{"command":"echo","args":["a"]}}}`
+	if err := os.WriteFile(mcpPath, []byte(initialJSON), 0o644); err != nil {
+		t.Fatalf("failed to write initial .mcp.json: %v", err)
+	}
+
+	// Step 2: Prime the cache by calling GetMCPInfo
+	info1 := GetMCPInfo(tmpDir)
+	if info1 == nil {
+		t.Fatal("expected non-nil MCPInfo after priming cache")
+	}
+	localNames1 := info1.Local()
+	if len(localNames1) != 1 || localNames1[0] != "mcp-a" {
+		t.Fatalf("expected cache to contain [mcp-a], got %v", localNames1)
+	}
+
+	// Step 3: Externally modify .mcp.json to add a second MCP (within 30s cache window)
+	updatedJSON := `{"mcpServers":{"mcp-a":{"command":"echo","args":["a"]},"mcp-b":{"command":"echo","args":["b"]}}}`
+	if err := os.WriteFile(mcpPath, []byte(updatedJSON), 0o644); err != nil {
+		t.Fatalf("failed to write updated .mcp.json: %v", err)
+	}
+
+	// Step 4: Call regenerateMCPConfig (should clear cache before GetMCPInfo)
+	inst := &Instance{
+		ID:          "test-cache-invalidation",
+		Title:       "Cache Test",
+		ProjectPath: tmpDir,
+		Tool:        "claude",
+	}
+	_ = inst.regenerateMCPConfig()
+
+	// Step 5: Verify the cache was refreshed with disk data during regeneration.
+	// GetMCPInfo returns the cache populated inside regenerateMCPConfig,
+	// which read fresh data after clearing the cache.
+	info2 := GetMCPInfo(tmpDir)
+	if info2 == nil {
+		t.Fatal("expected non-nil MCPInfo after regeneration")
+	}
+	localNames2 := info2.Local()
+
+	// With the fix: cache was cleared, so regenerateMCPConfig read both mcp-a and mcp-b
+	// Without the fix: cache still has stale data with only mcp-a
+	foundB := false
+	for _, name := range localNames2 {
+		if name == "mcp-b" {
+			foundB = true
+			break
+		}
+	}
+	if !foundB {
+		t.Errorf("expected cache to contain 'mcp-b' after regeneration "+
+			"(cache should have been invalidated), got: %v", localNames2)
+	}
+}
+
+func TestWrapIgnoreSuspend(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wraps simple command", func(t *testing.T) {
+		t.Parallel()
+		wrapped := wrapIgnoreSuspend("claude --session-id abc")
+		require.Equal(t, "bash -c 'stty susp undef; claude --session-id abc'", wrapped)
+	})
+
+	t.Run("wraps sandbox docker exec command", func(t *testing.T) {
+		t.Parallel()
+		// docker exec with shell-quoted env value from buildExecCommand/ShellJoinArgs.
+		sandboxCmd := `docker exec -it -e TERM=xterm-256color agent-deck-a1b2c3d4 claude --session-id abc`
+		wrapped := wrapIgnoreSuspend(sandboxCmd)
+		// Single bash -c layer wrapping the shell-quoted docker exec.
+		require.Equal(t,
+			`bash -c 'stty susp undef; docker exec -it -e TERM=xterm-256color agent-deck-a1b2c3d4 claude --session-id abc'`,
+			wrapped,
+		)
+	})
+
+	t.Run("escapes single quotes in command", func(t *testing.T) {
+		t.Parallel()
+		wrapped := wrapIgnoreSuspend("echo 'hello world'")
+		require.Equal(t, `bash -c 'stty susp undef; echo '"'"'hello world'"'"''`, wrapped)
+	})
+}
+
+func TestCollectDockerEnvVars(t *testing.T) {
+	// Cannot use t.Parallel() because t.Setenv mutates process env.
+
+	tests := []struct {
+		name     string
+		envSetup map[string]string // env vars to set for this test.
+		names    []string
+		wantKeys []string // expected keys in result (terminal defaults + names).
+	}{
+		{
+			name:     "includes terminal vars when set",
+			envSetup: map[string]string{"TERM": "xterm-256color"},
+			names:    nil,
+			wantKeys: []string{"TERM"},
+		},
+		{
+			name:     "merges user-configured names",
+			envSetup: map[string]string{"TERM": "xterm", "MY_KEY": "secret"},
+			names:    []string{"MY_KEY"},
+			wantKeys: []string{"TERM", "MY_KEY"},
+		},
+		{
+			name:     "skips unset vars",
+			envSetup: map[string]string{"TERM": "xterm"},
+			names:    []string{"UNSET_VAR"},
+			wantKeys: []string{"TERM"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.envSetup {
+				t.Setenv(k, v)
+			}
+			result := collectDockerEnvVars(tc.names)
+			for _, key := range tc.wantKeys {
+				require.Contains(t, result, key)
+			}
+		})
+	}
+}
+
+func TestNewSandboxConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		imageOverride string
+		wantEnabled   bool
+	}{
+		{
+			name:          "uses default image when override empty",
+			imageOverride: "",
+			wantEnabled:   true,
+		},
+		{
+			name:          "uses override image when provided",
+			imageOverride: "custom:v1",
+			wantEnabled:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := NewSandboxConfig(tc.imageOverride)
+			require.Equal(t, tc.wantEnabled, cfg.Enabled)
+			if tc.imageOverride != "" {
+				require.Equal(t, tc.imageOverride, cfg.Image)
+			} else {
+				require.Equal(t, docker.DefaultImage(), cfg.Image)
+			}
+		})
+	}
+}
+
+func TestBuildClaudeExtraFlags_DangerousMode(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	opts := &ClaudeOptions{SkipPermissions: true}
+	flags := inst.buildClaudeExtraFlags(opts)
+
+	if !strings.Contains(flags, "--dangerously-skip-permissions") {
+		t.Errorf("expected --dangerously-skip-permissions, got %q", flags)
+	}
+}
+
+func TestBuildClaudeExtraFlags_AllowDangerousMode(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	opts := &ClaudeOptions{SkipPermissions: false, AllowSkipPermissions: true}
+	flags := inst.buildClaudeExtraFlags(opts)
+
+	if !strings.Contains(flags, "--allow-dangerously-skip-permissions") {
+		t.Errorf("expected --allow-dangerously-skip-permissions, got %q", flags)
+	}
+	if strings.Contains(flags, " --dangerously-skip-permissions") {
+		t.Errorf("should not contain --dangerously-skip-permissions, got %q", flags)
+	}
+}
+
+func TestBuildClaudeExtraFlags_DangerousWinsOverAllow(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	opts := &ClaudeOptions{SkipPermissions: true, AllowSkipPermissions: true}
+	flags := inst.buildClaudeExtraFlags(opts)
+
+	if !strings.Contains(flags, "--dangerously-skip-permissions") {
+		t.Errorf("expected --dangerously-skip-permissions, got %q", flags)
+	}
+	if strings.Contains(flags, "--allow-dangerously-skip-permissions") {
+		t.Errorf("dangerous_mode should take precedence, got %q", flags)
+	}
+}
+
+func TestBuildClaudeExtraFlags_NilOpts(t *testing.T) {
+	inst := &Instance{Tool: "claude"}
+	flags := inst.buildClaudeExtraFlags(nil)
+
+	// With nil opts, no permission flags should be added
+	if strings.Contains(flags, "--dangerously-skip-permissions") {
+		t.Errorf("nil opts should not add permission flags, got %q", flags)
+	}
+	if strings.Contains(flags, "--allow-dangerously-skip-permissions") {
+		t.Errorf("nil opts should not add permission flags, got %q", flags)
+	}
+}
+
+// TestBuildClaudeCommand_ExportsInstanceID verifies that AGENTDECK_INSTANCE_ID
+// is included in the command string for Claude sessions.
+func TestBuildClaudeCommand_ExportsInstanceID(t *testing.T) {
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir())
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	// AGENTDECK_INSTANCE_ID should be in the command as an env var prefix
+	expectedPrefix := "AGENTDECK_INSTANCE_ID=" + inst.ID
+	if !strings.Contains(cmd, expectedPrefix) {
+		t.Errorf("Command should contain %q, got: %s", expectedPrefix, cmd)
+	}
+}
+
+func TestBuildCodexCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[codex]
+use_happy = true
+yolo_mode = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("happy-codex", "/tmp/test", "codex")
+	cmd := inst.buildCodexCommand("codex")
+
+	if !strings.Contains(cmd, "happy codex --yolo") {
+		t.Errorf("Should launch Codex via happy with yolo flag, got: %s", cmd)
+	}
+}
+
+func TestBuildCodexCommand_PerSessionUseHappyOverride(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[codex]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("plain-codex", "/tmp/test", "codex")
+	inst.CodexSessionID = "codex-session-123"
+	if err := inst.SetCodexOptions(&CodexOptions{
+		YoloMode: boolPtr(true),
+		UseHappy: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("SetCodexOptions failed: %v", err)
+	}
+
+	cmd := inst.buildCodexCommand("codex")
+
+	if strings.Contains(cmd, "happy codex") {
+		t.Errorf("Per-session UseHappy=false should override global config, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "codex --yolo resume codex-session-123") {
+		t.Errorf("Expected plain codex resume command with yolo, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeResumeCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("resume-happy", "/tmp/test", "claude")
+	inst.ClaudeSessionID = "resume-session-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	cmd := inst.buildClaudeResumeCommand()
+	if !strings.Contains(cmd, "happy --session-id resume-session-123") &&
+		!strings.Contains(cmd, "happy --resume resume-session-123") {
+		t.Errorf("Resume command should use happy when configured, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeForkCommandForTarget_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	parent := NewInstanceWithTool("parent", "/tmp/test", "claude")
+	parent.ClaudeSessionID = "parent-session-123"
+	parent.ClaudeDetectedAt = time.Now()
+	target := NewInstanceWithTool("fork", "/tmp/test", "claude")
+
+	cmd, err := parent.buildClaudeForkCommandForTarget(target, nil)
+	if err != nil {
+		t.Fatalf("buildClaudeForkCommandForTarget failed: %v", err)
+	}
+	if !strings.Contains(cmd, "exec happy --session-id") {
+		t.Errorf("Fork command should use happy when configured, got: %s", cmd)
+	}
+}
+
+// TestBuildClaudeResumeCommand_ExportsInstanceID verifies that AGENTDECK_INSTANCE_ID
+// is included in the resume command string.
+func TestBuildClaudeResumeCommand_ExportsInstanceID(t *testing.T) {
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir())
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
+	inst.ClaudeSessionID = "abc-123-def"
+
+	cmd := inst.buildClaudeResumeCommand()
+
+	expectedPrefix := "AGENTDECK_INSTANCE_ID=" + inst.ID
+	if !strings.Contains(cmd, expectedPrefix) {
+		t.Errorf("Resume command should contain %q, got: %s", expectedPrefix, cmd)
+	}
+}
+
+// TestInstance_HookFastPath tests that UpdateStatus uses hook data when fresh.
+func TestInstance_HookFastPath(t *testing.T) {
+	inst := NewInstanceWithTool("hook-test", "/tmp/test", "claude")
+
+	// Set fresh hook data
+	inst.hookStatus = "running"
+	inst.hookLastUpdate = time.Now()
+
+	status, fresh := inst.GetHookStatus()
+	if status != "running" {
+		t.Errorf("GetHookStatus() status = %q, want running", status)
+	}
+	if !fresh {
+		t.Error("GetHookStatus() should report fresh for recent update")
+	}
+}
+
+// TestInstance_HookFastPath_Stale tests that stale hook data is not used.
+func TestInstance_HookFastPath_Stale(t *testing.T) {
+	inst := NewInstanceWithTool("hook-stale-test", "/tmp/test", "claude")
+
+	// Hook data older than 2 minutes is stale (safety net for crashes)
+	inst.hookStatus = "running"
+	inst.hookLastUpdate = time.Now().Add(-3 * time.Minute)
+
+	status, fresh := inst.GetHookStatus()
+	if status != "running" {
+		t.Errorf("GetHookStatus() status = %q, want running", status)
+	}
+	if fresh {
+		t.Error("GetHookStatus() should report stale after 2 minutes")
+	}
+}
+
+func TestInstance_HookFastPath_CodexRunningFreshness(t *testing.T) {
+	inst := NewInstanceWithTool("hook-codex-running", "/tmp/test", "codex")
+	inst.hookStatus = "running"
+	inst.hookLastUpdate = time.Now().Add(-10 * time.Second)
+
+	_, fresh := inst.GetHookStatus()
+	if !fresh {
+		t.Error("codex running hook should be fresh within running window")
+	}
+}
+
+func TestInstance_HookFastPath_CodexRunningStale(t *testing.T) {
+	inst := NewInstanceWithTool("hook-codex-running-stale", "/tmp/test", "codex")
+	inst.hookStatus = "running"
+	inst.hookLastUpdate = time.Now().Add(-30 * time.Second)
+
+	_, fresh := inst.GetHookStatus()
+	if fresh {
+		t.Error("codex running hook should be stale outside running window")
+	}
+}
+
+func TestInstance_HookFastPath_CodexWaitingFreshness(t *testing.T) {
+	inst := NewInstanceWithTool("hook-codex-waiting", "/tmp/test", "codex")
+	inst.hookStatus = "waiting"
+	inst.hookLastUpdate = time.Now().Add(-30 * time.Second)
+
+	_, fresh := inst.GetHookStatus()
+	if !fresh {
+		t.Error("codex waiting hook should be fresh for waiting window")
+	}
+}
+
+func TestInstance_UpdateCodexSession_ScanCooldown(t *testing.T) {
+	origCodexHome := os.Getenv("CODEX_HOME")
+	codexHome := t.TempDir()
+	if err := os.Setenv("CODEX_HOME", codexHome); err != nil {
+		t.Fatalf("set CODEX_HOME: %v", err)
+	}
+	defer func() {
+		if origCodexHome != "" {
+			_ = os.Setenv("CODEX_HOME", origCodexHome)
+		} else {
+			_ = os.Unsetenv("CODEX_HOME")
+		}
+	}()
+
+	projectPath := filepath.Join(codexHome, "project")
+	if err := os.MkdirAll(projectPath, 0755); err != nil {
+		t.Fatalf("create project dir: %v", err)
+	}
+
+	inst := NewInstanceWithTool("codex-cooldown", projectPath, "codex")
+
+	sessionID1 := "11111111-1111-4111-8111-111111111111"
+	sessionID2 := "22222222-2222-4222-8222-222222222222"
+
+	file1 := writeCodexSessionFile(t, codexHome, sessionID1, projectPath)
+	file1Time := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(file1, file1Time, file1Time); err != nil {
+		t.Fatalf("set file1 mtime: %v", err)
+	}
+
+	inst.UpdateCodexSession(nil)
+	if inst.CodexSessionID != sessionID1 {
+		t.Fatalf("first scan picked %q, want %q", inst.CodexSessionID, sessionID1)
+	}
+
+	file2 := writeCodexSessionFile(t, codexHome, sessionID2, projectPath)
+	file2Time := time.Now().Add(-1 * time.Minute)
+	if err := os.Chtimes(file2, file2Time, file2Time); err != nil {
+		t.Fatalf("set file2 mtime: %v", err)
+	}
+
+	// Immediate follow-up should skip expensive scan and keep existing ID.
+	inst.UpdateCodexSession(nil)
+	if inst.CodexSessionID != sessionID1 {
+		t.Fatalf("cooldown should keep %q, got %q", sessionID1, inst.CodexSessionID)
+	}
+
+	// After cooldown, scan should run and pick the newer rotated session.
+	inst.lastCodexScanAt = time.Now().Add(-codexRotationScanInterval - time.Second)
+	inst.UpdateCodexSession(nil)
+	if inst.CodexSessionID != sessionID2 {
+		t.Fatalf("post-cooldown scan picked %q, want %q", inst.CodexSessionID, sessionID2)
+	}
+}
+
+func writeCodexSessionFile(t *testing.T, codexHome, sessionID, cwd string) string {
+	t.Helper()
+
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "02", "18")
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		t.Fatalf("create sessions dir: %v", err)
+	}
+
+	filePath := filepath.Join(sessionsDir, sessionID+".jsonl")
+	content := fmt.Sprintf("{\"cwd\":%q}\n", cwd)
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+	return filePath
+}
+
+func TestExtractCodexSessionIDFromLsofOutput(t *testing.T) {
+	lsofOutput := []byte(`codex 12345 user 45w REG 254,1 654264 5176218 /home/user/.codex/sessions/2026/02/28/rollout-2026-02-28T00-42-18-019c9ffa-c9d6-7be1-9e1c-527080e68951.jsonl
+`)
+
+	got := extractCodexSessionIDFromLsofOutput(lsofOutput)
+	want := "019c9ffa-c9d6-7be1-9e1c-527080e68951"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromLsofOutput() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractCodexSessionIDFromLsofOutput_DockerStyleLine(t *testing.T) {
+	lsofOutput := []byte(`codex 44 root 36w REG 0,608 3392413 5176210 /root/.codex/sessions/2026/02/23/rollout-2026-02-23T18-37-01-019c8a12-e903-7670-bd12-709c6a4c5451.jsonl
+`)
+
+	got := extractCodexSessionIDFromLsofOutput(lsofOutput)
+	want := "019c8a12-e903-7670-bd12-709c6a4c5451"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromLsofOutput() docker line = %q, want %q", got, want)
+	}
+}
+
+func TestExtractCodexSessionIDFromPath_DeletedSuffix(t *testing.T) {
+	path := "/home/user/.codex/sessions/2026/02/28/rollout-2026-02-28T00-42-18-019c9ffa-c9d6-7be1-9e1c-527080e68951.jsonl (deleted)"
+	got := extractCodexSessionIDFromPath(path)
+	want := "019c9ffa-c9d6-7be1-9e1c-527080e68951"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromPath() = %q, want %q", got, want)
+	}
+}
+
+func TestParsePSParentChildMap(t *testing.T) {
+	procTable := []byte("100 1\n101 100\n102 100\n103 101\nbad-line\n104 invalid\n105 0\n")
+	got := parsePSParentChildMap(procTable)
+
+	want := map[int][]int{
+		1:   {100},
+		100: {101, 102},
+		101: {103},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parsePSParentChildMap() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCollectProcessTreePIDsFromTable(t *testing.T) {
+	procTable := []byte("100 1\n101 100\n102 100\n103 101\n104 999\n")
+	got := collectProcessTreePIDsFromTable(100, procTable)
+	want := []int{100, 101, 102, 103}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("collectProcessTreePIDsFromTable() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCodexProbeMissingWarning(t *testing.T) {
+	if got := codexProbeMissingWarning(""); got != "" {
+		t.Fatalf("codexProbeMissingWarning(\"\") = %q, want empty", got)
+	}
+	want := "Codex session detection fallback: readlink is not available"
+	if got := codexProbeMissingWarning("readlink"); got != want {
+		t.Fatalf("codexProbeMissingWarning(\"readlink\") = %q, want %q", got, want)
+	}
+}
+
+func TestInstance_ConsumeCodexRestartWarning(t *testing.T) {
+	inst := NewInstanceWithTool("codex-warning", "/tmp/test", "codex")
+	inst.pendingCodexRestartWarning = "Codex session detection fallback: lsof is not available"
+
+	if got := inst.ConsumeCodexRestartWarning(); got == "" {
+		t.Fatalf("ConsumeCodexRestartWarning() returned empty warning")
+	}
+	if got := inst.ConsumeCodexRestartWarning(); got != "" {
+		t.Fatalf("second ConsumeCodexRestartWarning() = %q, want empty", got)
+	}
+}
+
+func TestInstance_ConsumeCodexRestartWarning_Concurrent(t *testing.T) {
+	inst := NewInstanceWithTool("codex-warning-concurrent", "/tmp/test", "codex")
+	inst.pendingCodexRestartWarning = "Codex session detection fallback: readlink is not available"
+
+	const workers = 16
+	var wg sync.WaitGroup
+	results := make(chan string, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- inst.ConsumeCodexRestartWarning()
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	nonEmpty := 0
+	for r := range results {
+		if r != "" {
+			nonEmpty++
+		}
+	}
+	if nonEmpty != 1 {
+		t.Fatalf("non-empty warnings = %d, want 1", nonEmpty)
+	}
+}
+
+// TestInstance_UpdateHookStatus tests the UpdateHookStatus method.
+func TestInstance_UpdateHookStatus(t *testing.T) {
+	inst := NewInstanceWithTool("hook-update-test", "/tmp/test", "claude")
+
+	// Update with hook status
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "hook-session-123",
+		Event:     "PermissionRequest",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	// Verify fields were set
+	if inst.hookStatus != "waiting" {
+		t.Errorf("hookStatus = %q, want waiting", inst.hookStatus)
+	}
+	if inst.ClaudeSessionID != "hook-session-123" {
+		t.Errorf("ClaudeSessionID = %q, want hook-session-123", inst.ClaudeSessionID)
+	}
+}
+
+// TestInstance_UpdateHookStatus_Nil tests UpdateHookStatus with nil input.
+func TestInstance_UpdateHookStatus_Nil(t *testing.T) {
+	inst := NewInstanceWithTool("hook-nil-test", "/tmp/test", "claude")
+
+	// Should not panic
+	inst.UpdateHookStatus(nil)
+
+	if inst.hookStatus != "" {
+		t.Errorf("hookStatus should be empty, got %q", inst.hookStatus)
+	}
+}
+
+func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Claude(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	inst := NewInstanceWithTool("hook-anchor-claude", "/tmp/test", "claude")
+	WriteHookSessionAnchor(inst.ID, "anchor-claude-1")
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "",
+		Event:     "Stop",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.ClaudeSessionID != "anchor-claude-1" {
+		t.Fatalf("ClaudeSessionID = %q, want anchor-claude-1", inst.ClaudeSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Codex(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	inst := NewInstanceWithTool("hook-anchor-codex", "/tmp/test", "codex")
+	WriteHookSessionAnchor(inst.ID, "anchor-codex-1")
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "",
+		Event:     "turn/completed",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.CodexSessionID != "anchor-codex-1" {
+		t.Fatalf("CodexSessionID = %q, want anchor-codex-1", inst.CodexSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_GeminiRejectsCandidateWithoutConversationData(t *testing.T) {
+	tmpDir := t.TempDir()
+	geminiConfigDirOverride = tmpDir
+	defer func() { geminiConfigDirOverride = "" }()
+
+	inst := NewInstanceWithTool("hook-gemini-reject", "/tmp/test", "gemini")
+	inst.GeminiSessionID = "current-gemini-session"
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "candidate-no-data",
+		Event:     "AfterAgent",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.GeminiSessionID != "current-gemini-session" {
+		t.Fatalf("GeminiSessionID = %q, want current-gemini-session", inst.GeminiSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_GeminiAcceptsCandidateWithConversationData(t *testing.T) {
+	tmpDir := t.TempDir()
+	geminiConfigDirOverride = tmpDir
+	defer func() { geminiConfigDirOverride = "" }()
+
+	projectPath := "/tmp/test-gemini-project"
+	inst := NewInstanceWithTool("hook-gemini-accept", projectPath, "gemini")
+	inst.GeminiSessionID = "current-gemini-session"
+
+	candidateID := "11111111-2222-3333-4444-555555555555"
+	sessionsDir := GetGeminiSessionsDir(projectPath)
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		t.Fatalf("mkdir sessions dir: %v", err)
+	}
+	filePath := filepath.Join(sessionsDir, "session-2026-03-05T10-00-"+candidateID[:8]+".json")
+	content := `{"sessionId":"` + candidateID + `","messages":[{"type":"user","content":"hi"}]}`
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: candidateID,
+		Event:     "AfterAgent",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.GeminiSessionID != candidateID {
+		t.Fatalf("GeminiSessionID = %q, want %q", inst.GeminiSessionID, candidateID)
+	}
+}
+
+func TestInstance_SetAcknowledgedFromShared_RunningIgnored(t *testing.T) {
+	inst := NewInstanceWithTool("ack-shared-running", "/tmp/test", "codex")
+	inst.Status = StatusRunning
+
+	inst.SetAcknowledgedFromShared(true)
+
+	if inst.tmuxSession.IsAcknowledged() {
+		t.Fatal("running session should ignore shared acknowledged=true")
+	}
+}
+
+func TestInstance_SetAcknowledgedFromShared_WaitingApplied(t *testing.T) {
+	inst := NewInstanceWithTool("ack-shared-waiting", "/tmp/test", "codex")
+	inst.Status = StatusWaiting
+
+	inst.SetAcknowledgedFromShared(true)
+
+	if !inst.tmuxSession.IsAcknowledged() {
+		t.Fatal("waiting session should apply shared acknowledged=true")
+	}
+}
+
+// TestUpdateStatus_ColdLoadHookFile verifies that UpdateStatus reads hook status
+// from disk when hookStatus is empty (CLI path without StatusFileWatcher).
+func TestUpdateStatus_ColdLoadHookFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	inst := NewInstanceWithTool("cold-load-test", "/tmp/test", "claude")
+
+	// Write a hook status file to disk
+	hooksDir := GetHooksDir()
+	if err := os.MkdirAll(hooksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	hookData := fmt.Sprintf(`{"status":"waiting","session_id":"cold-sess-1","event":"Stop","ts":%d}`, time.Now().Unix())
+	hookPath := filepath.Join(hooksDir, inst.ID+".json")
+	if err := os.WriteFile(hookPath, []byte(hookData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify hookStatus starts empty
+	if inst.hookStatus != "" {
+		t.Fatalf("hookStatus should start empty, got %q", inst.hookStatus)
+	}
+
+	// Call UpdateStatus — it will fail early because tmux session doesn't exist,
+	// but the cold load fires before the tmux-exists check only if we've passed
+	// the tmuxSession nil check. Instead, verify readHookStatusFile directly.
+	hs := readHookStatusFile(inst.ID)
+	if hs == nil {
+		t.Fatal("readHookStatusFile returned nil, expected hook status from disk")
+	}
+	if hs.Status != "waiting" {
+		t.Errorf("hook status = %q, want waiting", hs.Status)
+	}
+	if hs.SessionID != "cold-sess-1" {
+		t.Errorf("hook session ID = %q, want cold-sess-1", hs.SessionID)
+	}
+}
+
+// TestUpdateStatus_ColdLoadResetsAcknowledged verifies that cold-loading a
+// "waiting" hook status resets the stale acknowledged flag from ReconnectSessionLazy.
+func TestUpdateStatus_ColdLoadResetsAcknowledged(t *testing.T) {
+	skipIfNoTmuxServer(t)
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	inst := NewInstanceWithTool("cold-ack-test", tmpHome, "claude")
+
+	// Create a real tmux session so UpdateStatus gets past the Exists() check
+	if err := inst.tmuxSession.Start("sleep 3600"); err != nil {
+		t.Fatalf("failed to start tmux session: %v", err)
+	}
+	defer func() { _ = inst.tmuxSession.Kill() }()
+
+	// Simulate what ReconnectSessionLazy does for previousStatus="idle"
+	inst.tmuxSession.Acknowledge()
+	if !inst.tmuxSession.IsAcknowledged() {
+		t.Fatal("precondition: acknowledged should be true after Acknowledge()")
+	}
+
+	// Write a hook status file showing "waiting"
+	hooksDir := GetHooksDir()
+	if err := os.MkdirAll(hooksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	hookData := fmt.Sprintf(`{"status":"waiting","session_id":"sess-1","event":"Stop","ts":%d}`, time.Now().Unix())
+	if err := os.WriteFile(filepath.Join(hooksDir, inst.ID+".json"), []byte(hookData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for grace period to pass (1.5s)
+	time.Sleep(2 * time.Second)
+
+	// hookStatus is empty, so cold load should fire and reset acknowledged
+	inst.hookStatus = ""
+	_ = inst.UpdateStatus()
+
+	// After cold load with "waiting" status, acknowledged should be reset
+	if inst.tmuxSession.IsAcknowledged() {
+		t.Error("acknowledged should be false after cold-loading 'waiting' hook status")
+	}
+}
+
+// TestWriteHookSessionAnchor_InRestart verifies that WriteHookSessionAnchor
+// creates a .sid file with the correct session ID content.
+func TestWriteHookSessionAnchor_InRestart(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	instanceID := "restart-sid-test"
+	sessionID := "restart-session-abc123"
+
+	WriteHookSessionAnchor(instanceID, sessionID)
+
+	got := ReadHookSessionAnchor(instanceID)
+	if got != sessionID {
+		t.Errorf("ReadHookSessionAnchor = %q, want %q", got, sessionID)
+	}
+}
+
+// Tests for hasUnsentComposerPrompt and currentComposerPrompt moved to
+// internal/send/send_test.go as part of send verification consolidation.
+
+// TestGenerateUUID verifies that generateUUID returns a valid lowercase UUID v4.
+func TestGenerateUUID(t *testing.T) {
+	uuidRE := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	id := generateUUID()
+	if !uuidRE.MatchString(id) {
+		t.Errorf("generateUUID() = %q, does not match UUID v4 pattern", id)
+	}
+	// Must be all lowercase
+	if id != strings.ToLower(id) {
+		t.Errorf("generateUUID() = %q, must be lowercase", id)
+	}
+}
+
+// TestGenerateUUID_Uniqueness verifies that two calls return different values.
+func TestGenerateUUID_Uniqueness(t *testing.T) {
+	a := generateUUID()
+	b := generateUUID()
+	if a == b {
+		t.Errorf("generateUUID() returned same value twice: %q", a)
+	}
+}
+
+// TestBuildClaudeCommandNoUuidgen verifies that the built command does not use
+// shell-based uuidgen or $( substitution for the session ID.
+func TestBuildClaudeCommandNoUuidgen(t *testing.T) {
+	inst := NewInstanceWithTool("uuid-test", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("command must NOT use shell uuidgen (replaced with Go-side UUID):\n  cmd: %q", cmd)
+	}
+	if strings.Contains(cmd, "session_id=$(") {
+		t.Errorf("command must NOT use $( shell substitution for session ID:\n  cmd: %q", cmd)
+	}
+}
+
+// TestBuildClaudeCommandHasSessionID verifies that the built command embeds a
+// literal UUID in the --session-id flag. CLAUDE_SESSION_ID is set via host-side
+// SetEnvironment after session start (not embedded in the shell command string).
+func TestBuildClaudeCommandHasSessionID(t *testing.T) {
+	inst := NewInstanceWithTool("uuid-literal-test", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("command must include --session-id flag:\n  cmd: %q", cmd)
+	}
+	// tmux set-environment must NOT be in the shell command string;
+	// CLAUDE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("command must NOT embed tmux set-environment (use host-side SetEnvironment):\n  cmd: %q", cmd)
+	}
+}
+
+// TestForkCommandNoUuidgen verifies that Fork() does not use shell uuidgen.
+func TestForkCommandNoUuidgen(t *testing.T) {
+	inst := NewInstance("fork-uuid-test", "/tmp/test")
+	inst.ClaudeSessionID = "parent-session-id"
+	inst.ClaudeDetectedAt = time.Now()
+
+	cmd, err := inst.Fork("forked", "")
+	if err != nil {
+		t.Fatalf("Fork() failed: %v", err)
+	}
+
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command must NOT use shell uuidgen (replaced with Go-side UUID):\n  cmd: %q", cmd)
+	}
+	if strings.Contains(cmd, "session_id=$(") {
+		t.Errorf("Fork command must NOT use $( shell substitution:\n  cmd: %q", cmd)
+	}
 }

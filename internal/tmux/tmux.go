@@ -1,28 +1,106 @@
 package tmux
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sync/singleflight"
+
+	"github.com/BurntSushi/toml"
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/platform"
+	dark "github.com/thiagokokada/dark-mode-go"
 )
 
-// Debug flag - set via environment variable AGENTDECK_DEBUG=1
-var debugStatusEnabled = os.Getenv("AGENTDECK_DEBUG") == "1"
+var (
+	statusLog  = logging.ForComponent(logging.CompStatus)
+	respawnLog = logging.ForComponent(logging.CompSession)
+	mcpLog     = logging.ForComponent(logging.CompMCP)
+	perfLog    = logging.ForComponent(logging.CompPerf)
+)
 
-func debugLog(format string, args ...interface{}) {
-	if debugStatusEnabled {
-		log.Printf("[STATUS] "+format, args...)
+type tmuxThemeStyle struct {
+	windowStyle       string
+	windowActiveStyle string
+	statusStyle       string
+	hintColor         string
+}
+
+func resolvedAgentDeckTheme() string {
+	type cfg struct {
+		Theme string `toml:"theme"`
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		var c cfg
+		if _, err := toml.DecodeFile(filepath.Join(home, ".agent-deck", "config.toml"), &c); err == nil {
+			switch c.Theme {
+			case "light", "dark":
+				return c.Theme
+			case "system", "":
+				// fall through to OS detection
+			default:
+				return "dark"
+			}
+		}
+	}
+	isDark, err := dark.IsDarkMode()
+	if err != nil {
+		return "dark"
+	}
+	if isDark {
+		return "dark"
+	}
+	return "light"
+}
+
+func currentTmuxThemeStyle() tmuxThemeStyle {
+	if resolvedAgentDeckTheme() == "light" {
+		return tmuxThemeStyle{
+			// Light terminals can still inherit a dark-looking tmux window background
+			// when we leave window-style at "default". Use an explicit neutral light
+			// background so the attached client sees and renders against a light pane.
+			windowStyle:       "bg=#f9f9f9",
+			windowActiveStyle: "bg=#f9f9f9",
+			statusStyle:       "bg=#e9e9ec,fg=#343b58",
+			hintColor:         "#6a6d7c",
+		}
+	}
+	return tmuxThemeStyle{
+		// Preserve the historical dark behavior unless a light theme is active.
+		windowStyle:       "default",
+		windowActiveStyle: "default",
+		statusStyle:       "bg=#1a1b26,fg=#a9b1d6",
+		hintColor:         "#565f89",
 	}
 }
+
+func (s *Session) themedStatusRight(themeStyle tmuxThemeStyle) string {
+	folderName := filepath.Base(s.WorkDir)
+	if folderName == "" || folderName == "." {
+		folderName = "~"
+	}
+	return fmt.Sprintf("#[fg=%s]ctrl+q detach#[default] │ 📁 %s | %s ", themeStyle.hintColor, s.DisplayName, folderName)
+}
+
+// ErrCaptureTimeout is returned when CapturePane exceeds its timeout.
+// Callers should preserve previous state rather than transitioning to error/inactive.
+var ErrCaptureTimeout = errors.New("capture-pane timed out")
 
 const SessionPrefix = "agentdeck_"
 
@@ -38,12 +116,38 @@ var (
 // RefreshSessionCache updates the cache of existing tmux sessions and their activity
 // Call this ONCE per tick, then use Session.Exists() and Session.GetWindowActivity()
 // which read from cache. This reduces 30+ subprocess spawns to just 1 per tick cycle.
+//
+// Tries PipeManager first (zero subprocess), falls back to subprocess.
+//
+// NOTE: We use window_activity (not session_activity) because window_activity updates
+// when there's actual terminal output, while session_activity only updates on
+// session-level events. This is critical for detecting when Claude is actively working.
 func RefreshSessionCache() {
-	// Get both session name AND activity timestamp in single call
-	cmd := exec.Command("tmux", "list-sessions", "-F", "#{session_name}\t#{session_activity}")
+	finish := logging.TraceOp(perfLog, "refresh_session_cache", 100*time.Millisecond)
+	defer finish()
+
+	// Try control mode pipe first (zero subprocess)
+	if pm := GetPipeManager(); pm != nil {
+		if activities, windows, err := pm.RefreshAllActivities(); err == nil && len(activities) > 0 {
+			sessionCacheMu.Lock()
+			sessionCacheData = activities
+			sessionCacheTime = time.Now()
+			sessionCacheMu.Unlock()
+
+			windowCacheMu.Lock()
+			windowCacheData = windows
+			windowCacheTime = time.Now()
+			windowCacheMu.Unlock()
+			return
+		}
+		// Pipe failed: log it so we can verify zero subprocess usage
+		statusLog.Debug("refresh_cache_subprocess_fallback")
+	}
+
+	// Subprocess fallback: list-windows -a
+	cmd := exec.Command("tmux", "list-windows", "-a", "-F", "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}")
 	output, err := cmd.Output()
 	if err != nil {
-		// tmux not running or error - clear cache
 		sessionCacheMu.Lock()
 		sessionCacheData = nil
 		sessionCacheTime = time.Time{}
@@ -51,25 +155,56 @@ func RefreshSessionCache() {
 		return
 	}
 
-	newCache := make(map[string]int64)
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+	newSessionCache, newWindowCache := parseListWindowsOutput(string(output))
+
+	sessionCacheMu.Lock()
+	sessionCacheData = newSessionCache
+	sessionCacheTime = time.Now()
+	sessionCacheMu.Unlock()
+
+	windowCacheMu.Lock()
+	windowCacheData = newWindowCache
+	windowCacheTime = time.Now()
+	windowCacheMu.Unlock()
+}
+
+// parseListWindowsOutput parses the output of `tmux list-windows -a` with the extended format
+// "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}"
+// Returns session-level max activity and per-session window info.
+func parseListWindowsOutput(output string) (map[string]int64, map[string][]WindowInfo) {
+	sessionCache := make(map[string]int64)
+	windowCache := make(map[string][]WindowInfo)
+
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) < 2 {
 			continue
 		}
 		name := parts[0]
 		var activity int64
-		_, _ = fmt.Sscanf(parts[1], "%d", &activity) // ignore error, 0 is valid default
-		newCache[name] = activity
+		_, _ = fmt.Sscanf(parts[1], "%d", &activity)
+
+		// Session-level: keep max activity
+		if existing, ok := sessionCache[name]; !ok || activity > existing {
+			sessionCache[name] = activity
+		}
+
+		// Window-level: only if we have index and name fields
+		if len(parts) == 4 {
+			var idx int
+			_, _ = fmt.Sscanf(parts[2], "%d", &idx)
+			windowCache[name] = append(windowCache[name], WindowInfo{
+				Index:    idx,
+				Name:     parts[3],
+				Activity: activity,
+			})
+		}
 	}
 
-	sessionCacheMu.Lock()
-	sessionCacheData = newCache
-	sessionCacheTime = time.Now()
-	sessionCacheMu.Unlock()
+	return sessionCache, windowCache
 }
 
 // RefreshExistingSessions is an alias for RefreshSessionCache for backwards compatibility
@@ -139,10 +274,10 @@ func IsTmuxAvailable() error {
 
 // TerminalInfo contains detected terminal information
 type TerminalInfo struct {
-	Name           string // Terminal name (warp, iterm2, kitty, alacritty, etc.)
-	SupportsOSC8   bool   // Supports OSC 8 hyperlinks
-	SupportsOSC52  bool   // Supports OSC 52 clipboard
-	SupportsTrueColor bool // Supports 24-bit color
+	Name              string // Terminal name (warp, iterm2, kitty, alacritty, etc.)
+	SupportsOSC8      bool   // Supports OSC 8 hyperlinks
+	SupportsOSC52     bool   // Supports OSC 52 clipboard
+	SupportsTrueColor bool   // Supports 24-bit color
 }
 
 // DetectTerminal identifies the current terminal emulator from environment variables
@@ -208,9 +343,9 @@ func GetTerminalInfo() TerminalInfo {
 	terminal := DetectTerminal()
 
 	info := TerminalInfo{
-		Name:           terminal,
-		SupportsOSC8:   false,
-		SupportsOSC52:  false,
+		Name:              terminal,
+		SupportsOSC8:      false,
+		SupportsOSC52:     false,
 		SupportsTrueColor: false,
 	}
 
@@ -225,8 +360,8 @@ func GetTerminalInfo() TerminalInfo {
 	switch terminal {
 	case "warp":
 		// Warp: Full modern terminal support
-		info.SupportsOSC8 = true   // Native clickable paths
-		info.SupportsOSC52 = true  // Clipboard integration
+		info.SupportsOSC8 = true  // Native clickable paths
+		info.SupportsOSC52 = true // Clipboard integration
 		info.SupportsTrueColor = true
 
 	case "iterm2":
@@ -280,7 +415,7 @@ func GetTerminalInfo() TerminalInfo {
 	default:
 		// Unknown terminal - assume basic support
 		// Most modern terminals support these features
-		info.SupportsOSC8 = true  // Optimistic default
+		info.SupportsOSC8 = true // Optimistic default
 		info.SupportsOSC52 = true
 	}
 
@@ -293,10 +428,14 @@ func SupportsHyperlinks() bool {
 }
 
 // Tool detection patterns (used by DetectTool for initial tool identification)
+var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "pi"}
+
 var toolDetectionPatterns = map[string][]*regexp.Regexp{
 	"claude": {
-		regexp.MustCompile(`(?i)claude`),
-		regexp.MustCompile(`(?i)anthropic`),
+		// Avoid matching bare words like "claude-deck" in shell prompts/paths.
+		regexp.MustCompile(`(?i)\bclaude\s+code\b`),
+		regexp.MustCompile(`(?i)\bno,\s*and\s*tell\s+claude\s+what\s+to\s+do\s+differently\b`),
+		regexp.MustCompile(`(?i)\bdo you trust the files in this folder\??`),
 	},
 	"gemini": {
 		regexp.MustCompile(`(?i)gemini`),
@@ -310,6 +449,65 @@ var toolDetectionPatterns = map[string][]*regexp.Regexp{
 		regexp.MustCompile(`(?i)codex`),
 		regexp.MustCompile(`(?i)openai`),
 	},
+	"pi": {
+		regexp.MustCompile(`(?mi)^\s*pi>\s*`),
+		regexp.MustCompile(`(?i)\bpi\s+cli\b`),
+		regexp.MustCompile(`(?i)\bpi\s+code\b`),
+	},
+}
+
+func detectToolFromCommand(command string) string {
+	cmdLower := strings.ToLower(strings.TrimSpace(command))
+	if cmdLower == "" {
+		return ""
+	}
+
+	fields := strings.Fields(cmdLower)
+	if len(fields) > 0 {
+		base := filepath.Base(fields[0])
+		switch base {
+		case "claude":
+			return "claude"
+		case "gemini":
+			return "gemini"
+		case "opencode", "open-code":
+			return "opencode"
+		case "codex":
+			return "codex"
+		case "pi":
+			return "pi"
+		}
+	}
+
+	switch {
+	case strings.Contains(cmdLower, "claude"):
+		return "claude"
+	case strings.Contains(cmdLower, "gemini"):
+		return "gemini"
+	case strings.Contains(cmdLower, "opencode") || strings.Contains(cmdLower, "open code") || strings.Contains(cmdLower, "open-code"):
+		return "opencode"
+	case strings.Contains(cmdLower, "codex"):
+		return "codex"
+	case strings.Contains(cmdLower, " pi ") || strings.HasPrefix(cmdLower, "pi "):
+		return "pi"
+	default:
+		return ""
+	}
+}
+
+func detectToolFromContent(cleanContent string) string {
+	for _, tool := range toolDetectionOrder {
+		patterns, ok := toolDetectionPatterns[tool]
+		if !ok {
+			continue
+		}
+		for _, pattern := range patterns {
+			if pattern.MatchString(cleanContent) {
+				return tool
+			}
+		}
+	}
+	return "shell"
 }
 
 // StateTracker tracks content changes for notification-style status detection
@@ -325,22 +523,84 @@ type StateTracker struct {
 	acknowledged          bool      // User has seen this state (yellow vs gray)
 	acknowledgedAt        time.Time // When acknowledged was set (for grace period)
 	lastActivityTimestamp int64     // tmux window_activity timestamp for spike detection
+	waitingSince          time.Time // When session transitioned to waiting status
+	promptNoBusyCount     int       // consecutive prompt-visible polls with no busy signal while active
 
 	// Non-blocking spike detection: track changes across tick cycles
 	activityCheckStart  time.Time // When we started tracking for sustained activity
 	activityChangeCount int       // How many timestamp changes seen in current window
+
+	// Spinner activity tracking: grace period between tool calls
+	spinnerTracker *SpinnerActivityTracker
 }
 
-// acknowledgeGracePeriod is how long after user detaches before content changes
-// can reset the acknowledged flag. This prevents brief GREEN flashes when Claude
-// outputs a final message right after user detaches.
-const acknowledgeGracePeriod = 300 * time.Millisecond
+// SpinnerActivityTracker tracks when the spinner was last detected on screen.
+// Used for the grace period between tool calls where the spinner briefly disappears.
+//
+// This is intentionally simple: spinner PRESENCE from the curated char set
+// (which excludes ✻ done marker and · non-spinner) is the reliable signal.
+// No movement tracking needed because the char set itself distinguishes active vs done.
+type SpinnerActivityTracker struct {
+	lastBusyTime time.Time     // when spinner was last detected on screen
+	gracePeriod  time.Duration // how long to stay busy after spinner disappears (default: 6s)
+}
 
-// activityCooldown is how long to show GREEN after content stops changing.
-// This prevents flickering during natural micro-pauses in AI output.
-// - 2 seconds: Covers most pauses between output bursts
-// - 3 seconds: More conservative, fewer false yellows
-const activityCooldown = 2 * time.Second
+// NewSpinnerActivityTracker creates a tracker with default grace period.
+func NewSpinnerActivityTracker() *SpinnerActivityTracker {
+	return &SpinnerActivityTracker{
+		gracePeriod: 6 * time.Second, // cover 3 polls (2s each) of spinner absence
+	}
+}
+
+// MarkBusy records that an active spinner char is currently visible on screen.
+func (sat *SpinnerActivityTracker) MarkBusy() {
+	sat.lastBusyTime = time.Now()
+}
+
+// InGracePeriod returns true if an active spinner was visible recently.
+// This covers the brief gap between tool calls where the spinner disappears
+// before the next tool starts.
+func (sat *SpinnerActivityTracker) InGracePeriod() bool {
+	return !sat.lastBusyTime.IsZero() && time.Since(sat.lastBusyTime) < sat.gracePeriod
+}
+
+// findSpinnerInContent extracts the first spinner character found in the last
+// N lines of terminal content. Returns the char and the full line it was found on.
+// Skips box-drawing lines (UI borders) and empty lines.
+func findSpinnerInContent(content string, spinnerChars []string) (char string, line string, found bool) {
+	lines := strings.Split(content, "\n")
+	// Check last 10 lines (status line is always near bottom)
+	start := len(lines) - 10
+	if start < 0 {
+		start = 0
+	}
+	for i := len(lines) - 1; i >= start; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			continue
+		}
+		// Skip box-drawing lines (UI borders)
+		if startsWithBoxDrawing(lines[i]) {
+			continue
+		}
+		for _, ch := range spinnerChars {
+			if strings.Contains(lines[i], ch) {
+				return ch, lines[i], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// isBrailleSpinnerChar returns true for the classic 10-frame braille spinner.
+func isBrailleSpinnerChar(ch string) bool {
+	switch ch {
+	case "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏":
+		return true
+	default:
+		return false
+	}
+}
 
 // Session represents a tmux session
 // NOTE: All mutable fields are protected by mu. The Bubble Tea event loop is single-threaded,
@@ -351,9 +611,23 @@ type Session struct {
 	WorkDir     string
 	Command     string
 	Created     time.Time
+	InstanceID  string // Agent-deck instance ID for hook callbacks
+	startupAt   time.Time
 
 	// mu protects all mutable fields below from concurrent access
 	mu sync.Mutex
+
+	// PERFORMANCE: Lazy initialization flag
+	// When true, ConfigureStatusBar/EnableMouseMode have been run
+	// Allows deferring non-essential tmux configuration until first attach
+	configured bool
+
+	// PERFORMANCE: Cache CapturePane content for short duration (500ms)
+	// Reduces subprocess spawns during rapid status checks/log events
+	cacheMu      sync.RWMutex
+	cacheContent string
+	cacheTime    time.Time
+	captureSf    singleflight.Group // Deduplicates concurrent CapturePane subprocess calls
 
 	// Content tracking for HasUpdated (separate from StateTracker)
 	lastHash    string
@@ -369,6 +643,59 @@ type Session struct {
 
 	// Last status returned (for debugging)
 	lastStableStatus string
+
+	// OptionOverrides are user-specified tmux set-option overrides from config.
+	// Applied AFTER all defaults in Start(), so they take precedence.
+	// Keys are tmux option names, values are their settings.
+	// Example: {"allow-passthrough": "all", "history-limit": "50000"}
+	OptionOverrides map[string]string
+
+	// RunCommandAsInitialProcess launches Start(command) as the pane's initial
+	// process instead of sending it via SendKeysAndEnter after session creation.
+	// Sandbox sessions enable this so pane-dead detection can restart exited tools.
+	RunCommandAsInitialProcess bool
+
+	// Custom patterns for generic tool support
+	customToolName       string
+	customBusyPatterns   []string
+	customPromptPatterns []string
+	customDetectPatterns []string
+
+	// Configurable patterns (replaces hardcoded detection logic)
+	// When non-nil, hasBusyIndicator and normalizeContent use these instead of hardcoded values
+	resolvedPatterns *ResolvedPatterns
+
+	// Cached PromptDetector (avoids allocating a new one on every hasPromptIndicator call)
+	cachedPromptDetector     *PromptDetector
+	cachedPromptDetectorTool string
+
+	// Environment variable cache (reduces tmux show-environment subprocess spawns)
+	envCache   map[string]envCacheEntry
+	envCacheMu sync.RWMutex
+
+	// injectStatusLine controls whether ConfigureStatusBar actually modifies tmux.
+	// When false, the status bar configuration is skipped entirely.
+	// Default: true (set via SetInjectStatusLine from user config)
+	injectStatusLine bool
+}
+
+type envCacheEntry struct {
+	value string
+	time  time.Time
+}
+
+const (
+	envCacheTTL        = 30 * time.Second
+	startupStateWindow = 2 * time.Minute
+)
+
+// invalidateCache clears the CapturePane cache.
+// MUST be called after any action that might change terminal content.
+func (s *Session) invalidateCache() {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.cacheContent = ""
+	s.cacheTime = time.Time{}
 }
 
 // ensureStateTrackerLocked lazily allocates the tracker so callers can safely
@@ -378,13 +705,83 @@ func (s *Session) ensureStateTrackerLocked() {
 	if s.stateTracker == nil {
 		s.stateTracker = &StateTracker{
 			lastHash:       "",
-			lastChangeTime: time.Now().Add(-activityCooldown),
+			lastChangeTime: time.Now(),
 			acknowledged:   false,
+			spinnerTracker: NewSpinnerActivityTracker(),
 		}
+	}
+	// Ensure spinnerTracker exists even for older StateTrackers
+	if s.stateTracker.spinnerTracker == nil {
+		s.stateTracker.spinnerTracker = NewSpinnerActivityTracker()
 	}
 }
 
-// LogFile returns the path to this session's pipe-pane log file
+// shouldHoldActiveOnPromptLocked applies a small hysteresis when a session was
+// recently active but current capture shows prompt with no busy signal.
+// This avoids active <-> waiting flicker from transient capture misses.
+// MUST be called with s.mu held.
+func (s *Session) shouldHoldActiveOnPromptLocked() bool {
+	if s.stateTracker == nil || s.lastStableStatus != "active" {
+		return false
+	}
+	const promptNoBusyHoldPolls = 2
+	if s.stateTracker.promptNoBusyCount < promptNoBusyHoldPolls {
+		s.stateTracker.promptNoBusyCount++
+		return true
+	}
+	return false
+}
+
+// resetPromptNoBusyHoldLocked clears prompt-no-busy hysteresis counters.
+// MUST be called with s.mu held.
+func (s *Session) resetPromptNoBusyHoldLocked() {
+	if s.stateTracker != nil {
+		s.stateTracker.promptNoBusyCount = 0
+	}
+}
+
+// inStartupWindowLocked returns true when the session is still in its startup phase.
+// MUST be called with s.mu held.
+func (s *Session) inStartupWindowLocked() bool {
+	return !s.startupAt.IsZero() && time.Since(s.startupAt) < startupStateWindow
+}
+
+// SetCustomPatterns sets custom patterns for generic tool support
+// These patterns enable custom tools defined in config.toml to have proper status detection
+func (s *Session) SetCustomPatterns(toolName string, busyPatterns, promptPatterns, detectPatterns []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.customToolName = toolName
+	s.customBusyPatterns = busyPatterns
+	s.customPromptPatterns = promptPatterns
+	s.customDetectPatterns = detectPatterns
+}
+
+// SetPatterns sets the compiled ResolvedPatterns for configurable status detection.
+// When set, hasBusyIndicator and normalizeContent use these instead of hardcoded values.
+func (s *Session) SetPatterns(p *ResolvedPatterns) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resolvedPatterns = p
+}
+
+// SetDetectPatterns sets tool auto-detection patterns (separate from busy/prompt patterns).
+func (s *Session) SetDetectPatterns(toolName string, detectPatterns []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.customToolName = toolName
+	s.customDetectPatterns = detectPatterns
+}
+
+// SetInjectStatusLine controls whether ConfigureStatusBar modifies tmux settings.
+// When set to false, the status bar is left unchanged, preserving user's tmux config.
+func (s *Session) SetInjectStatusLine(inject bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.injectStatusLine = inject
+}
+
+// LogFile returns the path to this session's log file
 // Logs are stored in ~/.agent-deck/logs/<session-name>.log
 func (s *Session) LogFile() string {
 	homeDir, err := os.UserHomeDir()
@@ -414,8 +811,10 @@ func NewSession(name, workDir string) *Session {
 		DisplayName:      name,
 		WorkDir:          workDir,
 		Created:          time.Now(),
+		startupAt:        time.Now(),
 		lastStableStatus: "waiting",
 		toolDetectExpiry: 30 * time.Second, // Re-detect tool every 30 seconds
+		injectStatusLine: true,             // Default: inject status bar
 		// stateTracker and promptDetector will be created lazily on first status check
 	}
 }
@@ -423,6 +822,9 @@ func NewSession(name, workDir string) *Session {
 // ReconnectSession creates a Session object for an existing tmux session
 // This is used when loading sessions from storage - it properly initializes
 // all fields needed for status detection to work correctly
+//
+// Note: This runs immediate configuration (ConfigureStatusBar).
+// For lazy loading during TUI startup, use ReconnectSessionLazy instead.
 func ReconnectSession(tmuxName, displayName, workDir, command string) *Session {
 	sess := &Session{
 		Name:             tmuxName,
@@ -430,18 +832,18 @@ func ReconnectSession(tmuxName, displayName, workDir, command string) *Session {
 		WorkDir:          workDir,
 		Command:          command,
 		Created:          time.Now(), // Approximate - we don't persist this
+		startupAt:        time.Time{},
 		lastStableStatus: "waiting",
 		toolDetectExpiry: 30 * time.Second,
+		injectStatusLine: true,  // Default: inject status bar
+		configured:       false, // Will be set to true after configuration
 		// stateTracker and promptDetector will be created lazily on first status check
 	}
 
-	// Enable pipe-pane for event-driven status detection
+	// Configure existing sessions
 	if sess.Exists() {
-		if err := sess.EnablePipePane(); err != nil {
-			debugLog("Warning: failed to enable pipe-pane for %s: %v", tmuxName, err)
-		}
-		// Configure status bar for existing sessions
 		sess.ConfigureStatusBar()
+		sess.configured = true
 	}
 
 	return sess
@@ -480,15 +882,84 @@ func ReconnectSessionWithStatus(tmuxName, displayName, workDir, command string, 
 		sess.lastStableStatus = "waiting"
 	}
 
-	// Enable pipe-pane for event-driven status detection
-	// (Note: Also called in ReconnectSession, but we ensure it's enabled after state restoration)
-	if sess.Exists() {
-		if err := sess.EnablePipePane(); err != nil {
-			debugLog("Warning: failed to enable pipe-pane for %s: %v", tmuxName, err)
+	return sess
+}
+
+// ReconnectSessionLazy creates a Session object without running any tmux configuration.
+// PERFORMANCE: This is used during TUI startup to avoid subprocess overhead.
+// Non-essential configuration (EnableMouseMode, ConfigureStatusBar)
+// is deferred until first user interaction via EnsureConfigured().
+//
+// Use this for bulk session loading where immediate configuration is not needed.
+// For sessions that need immediate configuration, use ReconnectSession or ReconnectSessionWithStatus.
+func ReconnectSessionLazy(tmuxName, displayName, workDir, command string, previousStatus string) *Session {
+	sess := &Session{
+		Name:             tmuxName,
+		DisplayName:      displayName,
+		WorkDir:          workDir,
+		Command:          command,
+		Created:          time.Now(), // Approximate - we don't persist this
+		startupAt:        time.Time{},
+		lastStableStatus: "waiting",
+		toolDetectExpiry: 30 * time.Second,
+		injectStatusLine: true,  // Default: inject status bar
+		configured:       false, // Explicitly mark as not configured
+	}
+
+	// Restore state tracker based on previous status (without running tmux commands)
+	switch previousStatus {
+	case "idle":
+		sess.stateTracker = &StateTracker{
+			lastHash:       "",
+			lastChangeTime: time.Now().Add(-10 * time.Second),
+			acknowledged:   true,
 		}
+		sess.lastStableStatus = "idle"
+
+	case "waiting", "active":
+		sess.stateTracker = &StateTracker{
+			lastHash:       "",
+			lastChangeTime: time.Now().Add(-10 * time.Second),
+			acknowledged:   false,
+		}
+		sess.lastStableStatus = "waiting"
+
+	default:
+		sess.lastStableStatus = "waiting"
 	}
 
 	return sess
+}
+
+// EnsureConfigured runs deferred tmux configuration if not already done.
+// PERFORMANCE: This should be called before attaching to a session or when
+// the session needs full functionality (e.g., status bar, mouse mode).
+//
+// Safe to call multiple times - does nothing if already configured or session doesn't exist.
+// Thread-safe via mutex protection.
+func (s *Session) EnsureConfigured() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Already configured or session doesn't exist - nothing to do
+	if s.configured || !s.Exists() {
+		return
+	}
+
+	// Run deferred configuration
+	s.ConfigureStatusBar()
+	_ = s.EnableMouseMode()
+
+	s.configured = true
+	statusLog.Debug("lazy_config_completed", slog.String("session", s.DisplayName))
+}
+
+// IsConfigured returns whether the session has been fully configured.
+// Used for debugging and testing.
+func (s *Session) IsConfigured() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.configured
 }
 
 // generateShortID generates a short random ID for uniqueness
@@ -504,12 +975,47 @@ func generateShortID() string {
 // SetEnvironment sets an environment variable for this tmux session
 func (s *Session) SetEnvironment(key, value string) error {
 	cmd := exec.Command("tmux", "set-environment", "-t", s.Name, key, value)
-	return cmd.Run()
+	err := cmd.Run()
+	if err == nil {
+		// Invalidate cache entry so next GetEnvironment sees the new value
+		s.envCacheMu.Lock()
+		if s.envCache != nil {
+			delete(s.envCache, key)
+		}
+		s.envCacheMu.Unlock()
+	}
+	return err
 }
 
-// GetEnvironment gets an environment variable from this tmux session
-// Returns the value or error if not found
+func (s *Session) ApplyThemeOptions() error {
+	themeStyle := currentTmuxThemeStyle()
+	args := []string{
+		"set-option", "-t", s.Name, "window-style", themeStyle.windowStyle, ";",
+		"set-option", "-t", s.Name, "window-active-style", themeStyle.windowActiveStyle, ";",
+		"set-option", "-t", s.Name, "status-style", themeStyle.statusStyle,
+	}
+	if s.injectStatusLine {
+		args = append(args,
+			";", "set-option", "-t", s.Name, "status-right", s.themedStatusRight(themeStyle),
+		)
+	}
+	return exec.Command("tmux", args...).Run()
+}
+
+// GetEnvironment gets an environment variable from this tmux session.
+// Uses a 30-second cache to avoid spawning tmux show-environment subprocesses
+// on every poll cycle. Call InvalidateEnvCache() after SetEnvironment to clear.
 func (s *Session) GetEnvironment(key string) (string, error) {
+	// Check cache first
+	s.envCacheMu.RLock()
+	if s.envCache != nil {
+		if entry, ok := s.envCache[key]; ok && time.Since(entry.time) < envCacheTTL {
+			s.envCacheMu.RUnlock()
+			return entry.value, nil
+		}
+	}
+	s.envCacheMu.RUnlock()
+
 	cmd := exec.Command("tmux", "show-environment", "-t", s.Name, key)
 	output, err := cmd.Output()
 	if err != nil {
@@ -519,21 +1025,148 @@ func (s *Session) GetEnvironment(key string) (string, error) {
 	line := strings.TrimSpace(string(output))
 	prefix := key + "="
 	if strings.HasPrefix(line, prefix) {
-		return strings.TrimPrefix(line, prefix), nil
+		value := strings.TrimPrefix(line, prefix)
+		// Store in cache
+		s.envCacheMu.Lock()
+		if s.envCache == nil {
+			s.envCache = make(map[string]envCacheEntry)
+		}
+		s.envCache[key] = envCacheEntry{value: value, time: time.Now()}
+		s.envCacheMu.Unlock()
+		return value, nil
 	}
 	return "", fmt.Errorf("variable not found: %s", key)
 }
 
+// InvalidateEnvCache clears the environment variable cache for this session.
+// Should be called after SetEnvironment to ensure fresh reads.
+func (s *Session) InvalidateEnvCache() {
+	s.envCacheMu.Lock()
+	s.envCache = nil
+	s.envCacheMu.Unlock()
+}
+
+// sanitizeNameRe matches characters not allowed in tmux session names.
+var sanitizeNameRe = regexp.MustCompile(`[^a-zA-Z0-9-]+`)
+
 // sanitizeName converts a display name to a valid tmux session name
 func sanitizeName(name string) string {
 	// Replace spaces and special characters with hyphens
-	re := regexp.MustCompile(`[^a-zA-Z0-9-]+`)
-	return re.ReplaceAllString(name, "-")
+	return sanitizeNameRe.ReplaceAllString(name, "-")
 }
 
-// Start creates and starts a tmux session
+func shouldRecoverFromTmuxStartError(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "server exited unexpectedly") ||
+		strings.Contains(lower, "lost server")
+}
+
+func recoverFromStaleDefaultSocketIfNeeded(startErrOutput string) (bool, error) {
+	if !shouldRecoverFromTmuxStartError(startErrOutput) {
+		return false, nil
+	}
+
+	// If tmux can already answer list-sessions, don't touch any socket file.
+	if err := exec.Command("tmux", "list-sessions").Run(); err == nil {
+		return false, nil
+	}
+
+	for _, socketPath := range defaultTmuxSocketCandidates() {
+		info, err := os.Stat(socketPath)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		if isSocketAcceptingConnections(socketPath) {
+			continue
+		}
+
+		backupPath := fmt.Sprintf("%s.stale.%d", socketPath, time.Now().UnixNano())
+		if err := os.Rename(socketPath, backupPath); err != nil {
+			return false, fmt.Errorf("failed to quarantine stale tmux socket %s: %w", socketPath, err)
+		}
+
+		statusLog.Warn("tmux_stale_socket_recovered",
+			slog.String("socket", socketPath),
+			slog.String("backup", backupPath),
+		)
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func defaultTmuxSocketCandidates() []string {
+	uid := os.Getuid()
+	if uid < 0 {
+		return nil
+	}
+
+	add := func(out []string, seen map[string]struct{}, p string) []string {
+		if p == "" {
+			return out
+		}
+		if _, ok := seen[p]; ok {
+			return out
+		}
+		seen[p] = struct{}{}
+		return append(out, p)
+	}
+
+	seen := make(map[string]struct{})
+	candidates := make([]string, 0, 5)
+	if tmuxPath := tmuxSocketPathFromEnv(); tmuxPath != "" {
+		candidates = add(candidates, seen, tmuxPath)
+	}
+
+	socketSuffix := filepath.Join(fmt.Sprintf("tmux-%d", uid), "default")
+	if tmuxTmp := os.Getenv("TMUX_TMPDIR"); tmuxTmp != "" {
+		candidates = add(candidates, seen, filepath.Join(tmuxTmp, socketSuffix))
+	}
+	candidates = add(candidates, seen, filepath.Join(os.TempDir(), socketSuffix))
+	candidates = add(candidates, seen, filepath.Join("/tmp", socketSuffix))
+	candidates = add(candidates, seen, filepath.Join("/private/tmp", socketSuffix))
+	return candidates
+}
+
+func tmuxSocketPathFromEnv() string {
+	raw := os.Getenv("TMUX")
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0]
+}
+
+func isSocketAcceptingConnections(socketPath string) bool {
+	conn, err := net.DialTimeout("unix", socketPath, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// Start creates and starts a tmux session.
+// By default, command is sent after session creation (legacy behavior).
+// When RunCommandAsInitialProcess is true, command is passed directly to tmux
+// new-session and becomes the pane's initial process.
 func (s *Session) Start(command string) error {
 	s.Command = command
+	s.invalidateCache()
+	s.Created = time.Now()
+	s.startupAt = s.Created
+	s.mu.Lock()
+	s.lastStableStatus = "waiting"
+	s.stateTracker = nil
+	s.cachedPromptDetector = nil
+	s.cachedPromptDetectorTool = ""
+	s.mu.Unlock()
 
 	// Check if session already exists (shouldn't happen with unique IDs, but handle gracefully)
 	if s.Exists() {
@@ -548,9 +1181,29 @@ func (s *Session) Start(command string) error {
 		workDir = os.Getenv("HOME")
 	}
 
-	// Create new tmux session in detached mode
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", s.Name, "-c", workDir)
+	// Create new tmux session in detached mode.
+	// Sandbox sessions launch command as the pane process for dead-pane restart.
+	// Non-sandbox sessions keep the legacy shell+send flow.
+	startWithInitialProcess := command != "" && s.RunCommandAsInitialProcess
+	args := []string{"new-session", "-d", "-s", s.Name, "-c", workDir}
+	if startWithInitialProcess {
+		args = append(args, command)
+	}
+	cmd := exec.Command("tmux", args...)
 	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if recovered, recoverErr := recoverFromStaleDefaultSocketIfNeeded(string(output)); recoverErr != nil {
+			statusLog.Warn("tmux_stale_socket_recovery_failed",
+				slog.String("session", s.Name),
+				slog.String("error", recoverErr.Error()),
+			)
+		} else if recovered {
+			statusLog.Warn("tmux_start_retry_after_socket_recovery",
+				slog.String("session", s.Name),
+			)
+			output, err = exec.Command("tmux", args...).CombinedOutput()
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("failed to create tmux session: %w (output: %s)", err, string(output))
 	}
@@ -559,66 +1212,111 @@ func (s *Session) Start(command string) error {
 	// where Exists() returns false because cache was refreshed before session creation
 	registerSessionInCache(s.Name)
 
-	// Set default window/pane styles to prevent color issues in some terminals (Warp, etc.)
-	// This ensures no unexpected background colors are applied
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "window-style", "default").Run()
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "window-active-style", "default").Run()
+	// PERFORMANCE: Batch all session options into a single subprocess call.
+	// Before: 7 separate exec.Command calls = 7 subprocess spawns (~50-70ms)
+	// After:  1 exec.Command call = 1 subprocess spawn (~7-10ms)
+	//
+	// Options set:
+	// - window-style/window-active-style: Prevent color issues in some terminals (Warp, etc.)
+	// - mouse on: Mouse scrolling, text selection, pane resizing
+	// - allow-passthrough on: OSC 8 hyperlinks, OSC 52 clipboard (tmux 3.2+, -q for older)
+	// - set-clipboard on: Clipboard integration (Warp, iTerm2, kitty, etc.)
+	// - history-limit 10000: Large scrollback for AI agent output
+	// - escape-time 10: Fast Vim/editor responsiveness (default 500ms is too slow)
+	// - extended-keys on: Forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+	// - terminal-features hyperlinks+extkeys: Track hyperlinks and enable extended key reporting (tmux 3.4+, server-wide)
+	//
+	// Note: remain-on-exit is NOT set here — it is only enabled for sandbox sessions
+	// via OptionOverrides to avoid changing behaviour for non-sandbox sessions.
+	themeStyle := currentTmuxThemeStyle()
 
-	// Enable mouse mode for proper scrolling (per-session, doesn't affect user's other sessions)
-	// This allows:
-	// - Mouse wheel scrolling through terminal history
-	// - Text selection with mouse
-	// - Pane resizing with mouse
-	// Non-fatal: session still works, just without mouse support
-	// This can fail on very old tmux versions
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "mouse", "on").Run()
+	_ = exec.Command("tmux",
+		"set-option", "-t", s.Name, "window-style", themeStyle.windowStyle, ";",
+		"set-option", "-t", s.Name, "window-active-style", themeStyle.windowActiveStyle, ";",
+		"set-option", "-t", s.Name, "mouse", "on", ";",
+		"set-option", "-t", s.Name, "-q", "allow-passthrough", "on", ";",
+		"set-option", "-t", s.Name, "set-clipboard", "on", ";",
+		"set-option", "-t", s.Name, "history-limit", "10000", ";",
+		"set-option", "-t", s.Name, "escape-time", "10", ";",
+		"set-option", "-t", s.Name, "-q", "extended-keys", "on").Run()
 
-	// Enable escape sequence passthrough for modern terminal features (tmux 3.2+)
-	// This allows:
-	// - OSC 8: Clickable hyperlinks/file paths (Warp, iTerm2, kitty, Alacritty, etc.)
-	// - OSC 52: Clipboard integration (copy/paste from remote sessions)
-	// - Image protocols: Inline images in terminals that support it
-	// Uses -q flag to silently ignore on older tmux versions (< 3.2)
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "-q", "allow-passthrough", "on").Run()
+	// Idempotent: only append terminal-features if not already present
+	ensureTerminalFeatures("hyperlinks", "extkeys")
 
-	// Enable hyperlink support in terminal features (tmux 3.4+, server-wide option)
-	// This tells tmux to track hyperlinks like it tracks colors/attributes
-	// Required for OSC 8 hyperlinks to work - passthrough alone isn't enough
-	// Uses -as to append to existing terminal-features, -q to ignore if unsupported
-	_ = exec.Command("tmux", "set", "-asq", "terminal-features", ",*:hyperlinks").Run()
+	// Bind Ctrl+Q to detach at the tmux level as fallback for terminals where
+	// XON/XOFF flow control intercepts the key before it reaches the PTY stdin
+	// reader (e.g. iTerm2 on macOS). Only binds on agentdeck-managed sessions.
+	_ = exec.Command("tmux", "bind-key", "-n", "-T", "root", "C-q",
+		"if-shell", fmt.Sprintf("[ \"#{session_name}\" = \"%s\" ]", s.Name),
+		"detach-client", "").Run()
 
-	// Enable OSC 52 clipboard integration for seamless copy/paste
-	// Works with: Warp, iTerm2, kitty, Alacritty, WezTerm, Windows Terminal, VS Code
-	// The 'on' value (tmux 2.6+) allows apps inside tmux to set the clipboard
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "set-clipboard", "on").Run()
-
-	// Set large history buffer for AI agent sessions (default is 2000)
-	// AI agents produce extensive output, 10000 lines is a good balance
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "history-limit", "10000").Run()
-
-	// Reduce escape-time for responsive Vim/editor usage (default 500ms is too slow)
-	// 10ms is a good balance between responsiveness and SSH reliability
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "escape-time", "10").Run()
+	// Apply user-specified tmux option overrides from config (after defaults).
+	// These are batched into a single call when multiple overrides are present.
+	if len(s.OptionOverrides) > 0 {
+		args := make([]string, 0, len(s.OptionOverrides)*6)
+		first := true
+		for key, value := range s.OptionOverrides {
+			if !first {
+				args = append(args, ";")
+			}
+			args = append(args, "set-option", "-t", s.Name, "-q", key, value)
+			first = false
+		}
+		_ = exec.Command("tmux", args...).Run()
+	}
 
 	// Configure status bar with session info for easy identification
 	// Shows: session title on left, project folder on right
 	s.ConfigureStatusBar()
 
-	// Send the command to the session
-	if command != "" {
-		if err := s.SendKeys(command); err != nil {
-			return fmt.Errorf("failed to send command: %w", err)
+	// Wait for the pane shell to be ready before sending the command via send-keys.
+	// On WSL/Linux non-interactive contexts, pane initialisation can take 100-500ms and
+	// sending keys before the shell is ready causes them to be silently swallowed.
+	// Non-fatal best-effort guard: if the timeout expires, log a warning and continue
+	// anyway (degraded path, same as the behaviour before this guard was added).
+	if command != "" && !startWithInitialProcess {
+		paneReadyTimeout := 2 * time.Second
+		if platform.IsWSL() {
+			paneReadyTimeout = 5 * time.Second
 		}
-		if err := s.SendEnter(); err != nil {
-			return fmt.Errorf("failed to send enter: %w", err)
+		if err := waitForPaneReady(s, paneReadyTimeout); err != nil {
+			statusLog.Warn("pane_ready_timeout",
+				slog.String("session", s.Name),
+				slog.String("timeout", paneReadyTimeout.String()),
+				slog.String("error", err.Error()),
+			)
 		}
 	}
 
-	// Enable pipe-pane to log output for event-driven status detection
-	if err := s.EnablePipePane(); err != nil {
-		// Non-fatal: status detection will fall back to polling
-		debugLog("Warning: failed to enable pipe-pane for %s: %v", s.Name, err)
+	// Legacy behavior for non-sandbox sessions: start shell first, then send command.
+	if command != "" && !startWithInitialProcess {
+		cmdToSend := command
+		// Commands containing bash-specific syntax must be wrapped for fish users.
+		if strings.Contains(command, "$(") || strings.Contains(command, "session_id=") {
+			escapedCmd := strings.ReplaceAll(command, "'", "'\"'\"'")
+			cmdToSend = fmt.Sprintf("bash -c '%s'", escapedCmd)
+		}
+		if err := s.SendKeysAndEnter(cmdToSend); err != nil {
+			return fmt.Errorf("failed to send command: %w", err)
+		}
 	}
+
+	// Connect control mode pipe for event-driven status detection
+	if pm := GetPipeManager(); pm != nil {
+		if err := pm.Connect(s.Name); err != nil {
+			statusLog.Debug(
+				"control_pipe_connect_failed",
+				slog.String("session", s.Name),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+
+	// Note: We tried using tmux hooks for instant GREEN status detection:
+	// - alert-activity: Only fires for background windows (not current window)
+	// - after-send-keys: Fires for ALL send-keys calls (too noisy, catches agent-deck operations)
+	// Neither works reliably for detecting user input. We use polling for GREEN instead.
+	// The Stop hook (via Claude settings) handles instant YELLOW detection.
 
 	return nil
 }
@@ -632,65 +1330,109 @@ func (s *Session) Exists() bool {
 		return exists
 	}
 
-	// Cache miss/stale - fall back to direct check (spawns subprocess)
+	// If PipeManager has a live control connection, the session definitely exists.
+	if pm := GetPipeManager(); pm != nil {
+		if pm.IsConnected(s.Name) {
+			return true
+		}
+	}
+
+	// Cache is stale and no live pipe: fall back to direct tmux check.
 	cmd := exec.Command("tmux", "has-session", "-t", s.Name)
 	return cmd.Run() == nil
 }
 
-// ConfigureStatusBar sets up the tmux status bar with session info
-// Shows: session title on left, project folder on right
-// Uses a compact, informative layout that helps developers know where they are
+// IsPaneDead returns true if the session's pane process has exited.
+// Uses the cached pane info (refreshed once per tick) for zero-cost lookups.
+// Falls back to a direct tmux query targeting pane 0.0 (the primary pane)
+// to avoid false positives in multi-pane layouts.
+func (s *Session) IsPaneDead() bool {
+	if info, ok := GetCachedPaneInfo(s.Name); ok {
+		return info.Dead
+	}
+	// Cache miss: direct tmux check targeting the primary pane.
+	out, err := exec.Command("tmux", "list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "1"
+}
+
+// buildStatusBarArgs returns the tmux command args for configuring the status bar.
+// Returns nil if status bar injection is disabled.
+// Skips any option key that exists in s.OptionOverrides — user-defined options take precedence.
+func (s *Session) buildStatusBarArgs() []string {
+	if !s.injectStatusLine {
+		return nil
+	}
+	themeStyle := currentTmuxThemeStyle()
+	rightStatus := s.themedStatusRight(themeStyle)
+
+	// Managed defaults — each can be skipped if user defined it in [tmux] options
+	type option struct {
+		key   string
+		value string
+	}
+	defaults := []option{
+		{"status", "on"},
+		{"status-style", themeStyle.statusStyle},
+		{"status-left-length", "120"},
+		{"status-right", rightStatus},
+		{"status-right-length", "80"},
+	}
+
+	var args []string
+	for _, opt := range defaults {
+		if _, overridden := s.OptionOverrides[opt.key]; overridden {
+			continue
+		}
+		if len(args) > 0 {
+			args = append(args, ";")
+		}
+		args = append(args, "set-option", "-t", s.Name, opt.key, opt.value)
+	}
+
+	if len(args) == 0 {
+		return nil
+	}
+	return args
+}
+
+// ConfigureStatusBar sets up the tmux status bar with session info.
+// Shows: notification bar on left (managed by NotificationManager), session info on right.
+// NOTE: status-left is reserved for the notification bar showing waiting sessions.
+// Options defined in [tmux] options are respected — agent-deck skips those keys.
 func (s *Session) ConfigureStatusBar() {
-	// Get short folder name from WorkDir
-	folderName := filepath.Base(s.WorkDir)
-	if folderName == "" || folderName == "." {
-		folderName = "~"
+	args := s.buildStatusBarArgs()
+	if args == nil {
+		return
 	}
-
-	// Enable status bar
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status", "on").Run()
-
-	// Style: dark background with accent colors (Tokyo Night inspired)
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-style", "bg=#1a1b26,fg=#a9b1d6").Run()
-
-	// Left side: session title with icon
-	leftStatus := fmt.Sprintf(" 📁 %s ", s.DisplayName)
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-left", leftStatus).Run()
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-left-length", "40").Run()
-
-	// Right side: project folder path
-	rightStatus := fmt.Sprintf(" %s ", folderName)
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-right", rightStatus).Run()
-	_ = exec.Command("tmux", "set-option", "-t", s.Name, "status-right-length", "30").Run()
+	_ = exec.Command("tmux", args...).Run()
 }
 
-// EnablePipePane enables tmux pipe-pane to stream output to a log file
-// This is used for event-driven status detection via fsnotify
-func (s *Session) EnablePipePane() error {
-	logFile := s.LogFile()
-
-	// Ensure log directory exists
-	logDir := filepath.Dir(logFile)
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return fmt.Errorf("failed to create log dir: %w", err)
+// ensureTerminalFeatures appends terminal features only if not already present.
+// This prevents the terminal-features list from growing on every session start (#366).
+func ensureTerminalFeatures(features ...string) {
+	out, err := exec.Command("tmux", "show", "-sv", "terminal-features").Output()
+	if err != nil {
+		// tmux too old or server not running — append unconditionally as best-effort
+		if len(features) > 0 {
+			val := ",*:" + strings.Join(features, ":")
+			_ = exec.Command("tmux", "set", "-asq", "terminal-features", val).Run()
+		}
+		return
 	}
-
-	// Enable pipe-pane: stream pane output to log file
-	cmd := exec.Command("tmux", "pipe-pane", "-t", s.Name, "-o", fmt.Sprintf("cat >> '%s'", logFile))
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to enable pipe-pane: %w", err)
+	existing := string(out)
+	var missing []string
+	for _, f := range features {
+		if !strings.Contains(existing, f) {
+			missing = append(missing, f)
+		}
 	}
-
-	return nil
-}
-
-// DisablePipePane disables pipe-pane logging
-func (s *Session) DisablePipePane() error {
-	cmd := exec.Command("tmux", "pipe-pane", "-t", s.Name)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to disable pipe-pane for %s: %w", s.Name, err)
+	if len(missing) > 0 {
+		val := ",*:" + strings.Join(missing, ":")
+		_ = exec.Command("tmux", "set", "-asq", "terminal-features", val).Run()
 	}
-	return nil
 }
 
 // EnableMouseMode enables mouse scrolling, clipboard integration, and optimal settings
@@ -711,101 +1453,305 @@ func (s *Session) DisablePipePane() error {
 // Note: With mouse mode on, hold Shift while selecting to use native terminal selection
 // instead of tmux's selection (useful for copying to system clipboard in some terminals)
 func (s *Session) EnableMouseMode() error {
-	// Enable mouse support
+	// CRITICAL: Mouse mode must succeed - keep as separate call for error handling
+	// This is the only essential feature; all others are enhancements
 	mouseCmd := exec.Command("tmux", "set-option", "-t", s.Name, "mouse", "on")
 	if err := mouseCmd.Run(); err != nil {
 		return err
 	}
 
-	// Enable OSC 52 clipboard integration
-	// This allows tmux to copy directly to system clipboard in supported terminals
-	// (Warp, iTerm2, Alacritty, kitty, WezTerm, Windows Terminal, VS Code, etc.)
-	clipboardCmd := exec.Command("tmux", "set-option", "-t", s.Name, "set-clipboard", "on")
-	if err := clipboardCmd.Run(); err != nil {
-		// Non-fatal: older tmux versions may not support this
-		debugLog("%s: failed to enable clipboard: %v", s.DisplayName, err)
-	}
+	// PERFORMANCE: Batch all non-fatal enhancements into single subprocess call
+	// Uses tmux command chaining with \; separator (67% reduction in subprocess calls)
+	// Before: 5 separate exec.Command calls = 5 subprocess spawns
+	// After: 1 exec.Command call = 1 subprocess spawn
+	//
+	// Enhancements included:
+	// - set-clipboard on: OSC 52 clipboard integration (Warp, iTerm2, kitty, etc.)
+	// - allow-passthrough on: OSC 8 hyperlinks, advanced escape sequences (tmux 3.2+)
+	// - extended-keys on: Forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+	// - terminal-features hyperlinks+extkeys: Track hyperlinks and enable extended key reporting (tmux 3.4+)
+	// - history-limit 10000: Large scrollback for AI agent output
+	// - escape-time 10: Fast Vim/editor responsiveness (default 500ms is too slow)
+	//
+	// Uses -q flag where supported to silently ignore on older tmux versions
+	enhanceCmd := exec.Command("tmux",
+		"set-option", "-t", s.Name, "set-clipboard", "on", ";",
+		"set-option", "-t", s.Name, "-q", "allow-passthrough", "on", ";",
+		"set-option", "-t", s.Name, "history-limit", "10000", ";",
+		"set-option", "-t", s.Name, "escape-time", "10", ";",
+		"set-option", "-t", s.Name, "-q", "extended-keys", "on")
+	// Ignore errors - all these are non-fatal enhancements
+	// Older tmux versions may not support some options
+	_ = enhanceCmd.Run()
 
-	// Enable escape sequence passthrough for modern terminal features (tmux 3.2+)
-	// This allows:
-	// - OSC 8: Clickable hyperlinks/file paths in Warp, iTerm2, kitty, etc.
-	// - OSC 52: Clipboard integration (apps inside tmux can set clipboard)
-	// - Image protocols: Inline images in supported terminals
-	// Uses -q flag to silently ignore on older tmux versions
-	passthroughCmd := exec.Command("tmux", "set-option", "-t", s.Name, "-q", "allow-passthrough", "on")
-	if err := passthroughCmd.Run(); err != nil {
-		// Non-fatal: tmux < 3.2 doesn't support this option
-		debugLog("%s: failed to enable passthrough (tmux < 3.2?): %v", s.DisplayName, err)
-	}
-
-	// Enable hyperlink support in terminal features (tmux 3.4+, server-wide option)
-	// This tells tmux to track hyperlinks like it tracks colors/attributes
-	// Required for OSC 8 hyperlinks to work - passthrough alone isn't enough
-	hyperlinkCmd := exec.Command("tmux", "set", "-asq", "terminal-features", ",*:hyperlinks")
-	if err := hyperlinkCmd.Run(); err != nil {
-		// Non-fatal: tmux < 3.4 doesn't support hyperlinks in terminal-features
-		debugLog("%s: failed to enable hyperlinks (tmux < 3.4?): %v", s.DisplayName, err)
-	}
-
-	// Set large history limit for AI agent sessions (default is 2000)
-	// AI agents produce a lot of output, so we need more scrollback
-	historyCmd := exec.Command("tmux", "set-option", "-t", s.Name, "history-limit", "10000")
-	if err := historyCmd.Run(); err != nil {
-		// Non-fatal: history limit is a nice-to-have
-		debugLog("%s: failed to set history-limit: %v", s.DisplayName, err)
-	}
-
-	// Reduce escape-time for responsive Vim/editor usage (default 500ms is too slow)
-	// 10ms is a good balance between responsiveness and SSH reliability
-	escapeCmd := exec.Command("tmux", "set-option", "-t", s.Name, "escape-time", "10")
-	if err := escapeCmd.Run(); err != nil {
-		// Non-fatal: escape-time is a nice-to-have
-		debugLog("%s: failed to set escape-time: %v", s.DisplayName, err)
-	}
+	// Idempotent: only append terminal-features if not already present
+	ensureTerminalFeatures("hyperlinks", "extkeys")
 
 	return nil
 }
 
-// Kill terminates the tmux session
+// Kill terminates the tmux session.
+// Like RespawnPane, this captures the process tree first and ensures all
+// processes actually die. tmux kill-session sends SIGHUP which some CLI
+// tools (e.g. Claude Code 2.1.27+) ignore, leaving orphan processes.
 func (s *Session) Kill() error {
-	// Disable pipe-pane first
-	_ = s.DisablePipePane()
+	// Disconnect control mode pipe
+	if pm := GetPipeManager(); pm != nil {
+		pm.Disconnect(s.Name)
+	}
 
-	// Remove log file
+	// Remove old log file if it exists (from pre-control-pipe era)
 	logFile := s.LogFile()
 	os.Remove(logFile) // Ignore errors
 
+	// Capture process tree BEFORE killing so we can verify they die
+	_, oldPIDs := s.getPaneProcessTree()
+	if len(oldPIDs) > 0 {
+		respawnLog.Info("pre_kill_process_tree", slog.String("session", s.Name), slog.Any("pids", oldPIDs))
+	}
+
 	// Kill the tmux session
 	cmd := exec.Command("tmux", "kill-session", "-t", s.Name)
-	return cmd.Run()
+	err := cmd.Run()
+
+	// Verify old processes are dead; escalate to SIGKILL if needed
+	if len(oldPIDs) > 0 {
+		go s.ensureProcessesDead(oldPIDs, 0)
+	}
+
+	return err
 }
 
-// RespawnPane kills the current process in the pane and starts a new command
-// This is more reliable than sending Ctrl+C and waiting for shell prompt
-// The -k flag kills the current process before respawning
+// getPaneProcessTree returns the pane's direct PID and all descendant PIDs.
+// Used before respawn to track processes that must die.
+func (s *Session) getPaneProcessTree() (panePID int, allPIDs []int) {
+	target := s.Name + ":"
+	out, err := exec.Command("tmux", "list-panes", "-t", target, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return 0, nil
+	}
+	// Take only the first line (handles multi-pane sessions safely)
+	pidStr := strings.TrimSpace(string(out))
+	if idx := strings.IndexByte(pidStr, '\n'); idx >= 0 {
+		pidStr = pidStr[:idx]
+	}
+	panePID, err = strconv.Atoi(pidStr)
+	if err != nil {
+		return 0, nil
+	}
+
+	// Collect the pane PID plus all descendants via pgrep -P (recursive)
+	allPIDs = []int{panePID}
+	queue := []int{panePID}
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		pgrepOut, err := exec.Command("pgrep", "-P", strconv.Itoa(parent)).Output()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(pgrepOut)), "\n") {
+			if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
+				allPIDs = append(allPIDs, pid)
+				queue = append(queue, pid)
+			}
+		}
+	}
+	return panePID, allPIDs
+}
+
+// isOurProcess checks if a PID still belongs to a process we spawned
+// (claude, node, zsh, bash, sh) rather than an unrelated process that
+// reused the PID. This prevents accidentally killing random processes.
+func isOurProcess(pid int) bool {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+	if err != nil {
+		return false // Process doesn't exist
+	}
+	name := strings.ToLower(strings.TrimSpace(string(out)))
+	for _, known := range []string{"claude", "node", "zsh", "bash", "sh", "cat", "npm"} {
+		if strings.Contains(name, known) {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureProcessesDead checks if any of the given PIDs are still alive and
+// escalates from SIGTERM to SIGKILL. This prevents zombie/orphan process
+// accumulation when CLI tools (e.g. Claude Code) ignore SIGHUP from tmux.
+func (s *Session) ensureProcessesDead(oldPIDs []int, newPanePID int) {
+	if len(oldPIDs) == 0 {
+		return
+	}
+
+	// Wait briefly for respawn-pane's SIGHUP to take effect
+	time.Sleep(500 * time.Millisecond)
+
+	var survivors []int
+	for _, pid := range oldPIDs {
+		// Skip the new pane process (respawn reuses the pane PID slot sometimes)
+		if pid == newPanePID {
+			continue
+		}
+		// Check if process is still alive (signal 0 = existence check)
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			continue // Already dead
+		}
+		// Guard against PID reuse: verify it's still one of our processes
+		if !isOurProcess(pid) {
+			respawnLog.Info("pid_not_ours_skipping", slog.Int("pid", pid))
+			continue
+		}
+		survivors = append(survivors, pid)
+	}
+
+	if len(survivors) == 0 {
+		return
+	}
+
+	// First try SIGTERM
+	respawnLog.Info("survivors_sending_sigterm", slog.Int("count", len(survivors)), slog.Any("pids", survivors))
+	for _, pid := range survivors {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Signal(syscall.SIGTERM)
+		}
+	}
+
+	// Wait for SIGTERM
+	time.Sleep(1 * time.Second)
+
+	// Check again and SIGKILL any remaining
+	var stubborn []int
+	for _, pid := range survivors {
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			continue // Dead now
+		}
+		stubborn = append(stubborn, pid)
+	}
+
+	if len(stubborn) == 0 {
+		respawnLog.Info("all_survivors_terminated_after_sigterm")
+		return
+	}
+
+	respawnLog.Info("stubborn_sending_sigkill", slog.Int("count", len(stubborn)), slog.Any("pids", stubborn))
+	for _, pid := range stubborn {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Signal(syscall.SIGKILL)
+		}
+	}
+	respawnLog.Info("sigkill_cleanup_complete", slog.Int("count", len(stubborn)))
+}
+
+// RespawnPane kills the current process in the pane and starts a new command.
+// This is more reliable than sending Ctrl+C and waiting for shell prompt.
+// The -k flag kills the current process before respawning.
+//
+// IMPORTANT: After respawn, this function verifies that old processes actually
+// died. Some CLI tools (notably Claude Code 2.1.27+) ignore SIGHUP sent by
+// tmux respawn-pane, leaving orphan processes that consume CPU indefinitely.
+// If old processes survive, we escalate through SIGTERM → SIGKILL.
 func (s *Session) RespawnPane(command string) error {
 	if !s.Exists() {
 		return fmt.Errorf("session does not exist: %s", s.Name)
+	}
+	s.invalidateCache()
+
+	// Capture the current process tree BEFORE respawn so we can verify they die
+	_, oldPIDs := s.getPaneProcessTree()
+	if len(oldPIDs) > 0 {
+		respawnLog.Info("pre_respawn_process_tree", slog.Any("pids", oldPIDs))
+	}
+
+	// Clear scrollback buffer BEFORE respawn to prevent stale content
+	// from previous conversation appearing when user attaches (#138).
+	clearTarget := s.Name + ":"
+	clearCmd := exec.Command("tmux", "clear-history", "-t", clearTarget)
+	if clearOut, clearErr := clearCmd.CombinedOutput(); clearErr != nil {
+		respawnLog.Debug(
+			"clear_history_failed",
+			slog.String("error", clearErr.Error()),
+			slog.String("output", string(clearOut)),
+		)
+	} else {
+		respawnLog.Info("cleared_scrollback", slog.String("session", s.Name))
 	}
 
 	// Build respawn-pane command
 	// -k: Kill current process
 	// -t: Target pane (session:window.pane format, use session: for active pane)
 	// command: New command to run
-	target := s.Name + ":"  // Append colon to target the active pane
+	target := s.Name + ":" // Append colon to target the active pane
 	args := []string{"respawn-pane", "-k", "-t", target}
 	if command != "" {
-		args = append(args, command)
+		// Wrap command in interactive shell to ensure aliases and shell configs are available
+		// tmux respawn-pane runs commands directly without loading ~/.bashrc or ~/.zshrc,
+		// so shell aliases (like 'cdw' for claude) won't work without this wrapper
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/bash"
+		}
+
+		// IMPORTANT: Commands containing bash-specific syntax (like `session_id=$(...)`)
+		// must use bash, regardless of user's shell. This fixes fish shell compatibility (#47).
+		// Fish uses different syntax: `set var (...)` instead of `var=$(...)`.
+		// We detect bash-specific constructs and force bash for those commands.
+		if strings.Contains(command, "$(") || strings.Contains(command, "session_id=") {
+			shell = "/bin/bash"
+		}
+
+		// Use -i for interactive (loads aliases) and -c for command
+		wrappedCmd := fmt.Sprintf("%s -ic %q", shell, command)
+		args = append(args, wrappedCmd)
 	}
 
-	log.Printf("[MCP-DEBUG] RespawnPane executing: tmux %v", args)
+	mcpLog.Debug("respawn_pane_executing", slog.Any("args", args))
 	cmd := exec.Command("tmux", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[MCP-DEBUG] RespawnPane error: %v, output: %s", err, string(output))
+		mcpLog.Debug("respawn_pane_error", slog.String("error", err.Error()), slog.String("output", string(output)))
 		return fmt.Errorf("failed to respawn pane: %w (output: %s)", err, string(output))
 	}
-	log.Printf("[MCP-DEBUG] RespawnPane output: %s", string(output))
+	mcpLog.Debug("respawn_pane_output", slog.String("output", string(output)))
+
+	// Get the NEW pane PID so we don't accidentally kill the fresh process
+	newPanePID, _ := s.getPaneProcessTree()
+
+	// Verify old processes are dead; escalate to SIGKILL if needed
+	// Run in background so RespawnPane returns quickly
+	if len(oldPIDs) > 0 {
+		go s.ensureProcessesDead(oldPIDs, newPanePID)
+	}
+
+	// Reconnect control mode pipe (respawn changes the pane process)
+	if pm := GetPipeManager(); pm != nil {
+		pm.Disconnect(s.Name)
+		if err := pm.Connect(s.Name); err != nil {
+			statusLog.Debug(
+				"control_pipe_reconnect_failed",
+				slog.String("session", s.Name),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+
+	// Reset startup/status trackers so GetStatus can classify the fresh process correctly.
+	s.mu.Lock()
+	s.startupAt = time.Now()
+	s.lastStableStatus = "waiting"
+	s.stateTracker = nil
+	s.cachedPromptDetector = nil
+	s.cachedPromptDetectorTool = ""
+	s.mu.Unlock()
 
 	return nil
 }
@@ -819,8 +1765,15 @@ func (s *Session) GetWindowActivity() (int64, error) {
 		return activity, nil
 	}
 
-	// Cache miss/stale - fall back to direct check (spawns subprocess)
-	cmd := exec.Command("tmux", "display-message", "-t", s.Name, "-p", "#{window_activity}")
+	// When PipeManager is active, route through pipe (zero subprocess)
+	if pm := GetPipeManager(); pm != nil {
+		return pm.GetWindowActivity(s.Name)
+	}
+
+	// No PipeManager: fall back to direct check (spawns subprocess)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "tmux", "display-message", "-t", s.Name, "-p", "#{window_activity}")
 	output, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("failed to get window activity: %w", err)
@@ -833,35 +1786,135 @@ func (s *Session) GetWindowActivity() (int64, error) {
 	return ts, nil
 }
 
-// CapturePane captures the visible pane content
-func (s *Session) CapturePane() (string, error) {
-	// -J joins wrapped lines and trims trailing spaces so hashes don't change on resize
-	cmd := exec.Command("tmux", "capture-pane", "-t", s.Name, "-p", "-J")
-	startTime := time.Now()
-	output, err := cmd.Output()
-	elapsed := time.Since(startTime)
-	if elapsed > 100*time.Millisecond {
-		shortName := s.DisplayName
-		if len(shortName) > 12 {
-			shortName = shortName[:12]
-		}
-		debugLog("SLOW CapturePane for %s: %v (>%v sessions may cause lag)", shortName, elapsed, elapsed)
+// GetCachedWindowActivity returns the cached window_activity timestamp without
+// spawning a subprocess. Returns 0 if the cache is stale or session not found.
+// This is used for cheap idle-session activity gating in tiered polling.
+func (s *Session) GetCachedWindowActivity() int64 {
+	activity, valid := sessionActivityFromCache(s.Name)
+	if valid {
+		return activity
 	}
+	return 0
+}
+
+// CapturePane captures the visible pane content.
+// Tries control mode pipe first (zero subprocess), falls back to subprocess.
+// Uses singleflight to deduplicate concurrent calls.
+func (s *Session) CapturePane() (string, error) {
+	// Fast path: return cached content if fresh
+	s.cacheMu.RLock()
+	if s.cacheContent != "" && time.Since(s.cacheTime) < 500*time.Millisecond {
+		content := s.cacheContent
+		s.cacheMu.RUnlock()
+		logging.Aggregate(logging.CompPerf, "capture_pane_cache_hit", slog.String("session", s.Name))
+		return content, nil
+	}
+	s.cacheMu.RUnlock()
+
+	// Slow path: deduplicate concurrent calls via singleflight.
+	v, err, _ := s.captureSf.Do("capture", func() (interface{}, error) {
+		// Double-check cache inside singleflight
+		s.cacheMu.RLock()
+		if s.cacheContent != "" && time.Since(s.cacheTime) < 500*time.Millisecond {
+			content := s.cacheContent
+			s.cacheMu.RUnlock()
+			return content, nil
+		}
+		s.cacheMu.RUnlock()
+
+		// Try control mode pipe first (zero subprocess)
+		if pm := GetPipeManager(); pm != nil {
+			pipeStart := time.Now()
+			if content, pipeErr := pm.CapturePane(s.Name); pipeErr == nil {
+				s.cacheMu.Lock()
+				s.cacheContent = content
+				s.cacheTime = time.Now()
+				s.cacheMu.Unlock()
+				logging.Aggregate(logging.CompPerf, "capture_pane_pipe",
+					slog.String("session", s.Name),
+					slog.Duration("elapsed", time.Since(pipeStart)))
+				return content, nil
+			}
+			// Pipe failed: log it so we can verify zero subprocess usage
+			statusLog.Debug("capture_pane_subprocess_fallback", slog.String("session", s.Name))
+		}
+
+		// Subprocess fallback: 3s timeout
+		finish := logging.TraceOp(perfLog, "capture_pane_subprocess", 200*time.Millisecond,
+			slog.String("session", s.Name))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "tmux", "capture-pane", "-t", s.Name, "-p", "-e")
+		output, err := cmd.Output()
+		finish()
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return "", ErrCaptureTimeout
+			}
+			return "", fmt.Errorf("failed to capture pane: %w", err)
+		}
+
+		content := string(output)
+
+		s.cacheMu.Lock()
+		s.cacheContent = content
+		s.cacheTime = time.Now()
+		s.cacheMu.Unlock()
+
+		return content, nil
+	})
 	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
+}
+
+// CapturePaneFresh captures pane content via a direct tmux subprocess call.
+// Unlike CapturePane(), this bypasses the control-mode pipe and short-lived
+// cache to provide a fresh snapshot. Use this for send verification where
+// stale pane content can hide unsent composer input.
+func (s *Session) CapturePaneFresh() (string, error) {
+	s.invalidateCache()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "tmux", "capture-pane", "-t", s.Name, "-p", "-e")
+	output, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", ErrCaptureTimeout
+		}
 		return "", fmt.Errorf("failed to capture pane: %w", err)
 	}
-	return string(output), nil
+
+	content := string(output)
+	s.cacheMu.Lock()
+	s.cacheContent = content
+	s.cacheTime = time.Now()
+	s.cacheMu.Unlock()
+
+	return content, nil
 }
 
 // CaptureFullHistory captures the scrollback history (limited to last 2000 lines for performance)
 func (s *Session) CaptureFullHistory() (string, error) {
 	// Limit to last 2000 lines to balance content availability with memory usage
 	// AI agent conversations can be long - 2000 lines captures ~40-80 screens of content
-	// -J joins wrapped lines and trims trailing spaces so hashes don't change on resize
-	cmd := exec.Command("tmux", "capture-pane", "-t", s.Name, "-p", "-J", "-S", "-2000")
+	cmd := exec.Command("tmux", "capture-pane", "-t", s.Name, "-p", "-e", "-S", "-2000")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to capture history: %w", err)
+	}
+	return string(output), nil
+}
+
+// CaptureWindowFullHistory captures the scrollback history of a specific window (last 2000 lines).
+func (s *Session) CaptureWindowFullHistory(windowIndex int) (string, error) {
+	target := fmt.Sprintf("%s:%d", s.Name, windowIndex)
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-e", "-S", "-2000")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to capture window %d history: %w", windowIndex, err)
 	}
 	return string(output), nil
 }
@@ -910,26 +1963,25 @@ func (s *Session) DetectTool() string {
 	}
 	s.mu.Unlock()
 
+	// If a custom tool name is set, return it directly.
+	// Custom tools have their underlying command detected at creation time;
+	// runtime detection should preserve the custom name.
+	s.mu.Lock()
+	if s.customToolName != "" {
+		s.detectedTool = s.customToolName
+		s.toolDetectedAt = time.Now()
+		s.mu.Unlock()
+		return s.customToolName
+	}
+	s.mu.Unlock()
+
 	// Detect tool from command first (most reliable)
-	if s.Command != "" {
-		cmdLower := strings.ToLower(s.Command)
-		var tool string
-		if strings.Contains(cmdLower, "claude") {
-			tool = "claude"
-		} else if strings.Contains(cmdLower, "gemini") {
-			tool = "gemini"
-		} else if strings.Contains(cmdLower, "opencode") || strings.Contains(cmdLower, "open code") {
-			tool = "opencode"
-		} else if strings.Contains(cmdLower, "codex") {
-			tool = "codex"
-		}
-		if tool != "" {
-			s.mu.Lock()
-			s.detectedTool = tool
-			s.toolDetectedAt = time.Now()
-			s.mu.Unlock()
-			return tool
-		}
+	if tool := detectToolFromCommand(s.Command); tool != "" {
+		s.mu.Lock()
+		s.detectedTool = tool
+		s.toolDetectedAt = time.Now()
+		s.mu.Unlock()
+		return tool
 	}
 
 	// Fallback to content detection
@@ -945,19 +1997,7 @@ func (s *Session) DetectTool() string {
 	// Strip ANSI codes for accurate matching
 	cleanContent := StripANSI(content)
 
-	// Check using pre-compiled patterns
-	detectedTool := "shell"
-	for tool, patterns := range toolDetectionPatterns {
-		for _, pattern := range patterns {
-			if pattern.MatchString(cleanContent) {
-				detectedTool = tool
-				break
-			}
-		}
-		if detectedTool != "shell" {
-			break
-		}
-	}
+	detectedTool := detectToolFromContent(cleanContent)
 
 	s.mu.Lock()
 	s.detectedTool = detectedTool
@@ -1001,8 +2041,8 @@ func (s *Session) AcknowledgeWithSnapshot() {
 
 	// Clear cooldown to show GRAY status immediately
 	// This ensures explicit user acknowledge (Ctrl+Q detach) takes effect immediately
-	s.stateTracker.lastChangeTime = time.Now().Add(-activityCooldown)
-	debugLog("%s: AckSnapshot → acknowledged, cleared cooldown", shortName)
+	s.stateTracker.lastChangeTime = time.Now()
+	statusLog.Debug("ack_snapshot", slog.String("session", shortName))
 }
 
 // GetStatus returns the current status of the session
@@ -1023,9 +2063,15 @@ func (s *Session) AcknowledgeWithSnapshot() {
 // 3. If timestamp changed → check if sustained or spike
 //   - Sustained (1+ more changes in 1s) → GREEN
 //   - Spike (no more changes) → filtered (no state change)
+//
 // 4. Check cooldown → GREEN if within
 // 5. Cooldown expired → YELLOW or GRAY based on acknowledged
+
 func (s *Session) GetStatus() (string, error) {
+	finish := logging.TraceOp(perfLog, "get_status", 100*time.Millisecond,
+		slog.String("session", s.Name))
+	defer finish()
+
 	shortName := s.DisplayName
 	if len(shortName) > 12 {
 		shortName = shortName[:12]
@@ -1035,7 +2081,47 @@ func (s *Session) GetStatus() (string, error) {
 		s.mu.Lock()
 		s.lastStableStatus = "inactive"
 		s.mu.Unlock()
+		statusLog.Debug("session_inactive", slog.String("session", shortName))
 		return "inactive", nil
+	}
+
+	// Pane dead (process exited with remain-on-exit on) = inactive.
+	if s.IsPaneDead() {
+		s.mu.Lock()
+		s.lastStableStatus = "inactive"
+		s.mu.Unlock()
+		statusLog.Debug("pane_dead", slog.String("session", shortName))
+		return "inactive", nil
+	}
+
+	// FAST PATH: Title-based state detection for Claude Code sessions.
+	// Claude Code sets pane titles via OSC sequences: Braille spinner while working,
+	// ✳ markers when done. One character check replaces full CapturePane + content scan.
+	if paneInfo, ok := GetCachedPaneInfo(s.Name); ok {
+		titleState := AnalyzePaneTitle(paneInfo.Title, paneInfo.CurrentCommand)
+		switch titleState {
+		case TitleStateWorking:
+			// Braille spinner in title = actively working. Short-circuit completely.
+			s.mu.Lock()
+			s.ensureStateTrackerLocked()
+			s.stateTracker.lastChangeTime = time.Now()
+			s.stateTracker.acknowledged = false
+			s.resetPromptNoBusyHoldLocked()
+			s.stateTracker.spinnerTracker.MarkBusy()
+			s.lastStableStatus = "active"
+			s.startupAt = time.Time{}
+			s.mu.Unlock()
+			statusLog.Debug("title_working", slog.String("session", shortName), slog.String("title", paneInfo.Title))
+			return "active", nil
+
+		case TitleStateDone:
+			// Done marker, Claude still alive. Fall through to existing detection
+			// for waiting vs idle (prompt detection + acknowledgment logic).
+			statusLog.Debug("title_done_fallthrough", slog.String("session", shortName))
+
+		default:
+			// Unknown title (non-Claude tools). Fall through to full detection.
+		}
 	}
 
 	// Get current activity timestamp (fast: ~4ms)
@@ -1053,14 +2139,12 @@ func (s *Session) GetStatus() (string, error) {
 	needsBusyCheck := false
 	if s.stateTracker != nil {
 		// Check busy indicator if:
+		// Check busy indicator if:
 		// 1. timestamp changed (new activity)
-		// 2. we're in cooldown (might still be working)
-		// 3. we're in spike detection window (activity recently detected, waiting to confirm)
+		// 2. in spike detection window (activity recently detected, waiting to confirm)
 		inSpikeWindow := !s.stateTracker.activityCheckStart.IsZero() &&
 			time.Since(s.stateTracker.activityCheckStart) < 1*time.Second
-		if s.stateTracker.lastActivityTimestamp != currentTS ||
-			time.Since(s.stateTracker.lastChangeTime) < activityCooldown ||
-			inSpikeWindow {
+		if s.stateTracker.lastActivityTimestamp != currentTS || inSpikeWindow {
 			needsBusyCheck = true
 		}
 	} else {
@@ -1071,40 +2155,153 @@ func (s *Session) GetStatus() (string, error) {
 	if needsBusyCheck {
 		// Release lock for slow CapturePane operation
 		s.mu.Unlock()
-		content, err := s.CapturePane()
+		rawContent, err := s.CapturePane()
 		s.mu.Lock()
 
-		if err == nil && s.hasBusyIndicator(content) {
+		// Strip ANSI escape sequences for pattern matching.
+		// CapturePane now returns ANSI-rich content (via -e flag) for display,
+		// but status detection needs plain text for reliable string matching.
+		content := StripANSI(rawContent)
+
+		if errors.Is(err, ErrCaptureTimeout) {
+			// Timeout: preserve previous state to avoid false RED flashing
+			if s.lastStableStatus != "" {
+				statusLog.Debug(
+					"capture_timeout_preserve",
+					slog.String("session", shortName),
+					slog.String("status", s.lastStableStatus),
+				)
+				return s.lastStableStatus, nil
+			}
+			// No previous state, fall through to default logic
+			statusLog.Debug("capture_timeout_no_previous", slog.String("session", shortName))
+		} else if err == nil {
 			s.ensureStateTrackerLocked()
-			s.stateTracker.lastChangeTime = time.Now()
-			s.stateTracker.acknowledged = false
-			s.stateTracker.lastActivityTimestamp = currentTS
-			s.lastStableStatus = "active"
-			debugLog("%s: BUSY INDICATOR → active", shortName)
-			return "active", nil
+
+			// Check for explicit busy indicator (spinner, "ctrl+c to interrupt")
+			isExplicitlyBusy := s.hasBusyIndicator(content)
+			// Debug: show last line of content for this session
+			lines := strings.Split(content, "\n")
+			lastLine := ""
+			for i := len(lines) - 1; i >= 0; i-- {
+				if strings.TrimSpace(lines[i]) != "" {
+					lastLine = lines[i]
+					if len(lastLine) > 60 {
+						lastLine = lastLine[:60] + "..."
+					}
+					break
+				}
+			}
+			statusLog.Debug("needs_busy_check", slog.String("session", shortName), slog.Bool("busy", isExplicitlyBusy), slog.String("last_line", lastLine))
+
+			// Check for prompt indicators (AskUserQuestion, permission dialogs, etc.)
+			// BUSY indicator is AUTHORITATIVE: if spinner is active (or in grace period),
+			// return GREEN immediately. Prompt detection must NOT override this because
+			// the ❯ prompt from the user's previous input is always visible and causes
+			// false "waiting" detection during tool transitions.
+			if isExplicitlyBusy {
+				s.stateTracker.lastChangeTime = time.Now()
+				s.stateTracker.acknowledged = false
+				s.resetPromptNoBusyHoldLocked()
+				s.stateTracker.lastActivityTimestamp = currentTS
+				s.lastStableStatus = "active"
+				s.startupAt = time.Time{}
+				statusLog.Debug("busy_indicator_active", slog.String("session", shortName))
+				return "active", nil
+			}
+
+			// Update content hash for spike detection (deferred until after early return above).
+			// The 500ms CapturePane cache means the spike path gets the same content,
+			// so we store the normalized result once and reuse it via cachedNormContent.
+			cleanContent := s.normalizeContent(content)
+			currentHash := s.hashContent(cleanContent)
+			if currentHash != "" {
+				// Keep the content hash for diagnostics/fallback logic only.
+				// Do NOT clear acknowledgment on hash changes: dynamic footer text
+				// (timers, context counters, redraws) can mutate content without any
+				// real new work and causes idle -> waiting flapping.
+				s.stateTracker.lastHash = currentHash
+			}
+
+			// Not busy. Check for prompt indicators to distinguish YELLOW vs fall-through.
+			hasPrompt := s.hasPromptIndicator(content)
+			if hasPrompt {
+				// Respect acknowledgment: if user already acknowledged (e.g. by attaching),
+				// keep idle status. The prompt is still visible but the user is looking at it.
+				if s.stateTracker.acknowledged {
+					s.resetPromptNoBusyHoldLocked()
+					s.lastStableStatus = "idle"
+					s.startupAt = time.Time{}
+					statusLog.Debug("prompt_detected_idle", slog.String("session", shortName))
+					return "idle", nil
+				}
+				if s.shouldHoldActiveOnPromptLocked() {
+					s.startupAt = time.Time{}
+					statusLog.Debug("prompt_no_busy_hold_active",
+						slog.String("session", shortName),
+						slog.Int("count", s.stateTracker.promptNoBusyCount))
+					return "active", nil
+				}
+				s.resetPromptNoBusyHoldLocked()
+				if s.lastStableStatus != "waiting" {
+					s.stateTracker.waitingSince = time.Now()
+				}
+				s.lastStableStatus = "waiting"
+				s.startupAt = time.Time{}
+				statusLog.Debug("prompt_detected_waiting", slog.String("session", shortName))
+				return "waiting", nil
+			}
+
+			// During startup there may be a long period with neither spinner nor prompt.
+			// Keep this as STARTING to avoid premature waiting/idle transitions.
+			if s.inStartupWindowLocked() {
+				s.resetPromptNoBusyHoldLocked()
+				s.lastStableStatus = "starting"
+				statusLog.Debug("startup_no_prompt_or_busy", slog.String("session", shortName))
+				return "starting", nil
+			}
+			s.resetPromptNoBusyHoldLocked()
 		}
 	}
 
 	// Initialize on first call
 	if s.stateTracker == nil {
+		now := time.Now()
 		s.stateTracker = &StateTracker{
-			lastChangeTime:        time.Now().Add(-activityCooldown),
+			lastChangeTime:        now,
 			acknowledged:          false, // Start unacknowledged so stopped sessions show YELLOW
 			lastActivityTimestamp: currentTS,
+			waitingSince:          now, // Track when session became waiting
+			spinnerTracker:        NewSpinnerActivityTracker(),
+		}
+		if s.inStartupWindowLocked() {
+			s.lastStableStatus = "starting"
+			statusLog.Debug("init_starting", slog.String("session", shortName))
+			return "starting", nil
 		}
 		s.lastStableStatus = "waiting"
-		debugLog("%s: INIT → waiting", shortName)
+		statusLog.Debug("init_waiting", slog.String("session", shortName))
 		return "waiting", nil
 	}
 
 	// Restored session (lastActivityTimestamp == 0)
 	if s.stateTracker.lastActivityTimestamp == 0 {
 		s.stateTracker.lastActivityTimestamp = currentTS
+		if s.inStartupWindowLocked() {
+			s.lastStableStatus = "starting"
+			statusLog.Debug("restored_starting", slog.String("session", shortName))
+			return "starting", nil
+		}
 		if s.stateTracker.acknowledged {
 			s.lastStableStatus = "idle"
+			statusLog.Debug("restored_idle", slog.String("session", shortName))
 			return "idle", nil
 		}
+		if s.lastStableStatus != "waiting" {
+			s.stateTracker.waitingSince = time.Now()
+		}
 		s.lastStableStatus = "waiting"
+		statusLog.Debug("restored_waiting", slog.String("session", shortName))
 		return "waiting", nil
 	}
 
@@ -1121,21 +2318,91 @@ func (s *Session) GetStatus() (string, error) {
 			// Start new detection window
 			s.stateTracker.activityCheckStart = now
 			s.stateTracker.activityChangeCount = 1
-			debugLog("%s: ACTIVITY_START ts=%d→%d count=1", shortName, oldTS, currentTS)
+			statusLog.Debug(
+				"activity_start",
+				slog.String("session", shortName),
+				slog.Int64("old_ts", oldTS),
+				slog.Int64("new_ts", currentTS),
+				slog.Int("count", 1),
+			)
 		} else {
 			// Within detection window - count this change
 			s.stateTracker.activityChangeCount++
-			debugLog("%s: ACTIVITY_COUNT ts=%d→%d count=%d", shortName, oldTS, currentTS, s.stateTracker.activityChangeCount)
+			statusLog.Debug("activity_count", slog.String("session", shortName), slog.Int64("old_ts", oldTS), slog.Int64("new_ts", currentTS), slog.Int("count", s.stateTracker.activityChangeCount))
 
-			// 2+ changes within 1 second = sustained activity
+			// 2+ changes within 1 second = potential sustained activity
+			// BUT we must confirm with content check (fixes cursor blink false positives)
 			if s.stateTracker.activityChangeCount >= 2 {
-				s.stateTracker.lastChangeTime = now
-				s.stateTracker.acknowledged = false
-				s.stateTracker.activityCheckStart = time.Time{} // Reset window
+				// Gate the spike: confirm with content check before setting GREEN
+				s.mu.Unlock()
+				content, captureErr := s.CapturePane()
+				s.mu.Lock()
+
+				if captureErr == nil {
+					// Check for explicit busy indicator (spinner, "ctrl+c to interrupt")
+					isExplicitlyBusy := s.hasBusyIndicator(content)
+
+					// Only GREEN if explicit busy indicator found
+					// Content hash changes alone are NOT reliable - cursor blinks,
+					// terminal redraws, and status bar updates can cause hash changes
+					if isExplicitlyBusy {
+						s.stateTracker.lastChangeTime = now
+						s.stateTracker.acknowledged = false
+						s.resetPromptNoBusyHoldLocked()
+						s.stateTracker.activityCheckStart = time.Time{} // Reset window
+						s.stateTracker.activityChangeCount = 0
+						s.lastStableStatus = "active"
+						s.startupAt = time.Time{}
+						statusLog.Debug("sustained_confirmed", slog.String("session", shortName))
+						return "active", nil
+					}
+
+					// Not busy - update hash for tracking (deferred past the early return above)
+					cleanContent := s.normalizeContent(content)
+					currentHash := s.hashContent(cleanContent)
+					if currentHash != "" {
+						// Hash changes alone are not enough to clear acknowledgment.
+						s.stateTracker.lastHash = currentHash
+					}
+
+					if s.hasPromptIndicator(content) {
+						if s.stateTracker.acknowledged {
+							s.resetPromptNoBusyHoldLocked()
+							s.lastStableStatus = "idle"
+							s.startupAt = time.Time{}
+							statusLog.Debug("sustained_prompt_idle", slog.String("session", shortName))
+							s.stateTracker.activityCheckStart = time.Time{}
+							s.stateTracker.activityChangeCount = 0
+							return "idle", nil
+						}
+						if s.shouldHoldActiveOnPromptLocked() {
+							s.startupAt = time.Time{}
+							statusLog.Debug("sustained_prompt_hold_active",
+								slog.String("session", shortName),
+								slog.Int("count", s.stateTracker.promptNoBusyCount))
+							s.stateTracker.activityCheckStart = time.Time{}
+							s.stateTracker.activityChangeCount = 0
+							return "active", nil
+						}
+						s.resetPromptNoBusyHoldLocked()
+						if s.lastStableStatus != "waiting" {
+							s.stateTracker.waitingSince = time.Now()
+						}
+						s.lastStableStatus = "waiting"
+						s.startupAt = time.Time{}
+						statusLog.Debug("sustained_prompt_waiting", slog.String("session", shortName))
+						s.stateTracker.activityCheckStart = time.Time{}
+						s.stateTracker.activityChangeCount = 0
+						return "waiting", nil
+					}
+
+					// No busy indicator - spike was false positive (cursor blink, status bar, etc.)
+					statusLog.Debug("sustained_rejected", slog.String("session", shortName))
+				}
+
+				// Reset spike tracking - the activity was not real
+				s.stateTracker.activityCheckStart = time.Time{}
 				s.stateTracker.activityChangeCount = 0
-				s.lastStableStatus = "active"
-				debugLog("%s: SUSTAINED count=%d → active", shortName, s.stateTracker.activityChangeCount)
-				return "active", nil
 			}
 		}
 		// Not enough changes yet - continue with current status (don't block)
@@ -1144,7 +2411,7 @@ func (s *Session) GetStatus() (string, error) {
 		if s.stateTracker.activityChangeCount == 1 && !s.stateTracker.activityCheckStart.IsZero() {
 			if time.Since(s.stateTracker.activityCheckStart) > 1*time.Second {
 				// Only 1 change in 1 second = spike, reset tracking
-				debugLog("%s: SPIKE_EXPIRED count=1 (filtered)", shortName)
+				statusLog.Debug("spike_expired", slog.String("session", shortName), slog.Int("count", 1))
 				s.stateTracker.activityCheckStart = time.Time{}
 				s.stateTracker.activityChangeCount = 0
 			}
@@ -1157,26 +2424,83 @@ func (s *Session) GetStatus() (string, error) {
 	if !s.stateTracker.activityCheckStart.IsZero() &&
 		time.Since(s.stateTracker.activityCheckStart) < 1*time.Second {
 		// Return previous status - don't flash GREEN on unconfirmed single spike
-		debugLog("%s: SPIKE_WINDOW_PENDING → keeping %s (not flashing green)", shortName, s.lastStableStatus)
+		statusLog.Debug(
+			"spike_window_pending",
+			slog.String("session", shortName),
+			slog.String("status", s.lastStableStatus),
+		)
 		if s.lastStableStatus != "" {
 			return s.lastStableStatus, nil
 		}
 		// Fallback if no previous status
+		statusLog.Debug("spike_window_fallback_waiting", slog.String("session", shortName))
 		return "waiting", nil
 	}
 
-	// Check cooldown
-	if time.Since(s.stateTracker.lastChangeTime) < activityCooldown {
-		s.lastStableStatus = "active"
-		return "active", nil
+	// If we were previously active but skipped the busy check (no timestamp change),
+	// verify before transitioning away from GREEN - the session might still be busy
+	if s.lastStableStatus == "active" && !needsBusyCheck {
+		// Re-check busy indicator before dropping out of GREEN
+		s.mu.Unlock()
+		content, captureErr := s.CapturePane()
+		s.mu.Lock()
+		if captureErr == nil && s.hasBusyIndicator(content) {
+			// Busy indicator is authoritative (includes spinner grace period).
+			s.resetPromptNoBusyHoldLocked()
+			s.startupAt = time.Time{}
+			statusLog.Debug("still_busy", slog.String("session", shortName))
+			return "active", nil
+		}
+		if captureErr == nil && s.hasPromptIndicator(content) {
+			// Not busy, but prompt visible. Transition to waiting/idle.
+			if !s.stateTracker.acknowledged {
+				if s.shouldHoldActiveOnPromptLocked() {
+					s.startupAt = time.Time{}
+					statusLog.Debug("prompt_recheck_hold_active",
+						slog.String("session", shortName),
+						slog.Int("count", s.stateTracker.promptNoBusyCount))
+					return "active", nil
+				}
+				s.resetPromptNoBusyHoldLocked()
+				if s.lastStableStatus != "waiting" {
+					s.stateTracker.waitingSince = time.Now()
+				}
+				s.lastStableStatus = "waiting"
+				s.startupAt = time.Time{}
+				statusLog.Debug("prompt_recheck_waiting", slog.String("session", shortName))
+				return "waiting", nil
+			}
+			s.resetPromptNoBusyHoldLocked()
+			s.lastStableStatus = "idle"
+			s.startupAt = time.Time{}
+			statusLog.Debug("prompt_recheck_idle", slog.String("session", shortName))
+			return "idle", nil
+		}
+		statusLog.Debug("no_longer_busy", slog.String("session", shortName))
 	}
 
-	// Cooldown expired
+	// No busy indicator found - check acknowledged state
 	if s.stateTracker.acknowledged {
+		s.resetPromptNoBusyHoldLocked()
 		s.lastStableStatus = "idle"
+		s.startupAt = time.Time{}
+		statusLog.Debug("idle_acknowledged", slog.String("session", shortName))
 		return "idle", nil
 	}
+	if s.inStartupWindowLocked() {
+		s.resetPromptNoBusyHoldLocked()
+		s.lastStableStatus = "starting"
+		statusLog.Debug("startup_pending", slog.String("session", shortName))
+		return "starting", nil
+	}
+	s.resetPromptNoBusyHoldLocked()
+	// Track when we transition to waiting (not already waiting)
+	if s.lastStableStatus != "waiting" {
+		s.stateTracker.waitingSince = time.Now()
+	}
 	s.lastStableStatus = "waiting"
+	s.startupAt = time.Time{}
+	statusLog.Debug("waiting_not_acknowledged", slog.String("session", shortName))
 	return "waiting", nil
 }
 
@@ -1188,22 +2512,74 @@ func (s *Session) getStatusFallback() (string, error) {
 		shortName = shortName[:12]
 	}
 
-	content, err := s.CapturePane()
+	rawContent, err := s.CapturePane()
 	if err != nil {
+		if errors.Is(err, ErrCaptureTimeout) {
+			// Timeout: preserve previous state instead of going inactive
+			s.mu.Lock()
+			prev := s.lastStableStatus
+			s.mu.Unlock()
+			if prev != "" {
+				statusLog.Debug(
+					"fallback_timeout_preserve",
+					slog.String("session", shortName),
+					slog.String("status", prev),
+				)
+				return prev, nil
+			}
+		}
 		s.mu.Lock()
 		s.lastStableStatus = "inactive"
 		s.mu.Unlock()
+		statusLog.Debug("fallback_inactive", slog.String("session", shortName), slog.String("error", err.Error()))
 		return "inactive", nil
 	}
 
+	// Strip ANSI for reliable pattern matching (CapturePane now returns ANSI-rich content)
+	content := StripANSI(rawContent)
+
+	// Keep precedence aligned with the main path:
+	// 1) busy (authoritative), 2) prompt, 3) waiting/idle.
 	if s.hasBusyIndicator(content) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.ensureStateTrackerLocked()
 		s.stateTracker.lastChangeTime = time.Now()
 		s.stateTracker.acknowledged = false
+		s.resetPromptNoBusyHoldLocked()
 		s.lastStableStatus = "active"
+		s.startupAt = time.Time{}
+		statusLog.Debug("fallback_active", slog.String("session", shortName))
 		return "active", nil
+	}
+
+	if s.hasPromptIndicator(content) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.ensureStateTrackerLocked()
+		if s.stateTracker.acknowledged {
+			s.resetPromptNoBusyHoldLocked()
+			s.lastStableStatus = "idle"
+			s.startupAt = time.Time{}
+			statusLog.Debug("fallback_idle_prompt_ack", slog.String("session", shortName))
+			return "idle", nil
+		}
+		if s.shouldHoldActiveOnPromptLocked() {
+			s.startupAt = time.Time{}
+			statusLog.Debug("fallback_prompt_hold_active",
+				slog.String("session", shortName),
+				slog.Int("count", s.stateTracker.promptNoBusyCount))
+			return "active", nil
+		}
+		s.resetPromptNoBusyHoldLocked()
+		s.stateTracker.acknowledged = false
+		if s.lastStableStatus != "waiting" {
+			s.stateTracker.waitingSince = time.Now()
+		}
+		s.lastStableStatus = "waiting"
+		s.startupAt = time.Time{}
+		statusLog.Debug("fallback_waiting_prompt", slog.String("session", shortName))
+		return "waiting", nil
 	}
 
 	cleanContent := s.normalizeContent(content)
@@ -1216,49 +2592,72 @@ func (s *Session) getStatusFallback() (string, error) {
 	defer s.mu.Unlock()
 
 	if s.stateTracker == nil {
+		now := time.Now()
 		s.stateTracker = &StateTracker{
 			lastHash:       currentHash,
-			lastChangeTime: time.Now().Add(-activityCooldown),
+			lastChangeTime: now,
 			acknowledged:   false, // Start unacknowledged so stopped sessions show YELLOW
+			waitingSince:   now,   // Track when session became waiting
+		}
+		if s.inStartupWindowLocked() {
+			s.lastStableStatus = "starting"
+			statusLog.Debug("fallback_init_starting", slog.String("session", shortName))
+			return "starting", nil
 		}
 		s.lastStableStatus = "waiting"
+		statusLog.Debug("fallback_init_waiting", slog.String("session", shortName))
 		return "waiting", nil
 	}
 
 	if s.stateTracker.lastHash == "" {
 		s.stateTracker.lastHash = currentHash
+		if s.inStartupWindowLocked() {
+			s.lastStableStatus = "starting"
+			statusLog.Debug("fallback_restored_starting", slog.String("session", shortName))
+			return "starting", nil
+		}
 		if s.stateTracker.acknowledged {
 			s.lastStableStatus = "idle"
+			s.startupAt = time.Time{}
+			statusLog.Debug("fallback_restored_idle", slog.String("session", shortName))
 			return "idle", nil
 		}
+		if s.lastStableStatus != "waiting" {
+			s.stateTracker.waitingSince = time.Now()
+		}
 		s.lastStableStatus = "waiting"
+		s.startupAt = time.Time{}
+		statusLog.Debug("fallback_restored_waiting", slog.String("session", shortName))
 		return "waiting", nil
 	}
 
+	// Update hash for tracking, but do NOT trigger GREEN based on hash change alone
+	// The busy indicator check above (hasBusyIndicator) already handles the GREEN case
+	// Hash changes can occur from cursor blinks, terminal redraws, status bar updates, etc.
 	if s.stateTracker.lastHash != currentHash {
 		s.stateTracker.lastHash = currentHash
-		s.stateTracker.lastChangeTime = time.Now()
-		// Only reset acknowledged if we're outside the grace period
-		// This prevents brief YELLOW flash when Claude outputs right after user detaches
-		if time.Since(s.stateTracker.acknowledgedAt) > acknowledgeGracePeriod {
-			s.stateTracker.acknowledged = false
-		}
-		s.lastStableStatus = "active"
-		debugLog("%s: FALLBACK CHANGED → active (ack grace: %v)", shortName,
-			time.Since(s.stateTracker.acknowledgedAt) <= acknowledgeGracePeriod)
-		return "active", nil
+		statusLog.Debug("fallback_hash_updated", slog.String("session", shortName))
 	}
 
-	if time.Since(s.stateTracker.lastChangeTime) < activityCooldown {
-		s.lastStableStatus = "active"
-		return "active", nil
-	}
-
+	// No busy indicator found - check acknowledged state
 	if s.stateTracker.acknowledged {
 		s.lastStableStatus = "idle"
+		s.startupAt = time.Time{}
+		statusLog.Debug("fallback_idle_acknowledged", slog.String("session", shortName))
 		return "idle", nil
 	}
+	if s.inStartupWindowLocked() {
+		s.lastStableStatus = "starting"
+		statusLog.Debug("fallback_starting_pending", slog.String("session", shortName))
+		return "starting", nil
+	}
+	// Track when we transition to waiting (not already waiting)
+	if s.lastStableStatus != "waiting" {
+		s.stateTracker.waitingSince = time.Now()
+	}
 	s.lastStableStatus = "waiting"
+	s.startupAt = time.Time{}
+	statusLog.Debug("fallback_waiting_not_acknowledged", slog.String("session", shortName))
 	return "waiting", nil
 }
 
@@ -1270,6 +2669,7 @@ func (s *Session) Acknowledge() {
 
 	s.ensureStateTrackerLocked()
 	s.stateTracker.acknowledged = true
+	s.resetPromptNoBusyHoldLocked()
 	s.lastStableStatus = "idle"
 }
 
@@ -1282,20 +2682,46 @@ func (s *Session) ResetAcknowledged() {
 
 	s.ensureStateTrackerLocked()
 	s.stateTracker.acknowledged = false
+	s.resetPromptNoBusyHoldLocked()
+	s.stateTracker.waitingSince = time.Now() // Track when session became waiting for ordering
 	s.lastStableStatus = "waiting"
 }
 
-// SignalFileActivity signals that file output was detected (from LogWatcher)
-// This directly triggers GREEN status by updating the cooldown timer
-// Call this when pipe-pane log file is written to
-func (s *Session) SignalFileActivity() {
+// ApplySharedAcknowledged applies acknowledgment state replicated from SQLite.
+// Unlike Acknowledge/ResetAcknowledged, this only synchronizes the ack flag and
+// does not force an immediate status transition. GetStatus() will naturally map
+// to waiting/idle on the next poll based on busy/prompt conditions.
+func (s *Session) ApplySharedAcknowledged(ack bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.ensureStateTrackerLocked()
-	s.stateTracker.lastChangeTime = time.Now()
-	s.stateTracker.acknowledged = false
-	s.lastStableStatus = "active"
+	if s.stateTracker == nil {
+		// No local state yet; ack=false is already the default behavior.
+		if !ack {
+			return
+		}
+		s.ensureStateTrackerLocked()
+	} else if s.stateTracker.spinnerTracker == nil {
+		s.stateTracker.spinnerTracker = NewSpinnerActivityTracker()
+	}
+
+	s.stateTracker.acknowledged = ack
+	s.resetPromptNoBusyHoldLocked()
+	if ack {
+		s.stateTracker.acknowledgedAt = time.Now()
+	}
+}
+
+// IsAcknowledged returns whether the session has been acknowledged by the user.
+// Used by the hook fast path to distinguish waiting (orange) from idle (gray).
+func (s *Session) IsAcknowledged() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.stateTracker == nil {
+		return false
+	}
+	return s.stateTracker.acknowledged
 }
 
 // GetLastActivityTime returns when the session content last changed
@@ -1310,96 +2736,93 @@ func (s *Session) GetLastActivityTime() time.Time {
 	return s.stateTracker.lastChangeTime
 }
 
-// hasBusyIndicator checks if the terminal shows explicit busy indicators
-// This is a quick check used in GetStatus() to detect active processing
-//
-// Busy indicators for different tools:
-// - Claude Code: "esc to interrupt", spinner chars, "Thinking...", "Connecting..."
-// - Gemini: Similar spinner patterns
-// - OpenCode: TUI elements, mode indicators, input box
-// - Shell: Running commands (no prompt visible)
+// GetWaitingSince returns when the session transitioned to waiting status
+// Returns zero time if session has never been waiting
+func (s *Session) GetWaitingSince() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.stateTracker == nil {
+		return time.Time{}
+	}
+	return s.stateTracker.waitingSince
+}
+
+// hasBusyIndicator checks if the terminal shows explicit busy indicators.
+// Now uses spinner movement detection for all paths (experiment).
 func (s *Session) hasBusyIndicator(content string) bool {
-	shortName := s.DisplayName
-	if len(shortName) > 12 {
-		shortName = shortName[:12]
+	// Always use spinner movement detection regardless of resolvedPatterns
+	return s.hasBusyIndicatorResolved(content)
+}
+
+var defaultResolvedPatternsCache sync.Map // map[string]*ResolvedPatterns
+
+func inferToolFromSessionFields(detected, custom, command string) string {
+	if detected != "" {
+		return strings.ToLower(detected)
+	}
+	if custom != "" {
+		return strings.ToLower(custom)
+	}
+	return detectToolFromCommand(command)
+}
+
+func defaultResolvedPatternsForTool(tool string) *ResolvedPatterns {
+	tool = strings.ToLower(strings.TrimSpace(tool))
+	if tool == "" {
+		return nil
+	}
+	if cached, ok := defaultResolvedPatternsCache.Load(tool); ok {
+		if rp, ok := cached.(*ResolvedPatterns); ok {
+			return rp
+		}
 	}
 
-	// Get last 10 lines for analysis
-	lines := strings.Split(content, "\n")
-	start := len(lines) - 10
-	if start < 0 {
-		start = 0
+	raw := DefaultRawPatterns(tool)
+	if raw == nil {
+		return nil
 	}
-	recentContent := strings.ToLower(strings.Join(lines[start:], "\n"))
+	resolved, err := CompilePatterns(raw)
+	if err != nil {
+		return nil
+	}
+	if actual, loaded := defaultResolvedPatternsCache.LoadOrStore(tool, resolved); loaded {
+		if rp, ok := actual.(*ResolvedPatterns); ok {
+			return rp
+		}
+	}
+	return resolved
+}
 
-	// ═══════════════════════════════════════════════════════════════════════
-	// Text-based busy indicators
-	// ═══════════════════════════════════════════════════════════════════════
-	busyIndicators := []string{
-		"esc to interrupt",   // Claude Code main indicator
-		"(esc to interrupt)", // Claude Code in parentheses
-		"· esc to interrupt", // With separator
+func hasInterruptBusyContext(lines []string, phrase string, spinnerChars []string) bool {
+	phrase = strings.ToLower(strings.TrimSpace(phrase))
+	if phrase == "" {
+		return false
 	}
 
-	for _, indicator := range busyIndicators {
-		if strings.Contains(recentContent, indicator) {
-			debugLog("%s: BUSY_REASON=text_indicator matched=%q", shortName, indicator)
+	for _, line := range lines {
+		clean := strings.ToLower(strings.TrimSpace(StripANSI(line)))
+		if !strings.Contains(clean, phrase) {
+			continue
+		}
+
+		// Exact interrupt prompt line (older tool variants).
+		if clean == phrase {
 			return true
 		}
-	}
 
-	// Check for whimsical thinking words with "tokens" pattern
-	// Claude Code shows status like "Flibbertigibbeting... (25s · 340 tokens)"
-	// We check for any of the 90 whimsical words + "tokens" in content
-	if strings.Contains(recentContent, "tokens") {
-		for _, word := range claudeWhimsicalWords {
-			if strings.Contains(recentContent, word) {
-				debugLog("%s: BUSY_REASON=%s+tokens pattern", shortName, word)
-				return true
-			}
+		// Common busy-line context for Claude/Gemini style status lines.
+		if strings.Contains(clean, "(") ||
+			strings.Contains(clean, "tokens") ||
+			strings.Contains(clean, "thinking") ||
+			strings.Contains(clean, "…") ||
+			strings.Contains(clean, "·") {
+			return true
 		}
-	}
 
-	// ═══════════════════════════════════════════════════════════════════════
-	// Spinner characters (from cli-spinners "dots" - used by Claude Code)
-	// These braille characters animate to show processing
-	// ═══════════════════════════════════════════════════════════════════════
-	spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-
-	// Only check last 5 lines for spinners (they appear near the bottom)
-	last5 := lines
-	if len(last5) > 5 {
-		last5 = last5[len(last5)-5:]
-	}
-
-	for lineIdx, line := range last5 {
-		for _, spinner := range spinnerChars {
-			if strings.Contains(line, spinner) {
-				debugLog("%s: BUSY_REASON=spinner char=%q line=%d content=%q", shortName, spinner, lineIdx, truncateForLog(line, 50))
-				return true
-			}
-		}
-	}
-
-	// ═══════════════════════════════════════════════════════════════════════
-	// Additional busy indicators (for other tools)
-	// ═══════════════════════════════════════════════════════════════════════
-
-	// Generic "working" indicators that appear in various tools
-	workingIndicators := []string{
-		"processing",
-		"loading",
-		"please wait",
-		"working",
-	}
-
-	// Only match these if they're standalone (not part of other text)
-	for _, indicator := range workingIndicators {
-		// Check if indicator appears at start of a line (more reliable)
-		for lineIdx, line := range last5 {
-			lineLower := strings.ToLower(strings.TrimSpace(line))
-			if strings.HasPrefix(lineLower, indicator) {
-				debugLog("%s: BUSY_REASON=working_indicator matched=%q line=%d content=%q", shortName, indicator, lineIdx, truncateForLog(line, 50))
+		// Spinner char present on same line is also sufficient.
+		for _, ch := range spinnerChars {
+			if strings.Contains(clean, strings.ToLower(ch)) {
 				return true
 			}
 		}
@@ -1408,12 +2831,171 @@ func (s *Session) hasBusyIndicator(content string) bool {
 	return false
 }
 
-// truncateForLog truncates a string for logging purposes
-func truncateForLog(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+// hasBusyIndicatorResolved detects active work with a pattern-first strategy:
+//  1. Busy regex/string patterns (tool-specific, e.g. Claude ellipsis/interrupt lines)
+//  2. Spinner fallback (strict for Claude; permissive for other tools)
+//  3. Grace period between tool-call transitions
+//
+// This avoids false GREEN from decorative symbols or status/footer redraws.
+func (s *Session) hasBusyIndicatorResolved(content string) bool {
+	shortName := s.DisplayName
+	if len(shortName) > 12 {
+		shortName = shortName[:12]
 	}
-	return s[:maxLen] + "..."
+
+	tool := inferToolFromSessionFields(s.detectedTool, s.customToolName, s.Command)
+	patterns := s.resolvedPatterns
+	if patterns == nil {
+		patterns = defaultResolvedPatternsForTool(tool)
+	}
+
+	// Get spinner chars from resolved/default patterns, fallback to defaults
+	spinnerChars := defaultSpinnerChars()
+	if patterns != nil && len(patterns.SpinnerChars) > 0 {
+		spinnerChars = patterns.SpinnerChars
+	}
+
+	// Find spinner in terminal content
+	char, spinnerLine, found := findSpinnerInContent(content, spinnerChars)
+
+	// Get or create spinner tracker
+	s.ensureStateTrackerLocked()
+	tracker := s.stateTracker.spinnerTracker
+
+	// BusyPatterns (regex + string) are authoritative because they capture
+	// real active-line semantics for each tool.
+	if patterns != nil {
+		recentLines := lastNLines(content, 25)
+		recentContent := strings.Join(recentLines, "\n")
+		for _, re := range patterns.BusyRegexps {
+			if re.MatchString(recentContent) {
+				tracker.MarkBusy()
+				statusLog.Debug(
+					"busy_pattern_match",
+					slog.String("session", shortName),
+					slog.String("pattern", re.String()),
+				)
+				return true
+			}
+		}
+		lowerContent := strings.ToLower(recentContent)
+		for _, str := range patterns.BusyStrings {
+			lowerStr := strings.ToLower(str)
+			if !strings.Contains(lowerContent, lowerStr) {
+				continue
+			}
+			if strings.Contains(lowerStr, "interrupt") &&
+				!hasInterruptBusyContext(recentLines, lowerStr, spinnerChars) {
+				statusLog.Debug("busy_string_ignored_no_context",
+					slog.String("session", shortName),
+					slog.String("pattern", str))
+				continue
+			}
+			tracker.MarkBusy()
+			statusLog.Debug("busy_string_match", slog.String("session", shortName), slog.String("pattern", str))
+			return true
+		}
+	}
+	isClaude := strings.EqualFold(tool, "claude")
+
+	if found {
+		// For Claude, braille spinner frames are authoritative.
+		// Asterisk-style frames can appear in non-active contexts, so require context.
+		lineClean := StripANSI(spinnerLine)
+		lineLower := strings.ToLower(lineClean)
+		hasActiveContext := strings.Contains(lineClean, "…") || strings.Contains(lineLower, "interrupt")
+		if !isClaude || isBrailleSpinnerChar(char) || hasActiveContext {
+			tracker.MarkBusy()
+			statusLog.Debug("busy_spinner_found", slog.String("session", shortName), slog.String("char", char))
+			return true
+		}
+		statusLog.Debug("busy_spinner_ignored_no_active_context",
+			slog.String("session", shortName),
+			slog.String("char", char))
+	}
+
+	// No busy signal. Check grace period: between tool calls the spinner
+	// briefly disappears. If it was visible recently, stay busy.
+	if tracker.InGracePeriod() {
+		statusLog.Debug("busy_spinner_grace", slog.String("session", shortName),
+			slog.Duration("since_busy", time.Since(tracker.lastBusyTime)))
+		return true
+	}
+
+	statusLog.Debug("busy_no_spinner", slog.String("session", shortName))
+	return false
+}
+
+// hasPromptIndicator checks if the terminal shows a prompt waiting for user input.
+// Uses the PromptDetector which understands tool-specific prompt patterns (permission
+// dialogs, AskUserQuestion UI, input prompts, etc.). Prompt detection takes priority
+// over busy indicators because tools can show status text alongside interactive prompts.
+//
+// NOTE: This method reads s.detectedTool and s.customToolName without locking.
+// Callers in GetStatus() already hold s.mu, so we must not re-lock.
+func (s *Session) hasPromptIndicator(content string) bool {
+	tool := inferToolFromSessionFields(s.detectedTool, s.customToolName, s.Command)
+	patterns := s.resolvedPatterns
+	if patterns == nil {
+		patterns = defaultResolvedPatternsForTool(tool)
+	}
+
+	// Configured prompt patterns are checked first so custom tool definitions and
+	// per-tool overrides can participate in waiting-state detection.
+	if patterns != nil {
+		recentLines := lastNLines(content, 25)
+		recentContent := strings.Join(recentLines, "\n")
+		for _, re := range patterns.PromptRegexps {
+			if re.MatchString(recentContent) {
+				return true
+			}
+		}
+		lowerContent := strings.ToLower(recentContent)
+		for _, str := range patterns.PromptStrings {
+			if strings.Contains(lowerContent, strings.ToLower(str)) {
+				return true
+			}
+		}
+	}
+	if tool == "" {
+		return false
+	}
+	// Reuse cached detector if tool hasn't changed (avoids allocation per call)
+	if s.cachedPromptDetector == nil || s.cachedPromptDetectorTool != tool {
+		s.cachedPromptDetector = NewPromptDetector(tool)
+		s.cachedPromptDetectorTool = tool
+	}
+	return s.cachedPromptDetector.HasPrompt(content)
+}
+
+// lastNLines splits content into lines, trims trailing blank lines, and returns
+// the last n lines. Used by busy/prompt detection to focus on recent terminal output.
+func lastNLines(content string, n int) []string {
+	lines := strings.Split(content, "\n")
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	start := len(lines) - n
+	if start < 0 {
+		start = 0
+	}
+	return lines[start:]
+}
+
+// startsWithBoxDrawing checks if a line starts with box-drawing characters (UI borders).
+func startsWithBoxDrawing(line string) bool {
+	trimmedLine := strings.TrimSpace(line)
+	if len(trimmedLine) == 0 {
+		return false
+	}
+	r := []rune(trimmedLine)[0]
+	return r == '│' || r == '├' || r == '└' || r == '─' || r == '┌' || r == '┐' || r == '┘' || r == '┤' || r == '┬' ||
+		r == '┴' ||
+		r == '┼' ||
+		r == '╭' ||
+		r == '╰' ||
+		r == '╮' ||
+		r == '╯'
 }
 
 // isSustainedActivity checks if activity is sustained (real work) or a spike.
@@ -1450,25 +3032,50 @@ func (s *Session) isSustainedActivity() bool {
 	}
 
 	isSustained := changes >= 1 // At least 1 MORE change after initial detection
-	debugLog("%s: isSustainedActivity changes=%d sustained=%v", s.DisplayName, changes, isSustained)
+	statusLog.Debug(
+		"is_sustained_activity",
+		slog.String("session", s.DisplayName),
+		slog.Int("changes", changes),
+		slog.Bool("sustained", isSustained),
+	)
 	return isSustained
 }
 
 // Precompiled regex patterns for dynamic content stripping
 // These are compiled once at package init for performance
 var (
-	// Matches Claude Code status line: "(45s · 1234 tokens · esc to interrupt)"
-	dynamicStatusPattern = regexp.MustCompile(`\([^)]*\d+s\s*·[^)]*tokens[^)]*\)`)
+	// Matches Claude Code status line: "(45s · 1234 tokens · ctrl+c to interrupt)" and "(35s · ↑ 673 tokens)"
+	dynamicStatusPattern = regexp.MustCompile(`\([^)]*\d+s\s*·[^)]*(?:tokens|↑|↓)[^)]*\)`)
 
-	// Matches whimsical thinking words with timing info (e.g., "Flibbertigibbeting... (25s · 340 tokens)")
+	// Claude Code 2.1.25+ active spinner: symbol + unicode ellipsis (U+2026)
+	// Matches: "✳ Gusting…", "✻ Adding mcp-proxy subcommand…" (single or multi-word)
+	// Does NOT match done state: "✻ Worked for 54s" (no ellipsis)
+	// Anchored to line start to prevent mid-line · in welcome banner from false-positiving
+	claudeSpinnerActivePattern = regexp.MustCompile(`(?m)^[·✳✽✶✻✢]\s*.+…`)
+
+	// Matches whimsical thinking words with timing info (e.g., "⠋ Flibbertigibbeting... (25s · 340 tokens)")
+	// Requires spinner prefix to avoid matching normal English words like "processing" or "computing"
 	// Updated to include all 90 Claude Code whimsical words
-	thinkingPattern = regexp.MustCompile(`(?i)(` + whimsicalWordsPattern + `)[^(]*\([^)]*\)`)
+	thinkingPattern = regexp.MustCompile(`[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏·✳✽✶✻✢]\s*(?i)(` + whimsicalWordsPattern + `)[^(]*\([^)]*\)`)
+
+	// Claude 2.1.25+ uses unicode ellipsis: "✳ Gusting… (35s · ↑ 673 tokens)"
+	// Word-list independent - any spinner + text + ellipsis + parenthesized status
+	thinkingPatternEllipsis = regexp.MustCompile(`[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏·✳✽✶✻✢]\s*.+…\s*\([^)]*\)`)
 
 	// Progress bar patterns for normalization (Fix 2.1)
 	// These cause hash changes when progress updates
-	progressBarPattern = regexp.MustCompile(`\[=*>?\s*\]\s*\d+%`)           // [====>   ] 45%
+	progressBarPattern = regexp.MustCompile(`\[=*>?\s*\]\s*\d+%`)                  // [====>   ] 45%
 	downloadPattern    = regexp.MustCompile(`\d+\.?\d*[KMGT]?B/\d+\.?\d*[KMGT]?B`) // 1.2MB/5.6MB
-	percentagePattern  = regexp.MustCompile(`\b\d{1,3}%`)                   // 45% (word boundary to avoid false matches)
+	percentagePattern  = regexp.MustCompile(
+		`\b\d{1,3}%`,
+	) // 45% (word boundary to avoid false matches)
+
+	// Time patterns like "12:34" or "12:34:56" that change every second
+	// Gemini and other tools show timestamps that cause hash changes
+	timePattern = regexp.MustCompile(`\b\d{1,2}:\d{2}(?::\d{2})?\b`)
+
+	// Collapses runs of 3+ newlines to 2 newlines (one blank line)
+	blankLinesPattern = regexp.MustCompile(`\n{3,}`)
 )
 
 // claudeWhimsicalWords contains all 90 whimsical "thinking" words used by Claude Code
@@ -1493,6 +3100,8 @@ var claudeWhimsicalWords = []string{
 	"stewing", "sussing", "synthesizing", "thinking", "tinkering",
 	"transmuting", "unfurling", "unravelling", "vibing", "wandering",
 	"whirring", "wibbling", "wizarding", "working", "wrangling",
+	// Claude Code 2.1.25+ additions
+	"billowing", "gusting", "metamorphosing", "sublimating", "recombobulating", "sautéing",
 }
 
 // whimsicalWordsPattern is the regex alternation of all whimsical words
@@ -1514,27 +3123,36 @@ func (s *Session) normalizeContent(content string) string {
 	// Strip other non-printing control characters
 	result = stripControlChars(result)
 
-	// Strip braille spinner characters (used by Claude Code and others)
-	// These animate while processing and cause hash changes
-	spinners := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
-	for _, r := range spinners {
-		result = strings.ReplaceAll(result, string(r), "")
-	}
+	// Strip spinner characters that animate and cause hash changes
+	// Single-pass O(n) removal using map lookup instead of 16 sequential ReplaceAll calls
+	result = StripSpinnerRunes(result)
 
 	// Strip dynamic time/token counters that change every second
-	// This prevents flickering when Claude Code shows "(45s · 1234 tokens · esc to interrupt)"
-	// which updates to "(46s · 1234 tokens · esc to interrupt)" one second later
 	result = dynamicStatusPattern.ReplaceAllString(result, "(STATUS)")
-	result = thinkingPattern.ReplaceAllString(result, "$1...")
+
+	// Use resolved combo patterns when available, otherwise fall back to package-level patterns
+	if s.resolvedPatterns != nil && s.resolvedPatterns.ThinkingPattern != nil {
+		result = s.resolvedPatterns.ThinkingPattern.ReplaceAllString(result, "$1...")
+	} else {
+		result = thinkingPattern.ReplaceAllString(result, "$1...")
+	}
+	if s.resolvedPatterns != nil && s.resolvedPatterns.ThinkingPatternEllipsis != nil {
+		result = s.resolvedPatterns.ThinkingPatternEllipsis.ReplaceAllString(result, "THINKING…")
+	} else {
+		result = thinkingPatternEllipsis.ReplaceAllString(result, "THINKING…")
+	}
 
 	// Strip progress indicators that change frequently (Fix 2.1)
 	// These cause hash changes during downloads, builds, etc.
-	result = progressBarPattern.ReplaceAllString(result, "[PROGRESS]")  // [====>   ] 45%
-	result = downloadPattern.ReplaceAllString(result, "X.XMB/Y.YMB")    // 1.2MB/5.6MB
-	result = percentagePattern.ReplaceAllString(result, "N%")           // 45%
+	result = progressBarPattern.ReplaceAllString(result, "[PROGRESS]") // [====>   ] 45%
+	result = downloadPattern.ReplaceAllString(result, "X.XMB/Y.YMB")   // 1.2MB/5.6MB
+	result = percentagePattern.ReplaceAllString(result, "N%")          // 45%
+
+	// Normalize time patterns (12:34 or 12:34:56) that change every second
+	result = timePattern.ReplaceAllString(result, "HH:MM:SS")
 
 	// Normalize trailing whitespace per line (fixes resize false positives)
-	// tmux capture-pane -J can add trailing spaces when terminal is resized
+	// tmux capture-pane can include trailing spaces
 	lines := strings.Split(result, "\n")
 	for i, line := range lines {
 		lines[i] = strings.TrimRight(line, " \t")
@@ -1550,9 +3168,7 @@ func (s *Session) normalizeContent(content string) string {
 
 // normalizeBlankLines collapses runs of 3+ newlines to 2 newlines (one blank line)
 func normalizeBlankLines(content string) string {
-	// Match 3 or more consecutive newlines and replace with 2
-	re := regexp.MustCompile(`\n{3,}`)
-	return re.ReplaceAllString(content, "\n\n")
+	return blankLinesPattern.ReplaceAllString(content, "\n\n")
 }
 
 // stripControlChars removes all ASCII control characters except for tab, newline,
@@ -1579,27 +3195,108 @@ func (s *Session) hashContent(content string) string {
 // SendKeys sends keys to the tmux session
 // Uses -l flag to treat keys as literal text, preventing tmux special key interpretation
 func (s *Session) SendKeys(keys string) error {
+	s.invalidateCache()
 	// The -l flag makes tmux treat the string as literal text, not key names
 	// This prevents issues like "Enter" being interpreted as the Enter key
 	// and provides a layer of safety against tmux special sequences
-	cmd := exec.Command("tmux", "send-keys", "-l", "-t", s.Name, keys)
+	cmd := exec.Command("tmux", "send-keys", "-l", "-t", s.Name, "--", keys)
 	return cmd.Run()
 }
 
 // SendEnter sends an Enter key to the tmux session
 func (s *Session) SendEnter() error {
+	s.invalidateCache()
 	cmd := exec.Command("tmux", "send-keys", "-t", s.Name, "Enter")
 	return cmd.Run()
 }
 
+// SendKeysAndEnter sends literal text followed by Enter as two separate tmux
+// calls with a short delay between them. The delay is necessary because tmux
+// 3.2+ wraps send-keys -l in bracketed paste sequences (\e[200~...\e[201~).
+// Without the delay, Enter arrives in the same PTY buffer as the paste-end
+// marker and gets swallowed by async TUI frameworks (Ink/Node.js, curses).
+func (s *Session) SendKeysAndEnter(keys string) error {
+	s.invalidateCache()
+	// Use chunked sending for large messages to avoid tmux buffer limits
+	if err := s.SendKeysChunked(keys); err != nil {
+		return err
+	}
+	// Delay for TUI apps (Ink, curses) to finish processing bracketed paste
+	// before Enter arrives. Without this, tmux 3.2+ paste sequences cause
+	// the immediately-following Enter to be swallowed by the paste handler.
+	time.Sleep(100 * time.Millisecond)
+	return s.SendEnter()
+}
+
+// SendKeysChunked sends large content to the tmux session in chunks to avoid
+// tmux/OS buffer limits. Content ≤4KB is sent directly via SendKeys.
+// Larger content is split at newline boundaries with a short delay between chunks.
+func (s *Session) SendKeysChunked(content string) error {
+	const chunkSize = 4096
+	const chunkDelay = 50 * time.Millisecond
+
+	if len(content) <= chunkSize {
+		return s.SendKeys(content)
+	}
+
+	chunks := splitIntoChunks(content, chunkSize)
+	for i, chunk := range chunks {
+		if err := s.SendKeys(chunk); err != nil {
+			return fmt.Errorf("failed to send chunk %d/%d: %w", i+1, len(chunks), err)
+		}
+		if i < len(chunks)-1 {
+			time.Sleep(chunkDelay)
+		}
+	}
+	return nil
+}
+
+// splitIntoChunks splits content into chunks of at most maxSize bytes,
+// preferring to split at newline boundaries. If a single line exceeds maxSize,
+// it is split at the byte boundary as a fallback.
+func splitIntoChunks(content string, maxSize int) []string {
+	if content == "" {
+		return nil
+	}
+	if len(content) <= maxSize {
+		return []string{content}
+	}
+
+	var chunks []string
+	remaining := content
+
+	for len(remaining) > 0 {
+		if len(remaining) <= maxSize {
+			chunks = append(chunks, remaining)
+			break
+		}
+
+		// Find the last newline within the chunk boundary
+		cutPoint := strings.LastIndex(remaining[:maxSize], "\n")
+		if cutPoint > 0 {
+			// Include the newline in this chunk
+			chunks = append(chunks, remaining[:cutPoint+1])
+			remaining = remaining[cutPoint+1:]
+		} else {
+			// No newline found: hard split at maxSize
+			chunks = append(chunks, remaining[:maxSize])
+			remaining = remaining[maxSize:]
+		}
+	}
+
+	return chunks
+}
+
 // SendCtrlC sends Ctrl+C (interrupt signal) to the tmux session
 func (s *Session) SendCtrlC() error {
+	s.invalidateCache()
 	cmd := exec.Command("tmux", "send-keys", "-t", s.Name, "C-c")
 	return cmd.Run()
 }
 
 // SendCtrlU sends Ctrl+U (clear line) to the tmux session
 func (s *Session) SendCtrlU() error {
+	s.invalidateCache()
 	cmd := exec.Command("tmux", "send-keys", "-t", s.Name, "C-u")
 	return cmd.Run()
 }
@@ -1619,6 +3316,7 @@ func (s *Session) WaitForShellPrompt(timeout time.Duration) bool {
 			time.Sleep(pollInterval)
 			continue
 		}
+		content = StripANSI(content)
 
 		// Get the last non-empty line
 		lines := strings.Split(strings.TrimSpace(content), "\n")
@@ -1661,33 +3359,48 @@ func (s *Session) WaitForReady(timeout time.Duration) bool {
 		attempts++
 		content, err := s.CapturePane()
 		if err != nil {
-			log.Printf("[WaitForReady] Attempt %d: CapturePane error: %v", attempts, err)
+			statusLog.Debug(
+				"wait_for_ready_capture_error",
+				slog.Int("attempt", attempts),
+				slog.String("error", err.Error()),
+			)
 			time.Sleep(pollInterval)
 			continue
 		}
+		content = StripANSI(content)
 
 		busy := s.hasBusyIndicator(content)
 		prompt := hasPrompt(content)
 
 		if attempts%10 == 0 { // Log every 10th attempt (every second)
-			log.Printf("[WaitForReady] Attempt %d: busy=%v, prompt=%v", attempts, busy, prompt)
+			statusLog.Debug(
+				"wait_for_ready_status",
+				slog.Int("attempt", attempts),
+				slog.Bool("busy", busy),
+				slog.Bool("prompt", prompt),
+			)
 		}
 
 		// Check: NOT busy AND has prompt
 		if !busy && prompt {
-			log.Printf("[WaitForReady] READY detected after %d attempts (%.1fs)", attempts, float64(attempts)*0.1)
+			statusLog.Debug(
+				"wait_for_ready_detected",
+				slog.Int("attempts", attempts),
+				slog.Float64("seconds", float64(attempts)*0.1),
+			)
 			return true // Ready for input!
 		}
 
 		time.Sleep(pollInterval)
 	}
 
-	log.Printf("[WaitForReady] TIMEOUT after %d attempts", attempts)
+	statusLog.Debug("wait_for_ready_timeout", slog.Int("attempts", attempts))
 	return false // Timeout
 }
 
 // hasPrompt checks for input prompts (Claude, shell, other agents)
 func hasPrompt(content string) bool {
+	content = StripANSI(content)
 	lines := strings.Split(content, "\n")
 	if len(lines) == 0 {
 		return false
@@ -1730,7 +3443,7 @@ func (s *Session) IsClaudeRunning() bool {
 
 	// Check for Claude-specific indicators
 	claudeIndicators := []string{
-		"esc to interrupt",
+		"ctrl+c to interrupt",
 		"Thinking...",
 		"Connecting...",
 		"Press Ctrl-C again to exit",
@@ -1761,12 +3474,7 @@ func (s *Session) IsClaudeRunning() bool {
 
 // SendCommand sends a command to the tmux session and presses Enter
 func (s *Session) SendCommand(command string) error {
-	// Send the command text
-	if err := s.SendKeys(command); err != nil {
-		return err
-	}
-	// Press Enter to execute
-	return s.SendEnter()
+	return s.SendKeysAndEnter(command)
 }
 
 // GetWorkDir returns the current working directory of the tmux pane
@@ -1847,11 +3555,16 @@ func TruncateLogFile(logPath string, maxLines int) error {
 
 	// Write back
 	truncatedData := strings.Join(truncatedLines, "\n")
-	if err := os.WriteFile(logPath, []byte(truncatedData), 0644); err != nil {
+	if err := os.WriteFile(logPath, []byte(truncatedData), 0o644); err != nil {
 		return fmt.Errorf("failed to write truncated log: %w", err)
 	}
 
-	debugLog("Truncated log %s: %d -> %d lines", filepath.Base(logPath), len(lines), len(truncatedLines))
+	statusLog.Debug(
+		"log_truncated",
+		slog.String("file", filepath.Base(logPath)),
+		slog.Int("from_lines", len(lines)),
+		slog.Int("to_lines", len(truncatedLines)),
+	)
 	return nil
 }
 
@@ -1882,7 +3595,7 @@ func TruncateLargeLogFiles(maxSizeMB int, maxLines int) (truncated int, err erro
 
 		if info.Size() > maxSizeBytes {
 			if err := TruncateLogFile(logPath, maxLines); err != nil {
-				debugLog("Failed to truncate %s: %v", entry.Name(), err)
+				statusLog.Debug("truncate_failed", slog.String("file", entry.Name()), slog.String("error", err.Error()))
 				continue
 			}
 			truncated++
@@ -1948,13 +3661,21 @@ func CleanupOrphanedLogs() (removed int, freedBytes int64, err error) {
 		// Remove orphaned log
 		size := info.Size()
 		if err := os.Remove(logPath); err != nil {
-			debugLog("Failed to remove orphaned log %s: %v", entry.Name(), err)
+			statusLog.Debug(
+				"orphan_remove_failed",
+				slog.String("file", entry.Name()),
+				slog.String("error", err.Error()),
+			)
 			continue
 		}
 
 		removed++
 		freedBytes += size
-		debugLog("Removed orphaned log: %s (%.1f KB)", entry.Name(), float64(size)/1024)
+		statusLog.Debug(
+			"orphan_removed",
+			slog.String("file", entry.Name()),
+			slog.Float64("size_kb", float64(size)/1024),
+		)
 	}
 
 	return removed, freedBytes, nil
@@ -1966,20 +3687,269 @@ func RunLogMaintenance(maxSizeMB int, maxLines int, removeOrphans bool) {
 	// Truncate large files
 	truncated, err := TruncateLargeLogFiles(maxSizeMB, maxLines)
 	if err != nil {
-		debugLog("Log truncation error: %v", err)
+		statusLog.Debug("log_truncation_error", slog.String("error", err.Error()))
 	} else if truncated > 0 {
-		debugLog("Truncated %d large log files", truncated)
+		statusLog.Debug("log_truncation_complete", slog.Int("count", truncated))
 	}
 
 	// Remove orphaned logs
 	if removeOrphans {
 		removed, freed, err := CleanupOrphanedLogs()
 		if err != nil {
-			debugLog("Orphan cleanup error: %v", err)
+			statusLog.Debug("orphan_cleanup_error", slog.String("error", err.Error()))
 		} else if removed > 0 {
-			debugLog("Removed %d orphaned logs (freed %.1f MB)", removed, float64(freed)/(1024*1024))
+			statusLog.Debug("orphan_cleanup_complete", slog.Int("count", removed), slog.Float64("freed_mb", float64(freed)/(1024*1024)))
 		}
 	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Notification Bar Helper Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ListAgentDeckSessions returns the names of all agentdeck tmux sessions.
+// This is used to update notification bars across ALL sessions, not just
+// those in the current profile. This ensures consistent notification bars
+// when users switch between sessions.
+func ListAgentDeckSessions() ([]string, error) {
+	cmd := exec.Command("tmux", "list-sessions", "-F", "#{session_name}")
+	output, err := cmd.Output()
+	if err != nil {
+		// No sessions exist
+		if strings.Contains(err.Error(), "no server running") ||
+			strings.Contains(err.Error(), "no sessions") {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("failed to list sessions: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	var sessions []string
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, SessionPrefix) {
+			sessions = append(sessions, line)
+		}
+	}
+
+	return sessions, nil
+}
+
+// SetStatusLeft sets the left side of tmux status bar for a session.
+// Used by NotificationManager to display waiting session notifications.
+func SetStatusLeft(sessionName, text string) error {
+	// Escape single quotes for tmux by replacing ' with '\''
+	escaped := strings.ReplaceAll(text, "'", "'\\''")
+	cmd := exec.Command("tmux", "set-option", "-t", sessionName, "status-left", escaped)
+	return cmd.Run()
+}
+
+// ClearStatusLeft resets status-left to default for a session.
+// Called when notifications are cleared or acknowledged.
+func ClearStatusLeft(sessionName string) error {
+	// -u flag unsets the option, reverting to tmux default
+	cmd := exec.Command("tmux", "set-option", "-t", sessionName, "-u", "status-left")
+	return cmd.Run()
+}
+
+// savedStatusLeft holds the original global status-left value before agent-deck overwrites it.
+// This allows ClearStatusLeftGlobal to restore the user's theme/plugin value (e.g., Oasis, Catppuccin)
+// instead of unsetting it, which would fall back to tmux's built-in default "[#{session_name}]".
+var savedStatusLeft struct {
+	sync.Once
+	value    string
+	captured bool
+}
+
+// captureOriginalStatusLeft reads and stores the current global status-left value.
+// Called once on first SetStatusLeftGlobal to preserve the user's existing value.
+func captureOriginalStatusLeft() {
+	out, err := exec.Command("tmux", "show-option", "-gv", "status-left").Output()
+	if err == nil {
+		savedStatusLeft.value = strings.TrimRight(string(out), "\n")
+		savedStatusLeft.captured = true
+	}
+}
+
+// SetStatusLeftGlobal sets the left side of tmux status bar globally.
+// This is a MAJOR performance optimization: ONE tmux call instead of 100+.
+// All agentdeck sessions inherit this global setting.
+// On first call, captures the existing status-left so ClearStatusLeftGlobal can restore it.
+func SetStatusLeftGlobal(text string) error {
+	savedStatusLeft.Do(captureOriginalStatusLeft)
+	escaped := strings.ReplaceAll(text, "'", "'\\''")
+	cmd := exec.Command("tmux", "set-option", "-g", "status-left", escaped)
+	return cmd.Run()
+}
+
+// ClearStatusLeftGlobal restores the original global status-left value.
+// If the original value was captured, it is restored so the user's theme/plugin
+// (e.g., tmux-oasis) is preserved. Falls back to unsetting the option only if
+// no original value was captured.
+func ClearStatusLeftGlobal() error {
+	if savedStatusLeft.captured {
+		escaped := strings.ReplaceAll(savedStatusLeft.value, "'", "'\\''")
+		return exec.Command("tmux", "set-option", "-g", "status-left", escaped).Run()
+	}
+	// No saved value — fall back to unset (original behavior)
+	return exec.Command("tmux", "set-option", "-gu", "status-left").Run()
+}
+
+// InitializeStatusBarOptions sets optimal status bar options for agent-deck.
+// Fixes truncation by setting adequate status-left-length globally.
+// Should be called once during startup.
+func InitializeStatusBarOptions() error {
+	// Set adequate status-left-length globally (default is only 10 chars!)
+	// This ensures the notification bar content is not truncated
+	return exec.Command("tmux", "set-option", "-g", "status-left-length", "120").Run()
+}
+
+// RefreshStatusBarImmediate forces an immediate status bar redraw for ALL connected clients.
+// This bypasses the status-interval timer (default 15s) for instant visual feedback.
+// Uses -S flag which only refreshes the status line (lightweight operation ~1-2ms per client).
+// Filters out control mode clients (from PipeManager) which don't have a visible status bar.
+func RefreshStatusBarImmediate() error {
+	// Get all connected clients, filtering out control mode clients
+	cmd := exec.Command("tmux", "list-clients", "-F", "#{client_name}\t#{client_control_mode}")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			continue
+		}
+		// Skip control mode clients (PipeManager pipes)
+		if parts[1] == "1" {
+			continue
+		}
+		_ = exec.Command("tmux", "refresh-client", "-S", "-t", parts[0]).Run()
+	}
+	return nil
+}
+
+// GetAttachedSessions returns the names of tmux sessions that have real clients attached.
+// Used to detect which session the user is currently viewing.
+// Filters out control mode clients (from PipeManager) which are not real user sessions.
+func GetAttachedSessions() ([]string, error) {
+	cmd := exec.Command("tmux", "list-clients", "-F", "#{session_name}\t#{client_control_mode}")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var sessions []string
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			continue
+		}
+		// Skip control mode clients
+		if parts[1] == "1" {
+			continue
+		}
+		sessions = append(sessions, parts[0])
+	}
+	return sessions, nil
+}
+
+// BindSwitchKey binds a number key to switch to target session.
+// Uses prefix table (default) so Ctrl+b N works.
+// The key should be a single character like "1", "2", etc.
+// Deprecated: Use BindSwitchKeyWithAck for notification bar integration.
+func BindSwitchKey(key, targetSession string) error {
+	cmd := exec.Command("tmux", "bind-key", key, "switch-client", "-t", targetSession)
+	return cmd.Run()
+}
+
+// BindSwitchKeyWithAck binds a number key to switch to target session AND
+// writes a signal file so agent-deck can acknowledge the session was selected.
+// This enables proper acknowledgment when user presses Ctrl+b 1-6 shortcuts.
+func BindSwitchKeyWithAck(key, targetSession, sessionID string) error {
+	// Get signal file path
+	signalFile, err := GetAckSignalPath()
+	if err != nil {
+		// Fall back to simple binding if we can't get the path
+		return BindSwitchKey(key, targetSession)
+	}
+
+	// Create a compound command that:
+	// 1. Writes the session ID to a signal file (for agent-deck to acknowledge)
+	// 2. Switches to the target session
+	script := fmt.Sprintf("echo '%s' > '%s' && tmux switch-client -t '%s'",
+		sessionID, signalFile, targetSession)
+	cmd := exec.Command("tmux", "bind-key", key, "run-shell", script)
+	return cmd.Run()
+}
+
+// GetAckSignalPath returns the path to the acknowledgment signal file
+func GetAckSignalPath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".agent-deck", "ack-signal"), nil
+}
+
+// ReadAndClearAckSignal reads the session ID from the signal file and deletes it.
+// Returns empty string if no signal file exists or on error.
+func ReadAndClearAckSignal() string {
+	signalFile, err := GetAckSignalPath()
+	if err != nil {
+		return ""
+	}
+
+	data, err := os.ReadFile(signalFile)
+	if err != nil {
+		return "" // File doesn't exist or can't be read
+	}
+
+	// Delete the file immediately after reading
+	_ = os.Remove(signalFile)
+
+	return strings.TrimSpace(string(data))
+}
+
+// UnbindKey removes a key binding and restores default behavior.
+// After unbinding, attempts to restore the default behavior where number keys
+// select windows. The restore is best-effort since it may fail in environments
+// without windows (e.g., CI) and agent-deck rebinds keys every 2s anyway.
+func UnbindKey(key string) error {
+	// First unbind our custom binding
+	_ = exec.Command("tmux", "unbind-key", key).Run()
+
+	// Best-effort restore default: number keys select windows
+	// bind-key 1 select-window -t :1
+	_ = exec.Command("tmux", "bind-key", key, "select-window", "-t", ":"+key).Run()
+	return nil
+}
+
+// BindMouseStatusRightDetach binds a mouse click on the status-right area to detach.
+// Only fires inside agentdeck sessions (guards against detaching the user's outer tmux).
+func BindMouseStatusRightDetach() error {
+	// Guard: only detach if current session is an agentdeck-managed session
+	script := `S=$(tmux display-message -p '#{session_name}'); case "$S" in agentdeck_*) tmux detach-client ;; esac`
+	return exec.Command("tmux", "bind", "-n", "MouseDown1StatusRight", "run-shell", script).Run()
+}
+
+// UnbindMouseStatusClicks removes mouse click bindings from the status bar.
+func UnbindMouseStatusClicks() {
+	_ = exec.Command("tmux", "unbind", "-n", "MouseDown1StatusRight").Run()
+}
+
+// GetActiveSession returns the session name the user is currently attached to.
+// Returns empty string and error if not attached to any session.
+func GetActiveSession() (string, error) {
+	cmd := exec.Command("tmux", "display-message", "-p", "#{client_session}")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

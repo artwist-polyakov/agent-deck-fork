@@ -119,7 +119,12 @@ if [[ -d "$DATA_DIR" ]]; then
     PROFILE_COUNT=0
     if [[ -d "$DATA_DIR/profiles" ]]; then
         for profile_dir in "$DATA_DIR/profiles"/*/; do
-            if [[ -f "${profile_dir}sessions.json" ]]; then
+            if [[ -f "${profile_dir}state.db" ]]; then
+                PROFILE_COUNT=$((PROFILE_COUNT + 1))
+                count=$(sqlite3 "${profile_dir}state.db" "SELECT COUNT(*) FROM instances;" 2>/dev/null || echo 0)
+                SESSION_COUNT=$((SESSION_COUNT + count))
+            elif [[ -f "${profile_dir}sessions.json" ]]; then
+                # Legacy fallback for pre-v0.11.0 profiles
                 PROFILE_COUNT=$((PROFILE_COUNT + 1))
                 count=$(grep -o '"id"' "${profile_dir}sessions.json" 2>/dev/null | wc -l | tr -d ' ')
                 SESSION_COUNT=$((SESSION_COUNT + count))

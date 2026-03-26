@@ -46,6 +46,7 @@ make run        # Run directly
 
 - `feature/description` - New features
 - `fix/description` - Bug fixes
+- `perf/description` - Performance optimizations
 - `docs/description` - Documentation changes
 - `refactor/description` - Code refactoring
 
@@ -143,7 +144,8 @@ AGENTDECK_DEBUG=1 agent-deck
 
 ## Questions?
 
-Feel free to open an issue for questions or discussion.
+- **Chat:** Join the [Agent Deck Discord](https://discord.gg/e4xSs6NBN8) for questions, workflow discussions, and community support
+- **Issues:** [Open an issue](https://github.com/asheshgoplani/agent-deck/issues) for bugs or feature requests
 
 ## License
 

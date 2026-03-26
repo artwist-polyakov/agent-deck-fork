@@ -4,6 +4,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestNewNewDialog(t *testing.T) {
@@ -49,8 +53,8 @@ func TestDialogSetSize(t *testing.T) {
 func TestDialogPresetCommands(t *testing.T) {
 	d := NewNewDialog()
 
-	// Should have shell (empty), claude, gemini, opencode, codex
-	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex"}
+	// Should have shell (empty), claude, gemini, opencode, codex, pi
+	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi"}
 
 	if len(d.presetCommands) != len(expectedCommands) {
 		t.Errorf("Expected %d preset commands, got %d", len(expectedCommands), len(d.presetCommands))
@@ -128,22 +132,21 @@ func TestNewDialog_SetPathSuggestions(t *testing.T) {
 	d.SetPathSuggestions(paths)
 
 	if len(d.pathSuggestions) != 3 {
-		t.Errorf("expected 3 suggestions, got %d", len(d.pathSuggestions))
+		t.Errorf("expected 3 pathSuggestions, got %d", len(d.pathSuggestions))
 	}
 
-	// Verify suggestions are set on textinput
-	available := d.pathInput.AvailableSuggestions()
-	if len(available) != 3 {
-		t.Errorf("expected 3 available suggestions on pathInput, got %d", len(available))
+	// Verify full set is stored in allPathSuggestions
+	if len(d.allPathSuggestions) != 3 {
+		t.Errorf("expected 3 allPathSuggestions, got %d", len(d.allPathSuggestions))
 	}
 }
 
-func TestNewDialog_ShowSuggestionsEnabled(t *testing.T) {
+func TestNewDialog_ShowSuggestionsDisabled(t *testing.T) {
 	d := NewNewDialog()
 
-	// ShowSuggestions should be enabled by default
-	if !d.pathInput.ShowSuggestions {
-		t.Error("expected ShowSuggestions to be true on pathInput")
+	// ShowSuggestions should be disabled — we use our own dropdown with filtering
+	if d.pathInput.ShowSuggestions {
+		t.Error("expected ShowSuggestions to be false on pathInput (we use custom dropdown)")
 	}
 }
 
@@ -158,30 +161,24 @@ func TestNewDialog_SuggestionFiltering(t *testing.T) {
 
 	d.SetPathSuggestions(paths)
 
-	// Verify suggestions are available
-	available := d.pathInput.AvailableSuggestions()
-	if len(available) != 3 {
-		t.Errorf("expected 3 available suggestions, got %d", len(available))
+	// Type "project" to filter
+	d.pathInput.SetValue("project")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 2 {
+		t.Errorf("expected 2 filtered suggestions for 'project', got %d", len(d.pathSuggestions))
 	}
 
-	// Verify specific suggestions are in the list
-	hasProjectAlpha := false
-	hasProjectBeta := false
-	hasOtherThing := false
-	for _, s := range available {
-		if s == "/Users/test/project-alpha" {
-			hasProjectAlpha = true
-		}
-		if s == "/Users/test/project-beta" {
-			hasProjectBeta = true
-		}
-		if s == "/Users/test/other-thing" {
-			hasOtherThing = true
+	// Verify the correct paths are in the filtered list
+	for _, s := range d.pathSuggestions {
+		if !strings.Contains(s, "project") {
+			t.Errorf("filtered suggestion %q should contain 'project'", s)
 		}
 	}
 
-	if !hasProjectAlpha || !hasProjectBeta || !hasOtherThing {
-		t.Error("not all expected suggestions are available")
+	// Full set should remain unchanged
+	if len(d.allPathSuggestions) != 3 {
+		t.Errorf("allPathSuggestions should still be 3, got %d", len(d.allPathSuggestions))
 	}
 }
 
@@ -231,5 +228,1294 @@ func TestNewDialog_MalformedPathFix(t *testing.T) {
 				t.Errorf("GetValues() path = %q, want %q", path, tt.expected)
 			}
 		})
+	}
+}
+
+// TestNewDialog_TabDoesNotOverwriteCustomPath tests Issue #22:
+// When user enters a new folder path and presses Tab to move to agent selection,
+// the custom path should NOT be overwritten by a suggestion.
+func TestNewDialog_TabDoesNotOverwriteCustomPath(t *testing.T) {
+	d := NewNewDialog()
+	d.Show() // Dialog must be visible for Update to process keys
+
+	// Set up suggestions (simulating previously used paths)
+	suggestions := []string{
+		"/Users/test/old-project-1",
+		"/Users/test/old-project-2",
+	}
+	d.SetPathSuggestions(suggestions)
+
+	// User is on path field (focusIndex 1)
+	d.focusIndex = 2
+	d.updateFocus()
+
+	// User types a completely NEW path that doesn't match any suggestion
+	customPath := "/Users/test/brand-new-project"
+	d.pathInput.SetValue(customPath)
+
+	// User presses Tab to move to command selection
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	// The custom path should be PRESERVED, not overwritten
+	_, path, _ := d.GetValues()
+
+	if path != customPath {
+		t.Errorf("Tab overwrote custom path!\nGot: %q\nWant: %q\nThis is the bug from Issue #22", path, customPath)
+	}
+
+	// Focus should have moved to command field
+	if d.focusIndex != 3 {
+		t.Errorf("focusIndex = %d, want 3 (command field)", d.focusIndex)
+	}
+}
+
+// TestNewDialog_TabAppliesSuggestionWhenNavigated tests that Tab DOES apply
+// the suggestion when the user explicitly navigated to one using Ctrl+N/P.
+func TestNewDialog_TabAppliesSuggestionWhenNavigated(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	suggestions := []string{
+		"/Users/test/project-1",
+		"/Users/test/project-2",
+	}
+	d.SetPathSuggestions(suggestions)
+
+	// User is on path field
+	d.focusIndex = 2
+	d.updateFocus()
+
+	// User types something, then navigates to suggestion with Ctrl+N
+	d.pathInput.SetValue("/some/partial")
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+
+	// Now Tab should apply the suggestion
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	_, path, _ := d.GetValues()
+
+	// Should be the second suggestion (Ctrl+N moved from 0 to 1)
+	if path != "/Users/test/project-2" {
+		t.Errorf(
+			"Tab should apply suggestion after Ctrl+N navigation\nGot: %q\nWant: %q",
+			path,
+			"/Users/test/project-2",
+		)
+	}
+}
+
+// TestNewDialog_TypingResetsSuggestionNavigation tests that typing after
+// navigating suggestions resets the navigation state.
+func TestNewDialog_TypingResetsSuggestionNavigation(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	suggestions := []string{
+		"/Users/test/project-1",
+		"/Users/test/project-2",
+	}
+	d.SetPathSuggestions(suggestions)
+
+	d.focusIndex = 2
+	d.updateFocus()
+
+	// User navigates to a suggestion
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+
+	// Verify navigation flag is set
+	if !d.suggestionNavigated {
+		t.Error("suggestionNavigated should be true after Ctrl+N")
+	}
+
+	// User then types something new - simulate by sending a key
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+
+	// Flag should be reset
+	if d.suggestionNavigated {
+		t.Error("suggestionNavigated should be false after typing")
+	}
+
+	// Set a custom path and press Tab
+	d.pathInput.SetValue("/my/new/path")
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	_, path, _ := d.GetValues()
+
+	if path != "/my/new/path" {
+		t.Errorf("Typing should reset suggestion navigation\nGot: %q\nWant: %q", path, "/my/new/path")
+	}
+}
+
+func TestNewDialog_PreviewRecentSession_ShellCommand(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	d.commandCursor = 2 // non-shell
+	d.commandInput.SetValue("old-command")
+
+	rs := &statedb.RecentSessionRow{
+		Title:       "recent-shell",
+		ProjectPath: "/tmp/recent-shell",
+		Tool:        "shell",
+		Command:     "uv run agent",
+	}
+	d.previewRecentSession(rs)
+
+	if d.commandCursor != 0 {
+		t.Fatalf("commandCursor = %d, want 0 (shell)", d.commandCursor)
+	}
+	if got := d.commandInput.Value(); got != "uv run agent" {
+		t.Fatalf("commandInput = %q, want %q", got, "uv run agent")
+	}
+	if d.nameInput.Value() != "recent-shell" {
+		t.Fatalf("nameInput = %q, want %q", d.nameInput.Value(), "recent-shell")
+	}
+}
+
+func TestNewDialog_RestoreSnapshot_RestoresToolOptionsAndCommandInput(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+
+	originalClaude := &session.ClaudeOptions{
+		SessionMode:          "resume",
+		ResumeSessionID:      "abc123",
+		UseHappy:             true,
+		SkipPermissions:      true,
+		AllowSkipPermissions: false,
+		UseChrome:            true,
+		UseTeammateMode:      true,
+	}
+	d.nameInput.SetValue("orig-name")
+	d.pathInput.SetValue("/tmp/orig")
+	d.commandCursor = 0
+	d.commandInput.SetValue("echo original")
+	d.claudeOptions.SetFromOptions(originalClaude)
+	d.geminiOptions.SetDefaults(true)
+	d.codexOptions.SetDefaults(true, true)
+
+	snapshot := d.saveSnapshot()
+
+	// Mutate state to ensure restore actually rewinds everything.
+	d.nameInput.SetValue("mutated-name")
+	d.pathInput.SetValue("/tmp/mutated")
+	d.commandCursor = 1
+	d.commandInput.SetValue("echo mutated")
+	d.claudeOptions.SetFromOptions(&session.ClaudeOptions{SessionMode: "new"})
+	d.geminiOptions.SetDefaults(false)
+	d.codexOptions.SetDefaults(false, false)
+
+	d.restoreSnapshot(snapshot)
+
+	if got := d.nameInput.Value(); got != "orig-name" {
+		t.Fatalf("nameInput = %q, want %q", got, "orig-name")
+	}
+	if got := d.pathInput.Value(); got != "/tmp/orig" {
+		t.Fatalf("pathInput = %q, want %q", got, "/tmp/orig")
+	}
+	if d.commandCursor != 0 {
+		t.Fatalf("commandCursor = %d, want 0", d.commandCursor)
+	}
+	if got := d.commandInput.Value(); got != "echo original" {
+		t.Fatalf("commandInput = %q, want %q", got, "echo original")
+	}
+
+	restoredClaude := d.claudeOptions.GetOptions()
+	if restoredClaude == nil {
+		t.Fatal("restored Claude options are nil")
+	}
+	if restoredClaude.SessionMode != "resume" || restoredClaude.ResumeSessionID != "abc123" {
+		t.Fatalf("restored Claude session mode/id = %q/%q, want resume/abc123",
+			restoredClaude.SessionMode, restoredClaude.ResumeSessionID)
+	}
+	if !restoredClaude.UseHappy || !restoredClaude.SkipPermissions || !restoredClaude.UseChrome || !restoredClaude.UseTeammateMode {
+		t.Fatalf("restored Claude toggles incorrect: %+v", restoredClaude)
+	}
+	if !d.geminiOptions.GetYoloMode() {
+		t.Fatal("gemini yolo mode was not restored")
+	}
+	if !d.codexOptions.GetYoloMode() {
+		t.Fatal("codex yolo mode was not restored")
+	}
+	if !d.codexOptions.GetUseHappy() {
+		t.Fatal("codex happy mode was not restored")
+	}
+}
+
+func TestNewDialog_GetCodexOptions(t *testing.T) {
+	d := NewNewDialog()
+	d.commandCursor = 4 // codex
+	d.updateToolOptions()
+	d.codexOptions.SetDefaults(true, true)
+
+	opts := d.GetCodexOptions()
+	if opts == nil {
+		t.Fatal("GetCodexOptions returned nil")
+	}
+	if opts.YoloMode == nil || !*opts.YoloMode {
+		t.Fatalf("expected YoloMode=true, got %+v", opts)
+	}
+	if opts.UseHappy == nil || !*opts.UseHappy {
+		t.Fatalf("expected UseHappy=true, got %+v", opts)
+	}
+}
+
+// ===== Worktree Support Tests =====
+
+func TestNewDialog_WorktreeToggle(t *testing.T) {
+	dialog := NewNewDialog()
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled by default")
+	}
+	dialog.ToggleWorktree()
+	if !dialog.worktreeEnabled {
+		t.Error("Worktree should be enabled after toggle")
+	}
+	dialog.ToggleWorktree()
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled after second toggle")
+	}
+}
+
+func TestNewDialog_IsWorktreeEnabled(t *testing.T) {
+	dialog := NewNewDialog()
+	if dialog.IsWorktreeEnabled() {
+		t.Error("IsWorktreeEnabled should return false by default")
+	}
+	dialog.worktreeEnabled = true
+	if !dialog.IsWorktreeEnabled() {
+		t.Error("IsWorktreeEnabled should return true when enabled")
+	}
+}
+
+func TestNewDialog_GetValuesWithWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/test")
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+
+	name, path, command, branch, enabled := dialog.GetValuesWithWorktree()
+
+	if !enabled {
+		t.Error("worktreeEnabled should be true")
+	}
+	if branch != "feature/test" {
+		t.Errorf("Branch: got %q, want %q", branch, "feature/test")
+	}
+	if name != "test-session" {
+		t.Errorf("Name: got %q, want %q", name, "test-session")
+	}
+	if path != "/tmp/project" {
+		t.Errorf("Path: got %q, want %q", path, "/tmp/project")
+	}
+	// command should be empty or shell when commandCursor is 0
+	_ = command
+}
+
+func TestNewDialog_GetValuesWithWorktree_Disabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = false
+	dialog.branchInput.SetValue("feature/test")
+
+	_, _, _, branch, enabled := dialog.GetValuesWithWorktree()
+
+	if enabled {
+		t.Error("worktreeEnabled should be false")
+	}
+	// Branch value is still returned even when disabled
+	if branch != "feature/test" {
+		t.Errorf("Branch: got %q, want %q", branch, "feature/test")
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_EmptyBranch_WithName(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("")
+
+	// With a name set, empty branch is derived from name — validation passes
+	err := dialog.Validate()
+	if err != "" {
+		t.Errorf("Validation should pass when branch is empty but name is set (derives branch), got: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_EmptyBranch_NoName(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("")
+	dialog.generatedName = "" // no fallback
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("")
+
+	err := dialog.Validate()
+	if err == "" {
+		t.Error("Validation should fail when worktree enabled, branch empty, and no name")
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_InvalidBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature..test") // Invalid: contains ..
+
+	err := dialog.Validate()
+	if err == "" {
+		t.Error("Validation should fail for invalid branch name")
+	}
+	if err != "branch name cannot contain '..'" {
+		t.Errorf("Unexpected error message: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeEnabled_ValidBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/test-branch")
+
+	err := dialog.Validate()
+	if err != "" {
+		t.Errorf("Validation should pass for valid branch, got: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_WorktreeDisabled_IgnoresBranch(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.nameInput.SetValue("test-session")
+	dialog.pathInput.SetValue("/tmp/project")
+	dialog.worktreeEnabled = false
+	dialog.branchInput.SetValue("") // Empty branch, but worktree disabled
+
+	err := dialog.Validate()
+	if err != "" {
+		t.Errorf("Validation should pass when worktree disabled, got: %q", err)
+	}
+}
+
+func TestNewDialog_ShowInGroup_ResetsWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.worktreeEnabled = true
+	dialog.branchInput.SetValue("feature/old-branch")
+
+	dialog.ShowInGroup("projects", "Projects", "")
+
+	if dialog.worktreeEnabled {
+		t.Error("worktreeEnabled should be reset to false on ShowInGroup")
+	}
+	if dialog.branchInput.Value() != "" {
+		t.Errorf("branchInput should be reset, got: %q", dialog.branchInput.Value())
+	}
+}
+
+func TestNewDialog_ShowInGroup_SetsDefaultPath(t *testing.T) {
+	dialog := NewNewDialog()
+
+	dialog.ShowInGroup("projects", "Projects", "/test/default/path")
+
+	// Verify path input is set to the default path
+	if dialog.pathInput.Value() != "/test/default/path" {
+		t.Errorf("pathInput should be set to default path, got: %q", dialog.pathInput.Value())
+	}
+}
+
+func TestNewDialog_ShowInGroup_EmptyDefaultPath(t *testing.T) {
+	dialog := NewNewDialog()
+
+	dialog.ShowInGroup("projects", "Projects", "")
+
+	// With empty default path, it should fall back to current working directory
+	// We can't test the exact value, but we can verify it's not empty
+	// (assuming we're not in a system temp directory)
+	value := dialog.pathInput.Value()
+	if value == "" {
+		t.Error("pathInput should not be empty when defaultPath is empty (should use cwd)")
+	}
+}
+
+func TestNewDialog_BranchInputInitialized(t *testing.T) {
+	dialog := NewNewDialog()
+
+	// Verify branch input is properly initialized
+	if dialog.branchInput.Placeholder != "feature/branch-name" {
+		t.Errorf("branchInput placeholder: got %q, want %q",
+			dialog.branchInput.Placeholder, "feature/branch-name")
+	}
+}
+
+func TestNewDialog_WorktreeToggle_ViaKeyPress(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.commandCursor = 1 // preset command (not custom input)
+	dialog.rebuildFocusTargets()
+	dialog.focusIndex = 3 // Command field
+
+	// Press 'w' to toggle worktree.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+
+	if !dialog.worktreeEnabled {
+		t.Error("Worktree should be enabled after pressing 'w' on command field")
+	}
+
+	// Focus should move to branch field.
+	if dialog.focusIndex != dialog.indexOf(focusBranch) {
+		t.Errorf("Focus should move to branch field (%d), got %d", dialog.indexOf(focusBranch), dialog.focusIndex)
+	}
+
+	// Press 'w' again to disable (need to be on command field).
+	dialog.focusIndex = 3
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+
+	if dialog.worktreeEnabled {
+		t.Error("Worktree should be disabled after pressing 'w' again")
+	}
+}
+
+func TestNewDialog_ShortcutsBlockedDuringTextInput(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.commandCursor = 0 // custom command input (text field active)
+	dialog.rebuildFocusTargets()
+
+	// Navigate to command field.
+	cmdIdx := dialog.indexOf(focusCommand)
+	dialog.focusIndex = cmdIdx
+	dialog.updateFocus()
+
+	// Press 's' — should NOT toggle sandbox when custom command input is focused.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if dialog.sandboxEnabled {
+		t.Error("Pressing 's' on custom command input should type, not toggle sandbox")
+	}
+
+	// Press 'w' — should NOT toggle worktree.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	if dialog.worktreeEnabled {
+		t.Error("Pressing 'w' on custom command input should type, not toggle worktree")
+	}
+
+	// Press 'm' — should NOT toggle multi-repo.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	if dialog.multiRepoEnabled {
+		t.Error("Pressing 'm' on custom command input should type, not toggle multi-repo")
+	}
+
+	// Also verify shortcuts don't fire on name field.
+	dialog.focusIndex = 0 // focusName
+	dialog.updateFocus()
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if dialog.sandboxEnabled {
+		t.Error("Pressing 's' on name input should not toggle sandbox")
+	}
+}
+
+func TestNewDialog_TabNavigationWithWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.focusIndex = 0
+	dialog.worktreeEnabled = true
+	dialog.rebuildFocusTargets()
+
+	branchIdx := dialog.indexOf(focusBranch)
+	maxIdx := len(dialog.focusTargets) - 1
+
+	// Tab through: 0 -> 1 -> 2 -> 3(worktree) -> 4(sandbox) -> branchIdx(branch) -> 0.
+	for i := 1; i <= maxIdx; i++ {
+		dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+		want := i
+		if i == branchIdx {
+			want = branchIdx
+		}
+		if dialog.focusIndex != want {
+			t.Errorf("After Tab %d, focusIndex = %d, want %d", i, dialog.focusIndex, want)
+		}
+	}
+
+	// One more Tab should wrap to 0.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 0 {
+		t.Errorf("After final Tab, focusIndex = %d, want 0 (wrap around)", dialog.focusIndex)
+	}
+}
+
+func TestNewDialog_TabNavigationWithoutWorktree(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.focusIndex = 0
+	dialog.worktreeEnabled = false
+	dialog.rebuildFocusTargets()
+
+	maxIdx := len(dialog.focusTargets) - 1
+
+	// Tab through: 0 -> 1 -> 2 -> 3(worktree) -> 4(sandbox) -> 0.
+	for i := 1; i <= maxIdx; i++ {
+		dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+		if dialog.focusIndex != i {
+			t.Errorf("After Tab %d, focusIndex = %d, want %d", i, dialog.focusIndex, i)
+		}
+	}
+
+	// One more Tab should wrap to 0.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if dialog.focusIndex != 0 {
+		t.Errorf("After final Tab, focusIndex = %d, want 0 (wrap around)", dialog.focusIndex)
+	}
+}
+
+func TestNewDialog_View_ShowsWorktreeCheckbox(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.focusIndex = 3 // Command field
+
+	view := dialog.View()
+
+	// Should show worktree checkbox.
+	if !strings.Contains(view, "Create in worktree") {
+		t.Error("View should contain 'Create in worktree' checkbox")
+	}
+
+	// Should show shortcut hint when on command field.
+	if !strings.Contains(view, "(w)") {
+		t.Error("View should contain '(w)' hint when on command field")
+	}
+}
+
+func TestNewDialog_View_ShowsBranchInputWhenEnabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.worktreeEnabled = true
+
+	view := dialog.View()
+
+	// Should show branch input
+	if !strings.Contains(view, "Branch:") {
+		t.Error("View should contain 'Branch:' label when worktree enabled")
+	}
+
+	// Checkbox should be checked
+	if !strings.Contains(view, "[x]") {
+		t.Error("View should show checked checkbox [x] when worktree enabled")
+	}
+}
+
+func TestNewDialog_View_HidesBranchInputWhenDisabled(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+	dialog.worktreeEnabled = false
+
+	view := dialog.View()
+
+	// Should NOT show branch input label
+	if strings.Contains(view, "Branch:") {
+		t.Error("View should NOT contain 'Branch:' label when worktree disabled")
+	}
+
+	// Checkbox should be unchecked
+	if !strings.Contains(view, "[ ]") {
+		t.Error("View should show unchecked checkbox [ ] when worktree disabled")
+	}
+}
+
+// ===== CharLimit & Inline Error Tests (Issue #93) =====
+
+func TestNewDialog_CharLimitMatchesMaxNameLength(t *testing.T) {
+	d := NewNewDialog()
+	if d.nameInput.CharLimit != MaxNameLength {
+		t.Errorf("nameInput.CharLimit = %d, want %d (MaxNameLength)", d.nameInput.CharLimit, MaxNameLength)
+	}
+}
+
+func TestNewDialog_CharLimitTruncatesLongNames(t *testing.T) {
+	d := NewNewDialog()
+	d.pathInput.SetValue("/tmp/project")
+	// Try to set a name longer than MaxNameLength via textinput
+	longName := strings.Repeat("a", MaxNameLength+10)
+	d.nameInput.SetValue(longName)
+
+	// CharLimit should truncate the value to MaxNameLength
+	actual := d.nameInput.Value()
+	if len(actual) > MaxNameLength {
+		t.Errorf("nameInput should truncate to MaxNameLength (%d), but got length %d", MaxNameLength, len(actual))
+	}
+
+	// Validation should pass since the textinput truncated
+	err := d.Validate()
+	if err != "" {
+		t.Errorf("Validate() should pass after CharLimit truncation, got: %q", err)
+	}
+}
+
+func TestNewDialog_Validate_NameAtMaxLength(t *testing.T) {
+	d := NewNewDialog()
+	d.pathInput.SetValue("/tmp/project")
+	exactName := strings.Repeat("a", MaxNameLength)
+	d.nameInput.SetValue(exactName)
+
+	err := d.Validate()
+	if err != "" {
+		t.Errorf("Validate() should accept name at exactly MaxNameLength, got: %q", err)
+	}
+}
+
+func TestNewDialog_SetError_ShowsInView(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	d.SetError("Something went wrong")
+	view := d.View()
+
+	if !strings.Contains(view, "Something went wrong") {
+		t.Error("View should display the inline error message")
+	}
+}
+
+func TestNewDialog_ClearError_HidesFromView(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	d.SetError("Something went wrong")
+	d.ClearError()
+	view := d.View()
+
+	if strings.Contains(view, "Something went wrong") {
+		t.Error("View should not display the error after ClearError()")
+	}
+}
+
+// ===== Checkbox Focus Tests =====
+
+func TestNewDialog_WorktreeCheckbox_SpaceToggle(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.rebuildFocusTargets()
+	dialog.focusIndex = 4 // Worktree checkbox
+
+	// Space toggles worktree on.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	if !dialog.worktreeEnabled {
+		t.Error("Space on worktree checkbox should enable worktree")
+	}
+
+	// Focus should jump to branch field.
+	if dialog.focusIndex != dialog.indexOf(focusBranch) {
+		t.Errorf("Focus should move to branch field (%d), got %d", dialog.indexOf(focusBranch), dialog.focusIndex)
+	}
+
+	// Navigate back and space again to disable.
+	dialog.focusIndex = 4
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	if dialog.worktreeEnabled {
+		t.Error("Space on worktree checkbox should disable worktree")
+	}
+}
+
+func TestNewDialog_SandboxCheckbox_SpaceToggle(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false // Ensure known initial state.
+	dialog.focusIndex = 5         // Sandbox checkbox
+
+	// Space toggles sandbox on.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	if !dialog.sandboxEnabled {
+		t.Error("Space on sandbox checkbox should enable sandbox")
+	}
+
+	// Space again toggles off.
+	dialog.focusIndex = 5
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	if dialog.sandboxEnabled {
+		t.Error("Space on sandbox checkbox should disable sandbox")
+	}
+}
+
+func TestNewDialog_CheckboxesFocusIndependently(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.SetSize(80, 40)
+	dialog.Show()
+
+	// Focus on worktree checkbox — only it should highlight.
+	dialog.focusIndex = 4
+	view := dialog.View()
+
+	// Worktree line should have the focus indicator.
+	if !strings.Contains(view, "Create in worktree") {
+		t.Error("View should contain worktree checkbox")
+	}
+
+	// Focus on sandbox checkbox — only it should highlight.
+	dialog.focusIndex = 5
+	view = dialog.View()
+
+	if !strings.Contains(view, "Run in Docker sandbox") {
+		t.Error("View should contain sandbox checkbox")
+	}
+}
+
+func TestNewDialog_ShowInGroup_ClearsError(t *testing.T) {
+	d := NewNewDialog()
+	d.SetError("Previous error")
+	d.ShowInGroup("group", "Group", "")
+
+	if d.validationErr != "" {
+		t.Error("ShowInGroup should clear validationErr")
+	}
+}
+
+// ===== Worktree Branch Auto-Matching Tests =====
+
+func TestNewDialog_ToggleWorktree_AutoPopulatesBranch(t *testing.T) {
+	d := NewNewDialog()
+	d.nameInput.SetValue("amber-falcon")
+
+	// Toggling worktree ON should auto-populate branch from session name
+	d.ToggleWorktree()
+
+	if !d.worktreeEnabled {
+		t.Fatal("worktreeEnabled should be true after toggle")
+	}
+	if d.branchInput.Value() != "feature/amber-falcon" {
+		t.Errorf("branch = %q, want %q", d.branchInput.Value(), "feature/amber-falcon")
+	}
+	if !d.branchAutoSet {
+		t.Error("branchAutoSet should be true after auto-population")
+	}
+}
+
+func TestNewDialog_ToggleWorktree_EmptyName_NoBranch(t *testing.T) {
+	d := NewNewDialog()
+	// Name is empty
+
+	d.ToggleWorktree()
+
+	if d.branchInput.Value() != "" {
+		t.Errorf("branch should be empty when name is empty, got %q", d.branchInput.Value())
+	}
+}
+
+func TestNewDialog_ShowInGroup_ResetsBranchAutoSet(t *testing.T) {
+	d := NewNewDialog()
+	d.branchAutoSet = true
+
+	d.ShowInGroup("projects", "Projects", "")
+
+	if d.branchAutoSet {
+		t.Error("branchAutoSet should be reset to false on ShowInGroup")
+	}
+}
+
+func TestNewDialog_CtrlFBranchPickerAppliesSelection(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+	d.pathInput.SetValue("/tmp/project")
+	d.ToggleWorktree()
+	d.rebuildFocusTargets()
+	d.focusIndex = d.indexOf(focusBranch)
+	d.updateFocus()
+
+	origPicker := openBranchPicker
+	defer func() { openBranchPicker = origPicker }()
+
+	called := false
+	openBranchPicker = func(path string) tea.Cmd {
+		called = true
+		if path != "/tmp/project" {
+			t.Fatalf("picker path = %q, want %q", path, "/tmp/project")
+		}
+		return func() tea.Msg {
+			return branchPickerResultMsg{branch: "feature/picked"}
+		}
+	}
+
+	var cmd tea.Cmd
+	d, cmd = d.Update(tea.KeyMsg{Type: tea.KeyCtrlF})
+	if !called {
+		t.Fatal("expected ctrl+f to open branch picker")
+	}
+	if cmd == nil {
+		t.Fatal("expected ctrl+f to return a branch picker command")
+	}
+
+	d, _ = d.Update(cmd())
+	if got := d.branchInput.Value(); got != "feature/picked" {
+		t.Fatalf("branch = %q, want %q", got, "feature/picked")
+	}
+	if d.validationErr != "" {
+		t.Fatalf("expected no validation error, got %q", d.validationErr)
+	}
+}
+
+func TestNewDialog_BranchPickerErrorIsShown(t *testing.T) {
+	d := NewNewDialog()
+	d.Show()
+	d.ToggleWorktree()
+	d.rebuildFocusTargets()
+	d.focusIndex = d.indexOf(focusBranch)
+	d.updateFocus()
+
+	d, _ = d.Update(branchPickerResultMsg{err: os.ErrNotExist})
+	if !strings.Contains(d.validationErr, os.ErrNotExist.Error()) {
+		t.Fatalf("expected picker error in validationErr, got %q", d.validationErr)
+	}
+}
+
+// ===== Soft-Select Tests =====
+
+func TestNewDialog_SoftSelect_InitialState(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	// After Show(), path is pre-filled and soft-selected
+	if !d.pathSoftSelected {
+		t.Error("pathSoftSelected should be true after Show()")
+	}
+	if d.pathInput.Value() == "" {
+		t.Error("path should be pre-filled with CWD after Show()")
+	}
+}
+
+func TestNewDialog_SoftSelect_TypeClearsField(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	// Move focus to path field
+	d.focusIndex = 2
+	d.updateFocus()
+
+	originalPath := d.pathInput.Value()
+	if originalPath == "" {
+		t.Fatal("path should be pre-filled")
+	}
+	if !d.pathSoftSelected {
+		t.Fatal("pathSoftSelected should be true when focusing path with value")
+	}
+
+	// Type a character while soft-selected
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+
+	// Field should have only the typed character (old value cleared)
+	val := d.pathInput.Value()
+	if val != "x" {
+		t.Errorf("path = %q, want %q (old value should be replaced)", val, "x")
+	}
+	if d.pathSoftSelected {
+		t.Error("pathSoftSelected should be false after typing")
+	}
+}
+
+func TestNewDialog_SoftSelect_BackspaceClearsField(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	d.focusIndex = 2
+	d.updateFocus()
+
+	if !d.pathSoftSelected {
+		t.Fatal("pathSoftSelected should be true")
+	}
+
+	// Press backspace while soft-selected
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+
+	if d.pathInput.Value() != "" {
+		t.Errorf("path should be empty after backspace, got %q", d.pathInput.Value())
+	}
+	if d.pathSoftSelected {
+		t.Error("pathSoftSelected should be false after backspace")
+	}
+}
+
+func TestNewDialog_SoftSelect_MovementExits(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	d.focusIndex = 2
+	d.updateFocus()
+
+	originalPath := d.pathInput.Value()
+	if !d.pathSoftSelected {
+		t.Fatal("pathSoftSelected should be true")
+	}
+
+	// Press Left to exit soft-select
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyLeft})
+
+	// Value should be preserved
+	if d.pathInput.Value() != originalPath {
+		t.Errorf("path = %q, want %q (value should be preserved)", d.pathInput.Value(), originalPath)
+	}
+	if d.pathSoftSelected {
+		t.Error("pathSoftSelected should be false after Left key")
+	}
+}
+
+func TestNewDialog_SoftSelect_TabPreservesValue(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	d.focusIndex = 2
+	d.updateFocus()
+
+	originalPath := d.pathInput.Value()
+	if !d.pathSoftSelected {
+		t.Fatal("pathSoftSelected should be true")
+	}
+
+	// Press Tab to accept and move to next field
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	// Value should be preserved (Tab accepts as-is)
+	if d.pathInput.Value() != originalPath {
+		t.Errorf("path = %q, want %q (Tab should preserve value)", d.pathInput.Value(), originalPath)
+	}
+	// Focus should have moved forward
+	if d.focusIndex != 3 {
+		t.Errorf("focusIndex = %d, want 3 (should move to command)", d.focusIndex)
+	}
+}
+
+func TestNewDialog_SoftSelect_CtrlNExits(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	suggestions := []string{"/path/one", "/path/two"}
+	d.SetPathSuggestions(suggestions)
+
+	d.focusIndex = 2
+	d.updateFocus()
+
+	if !d.pathSoftSelected {
+		t.Fatal("pathSoftSelected should be true")
+	}
+
+	// Ctrl+N should exit soft-select and navigate suggestions
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+
+	if d.pathSoftSelected {
+		t.Error("pathSoftSelected should be false after Ctrl+N")
+	}
+	if !d.suggestionNavigated {
+		t.Error("suggestionNavigated should be true after Ctrl+N")
+	}
+}
+
+func TestNewDialog_SoftSelect_ReactivatesOnRefocus(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	d.focusIndex = 2
+	d.updateFocus()
+
+	// Exit soft-select by typing
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if d.pathSoftSelected {
+		t.Fatal("should not be soft-selected after typing")
+	}
+
+	// Set a value back and Tab away
+	d.pathInput.SetValue("/some/path")
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab}) // move to command
+
+	// Shift+Tab back to path
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+
+	if d.focusIndex != 2 {
+		t.Fatalf("focusIndex = %d, want 2", d.focusIndex)
+	}
+	if !d.pathSoftSelected {
+		t.Error("pathSoftSelected should reactivate when refocusing path field with value")
+	}
+}
+
+// ===== Filter Path Tests =====
+
+func TestNewDialog_FilterPaths_SubstringMatch(t *testing.T) {
+	d := NewNewDialog()
+	d.SetPathSuggestions([]string{
+		"/Users/test/skulk-project",
+		"/Users/test/other-project",
+		"/Users/test/skulking-around",
+	})
+
+	d.pathInput.SetValue("skulk")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 2 {
+		t.Errorf("expected 2 matching paths for 'skulk', got %d", len(d.pathSuggestions))
+	}
+}
+
+func TestNewDialog_FilterPaths_CaseInsensitive(t *testing.T) {
+	d := NewNewDialog()
+	d.SetPathSuggestions([]string{
+		"/Users/test/MyProject",
+		"/Users/test/other",
+	})
+
+	d.pathInput.SetValue("MYPROJECT")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 1 {
+		t.Errorf("expected 1 matching path for 'MYPROJECT' (case insensitive), got %d", len(d.pathSuggestions))
+	}
+}
+
+func TestNewDialog_FilterPaths_NoMatch(t *testing.T) {
+	d := NewNewDialog()
+	d.SetPathSuggestions([]string{
+		"/Users/test/project-alpha",
+		"/Users/test/project-beta",
+	})
+
+	d.pathInput.SetValue("zzz")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 0 {
+		t.Errorf("expected 0 matching paths for 'zzz', got %d", len(d.pathSuggestions))
+	}
+}
+
+func TestNewDialog_FilterPaths_EmptyInput(t *testing.T) {
+	d := NewNewDialog()
+	paths := []string{
+		"/Users/test/project-alpha",
+		"/Users/test/project-beta",
+		"/Users/test/other-thing",
+	}
+	d.SetPathSuggestions(paths)
+
+	d.pathInput.SetValue("")
+	d.filterPathSuggestions()
+
+	if len(d.pathSuggestions) != 3 {
+		t.Errorf("expected all 3 suggestions for empty input, got %d", len(d.pathSuggestions))
+	}
+}
+
+// ===== Generated Name Fallback Tests =====
+
+func TestNewDialog_EmptyName_UsesGeneratedName(t *testing.T) {
+	d := NewNewDialog()
+	d.pathInput.SetValue("/tmp/project")
+	d.nameInput.SetValue("")
+	d.generatedName = "golden-eagle"
+
+	name, _, _ := d.GetValues()
+	if name != "golden-eagle" {
+		t.Errorf("GetValues() name = %q, want %q", name, "golden-eagle")
+	}
+}
+
+func TestNewDialog_Validate_EmptyName_UsesGeneratedName(t *testing.T) {
+	d := NewNewDialog()
+	d.pathInput.SetValue("/tmp/project")
+	d.nameInput.SetValue("")
+	d.generatedName = "swift-fox"
+
+	err := d.Validate()
+	if err != "" {
+		t.Errorf("Validate() should pass with generatedName fallback, got: %q", err)
+	}
+}
+
+func TestNewDialog_ShowInGroup_SetsGeneratedName(t *testing.T) {
+	d := NewNewDialog()
+	d.ShowInGroup("default", "default", "")
+
+	if d.generatedName == "" {
+		t.Error("generatedName should be set after ShowInGroup")
+	}
+	if d.nameInput.Placeholder != d.generatedName {
+		t.Errorf("nameInput.Placeholder = %q, want %q", d.nameInput.Placeholder, d.generatedName)
+	}
+}
+
+func TestNewDialog_WorktreeBranch_PlaceholderWhenNameEmpty(t *testing.T) {
+	d := NewNewDialog()
+	d.generatedName = "calm-river"
+	d.branchPrefix = "feature/"
+	d.nameInput.SetValue("")
+
+	d.autoBranchFromName()
+
+	// Branch input should remain empty (placeholder only)
+	if d.branchInput.Value() != "" {
+		t.Errorf("branch value should be empty when using generated name, got %q", d.branchInput.Value())
+	}
+	if d.branchInput.Placeholder != "feature/calm-river" {
+		t.Errorf("branch placeholder = %q, want %q", d.branchInput.Placeholder, "feature/calm-river")
+	}
+	if !d.branchAutoSet {
+		t.Error("branchAutoSet should be true")
+	}
+}
+
+func TestNewDialog_WorktreeBranch_FilledWhenNameProvided(t *testing.T) {
+	d := NewNewDialog()
+	d.generatedName = "calm-river"
+	d.branchPrefix = "feature/"
+	d.nameInput.SetValue("my-feature")
+
+	d.autoBranchFromName()
+
+	if d.branchInput.Value() != "feature/my-feature" {
+		t.Errorf("branch value = %q, want %q", d.branchInput.Value(), "feature/my-feature")
+	}
+}
+
+func TestNewDialog_GetValuesWithWorktree_EmptyBranch_DerivedFromName(t *testing.T) {
+	d := NewNewDialog()
+	d.worktreeEnabled = true
+	d.branchPrefix = "feature/"
+	d.generatedName = "bold-crane"
+	d.nameInput.SetValue("")
+	d.pathInput.SetValue("/tmp/project")
+	d.branchInput.SetValue("")
+
+	name, _, _, branch, _ := d.GetValuesWithWorktree()
+	if name != "bold-crane" {
+		t.Errorf("name = %q, want %q", name, "bold-crane")
+	}
+	if branch != "feature/bold-crane" {
+		t.Errorf("branch = %q, want %q", branch, "feature/bold-crane")
+	}
+}
+
+func TestNewDialog_BranchPrefix_Default(t *testing.T) {
+	d := NewNewDialog()
+	if d.branchPrefix != "feature/" {
+		t.Errorf("expected branchPrefix %q from constructor, got %q", "feature/", d.branchPrefix)
+	}
+}
+
+func TestNewDialog_BranchPrefix_Custom_AutoPopulates(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "dev/"
+	d.nameInput.SetValue("my-session")
+	d.autoBranchFromName()
+
+	if got := d.branchInput.Value(); got != "dev/my-session" {
+		t.Errorf("expected branch %q, got %q", "dev/my-session", got)
+	}
+}
+
+func TestNewDialog_BranchPrefix_Empty_NoPrefix(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = ""
+	d.nameInput.SetValue("my-session")
+	d.autoBranchFromName()
+
+	if got := d.branchInput.Value(); got != "my-session" {
+		t.Errorf("expected branch %q, got %q", "my-session", got)
+	}
+}
+
+// TestNewDialog_CtrlR_OpensRecentPicker verifies that Ctrl+R opens the recent
+// sessions picker when recent sessions are available.
+func TestNewDialog_CtrlR_OpensRecentPicker(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	// Set up recent sessions
+	sessions := []*statedb.RecentSessionRow{
+		{Title: "session-1", ProjectPath: "/tmp/one", Tool: "claude"},
+		{Title: "session-2", ProjectPath: "/tmp/two", Tool: "claude"},
+	}
+	d.SetRecentSessions(sessions)
+
+	if len(d.recentSessions) != 2 {
+		t.Fatalf("expected 2 recent sessions, got %d", len(d.recentSessions))
+	}
+
+	// Verify ^R hint appears in the view
+	view := d.View()
+	if !strings.Contains(view, "^R recent") {
+		t.Error("View should contain '^R recent' hint when recent sessions exist")
+	}
+
+	// Verify picker is not open yet
+	if d.showRecentPicker {
+		t.Fatal("recent picker should not be open before Ctrl+R")
+	}
+
+	// Send Ctrl+R
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+
+	if !d.showRecentPicker {
+		t.Error("Ctrl+R should open the recent sessions picker")
+	}
+	if d.recentSessionCursor != 0 {
+		t.Errorf("recentSessionCursor = %d, want 0", d.recentSessionCursor)
+	}
+	// First session should be previewed
+	if d.nameInput.Value() != "session-1" {
+		t.Errorf("name = %q, want %q (first session should be previewed)", d.nameInput.Value(), "session-1")
+	}
+}
+
+// TestNewDialog_CtrlR_HintHiddenWhenNoRecents verifies the hint is absent
+// when there are no recent sessions.
+func TestNewDialog_CtrlR_HintHiddenWhenNoRecents(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(80, 40)
+	d.Show()
+
+	// No recent sessions set
+	view := d.View()
+	if strings.Contains(view, "^R recent") {
+		t.Error("View should NOT contain '^R recent' hint when no recent sessions exist")
+	}
+}
+
+func TestNewDialog_BranchPrefix_Placeholder_Updated(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "fix/"
+	d.branchInput.Placeholder = d.branchPrefix + "branch-name"
+
+	if d.branchInput.Placeholder != "fix/branch-name" {
+		t.Errorf("expected placeholder %q, got %q", "fix/branch-name", d.branchInput.Placeholder)
+	}
+}
+
+func TestNewDialog_ToggleWorktree_CustomPrefix(t *testing.T) {
+	d := NewNewDialog()
+	d.branchPrefix = "dev/"
+	d.nameInput.SetValue("cool-feature")
+	d.ToggleWorktree()
+
+	if got := d.branchInput.Value(); got != "dev/cool-feature" {
+		t.Errorf("expected branch %q, got %q", "dev/cool-feature", got)
 	}
 }

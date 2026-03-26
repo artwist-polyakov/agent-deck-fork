@@ -37,26 +37,49 @@ func (d *PromptDetector) HasPrompt(content string) bool {
 		return d.hasClaudePrompt(content)
 
 	case "opencode":
-		// OpenCode TUI - look for characteristic UI elements
-		// OpenCode displays a visual TUI with input box, mode indicator, and logo
-		return strings.Contains(content, "Ask anything") || // Input placeholder
-			strings.Contains(content, "┃") || // Input box border characters
-			strings.Contains(content, "open code") || // ASCII logo (with space)
-			strings.Contains(content, "Build") || // Build mode indicator
-			strings.Contains(content, "Plan") || // Plan mode indicator
+		// OpenCode TUI - the UI is always visible (input box, mode tabs, logo),
+		// so we MUST check busy indicators first. If opencode is actively working,
+		// return false to let the busy detector handle status correctly.
+		//
+		// Busy indicators (from opencode source: internal/tui/components/chat/list.go):
+		//   - Help bar shows "esc" when busy (to cancel), vs "enter" when idle (to send)
+		//   - Pulse spinner: █ ▓ ▒ ░ (spinner.Pulse, 125ms cycle)
+		//   - Task strings: "Thinking...", "Generating...", "Building tool call...",
+		//     "Waiting for tool response...", "Loading..."
+		if d.hasOpencodeBusyIndicator(content) {
+			return false
+		}
+		// Idle: check for opencode-specific prompt patterns
+		// "press enter to send" only appears when idle (help bar text)
+		// "Ask anything" is the input placeholder
+		return strings.Contains(content, "press enter to send") ||
+			strings.Contains(content, "Ask anything") ||
+			strings.Contains(content, "open code") ||
+			strings.Contains(content, "enter submit") ||
+			strings.Contains(content, "esc dismiss") ||
 			d.hasLineEndingWith(content, ">")
 
 	case "gemini":
-		// From Claude Squad: session/tmux/tmux.go line 284
-		return strings.Contains(content, "Yes, allow once") ||
-			strings.Contains(content, "gemini>") ||
-			d.hasLineEndingWith(content, ">")
+		return d.hasGeminiPrompt(content)
 
 	case "codex":
-		// Codex/OpenAI CLI patterns
-		return strings.Contains(content, "codex>") ||
+		// Codex/OpenAI CLI patterns.
+		// Busy indicators take priority over prompt markers.
+		lower := strings.ToLower(content)
+		if strings.Contains(lower, "esc to interrupt") ||
+			strings.Contains(lower, "ctrl+c to interrupt") {
+			return false
+		}
+		// Direct prompt strings
+		if strings.Contains(content, "codex>") ||
 			strings.Contains(content, "Continue?") ||
-			d.hasLineEndingWith(content, ">")
+			strings.Contains(content, "How can I help") {
+			return true
+		}
+		// Codex uses › (U+203A) as its prompt marker, similar to Claude's ❯.
+		// The prompt appears as "› suggestion text" near the bottom of the pane
+		// with a status bar (model · path · branch · usage) below it.
+		return d.hasCodexPromptMarker(content)
 
 	default:
 		// Generic shell - check for common prompts
@@ -68,7 +91,7 @@ func (d *PromptDetector) HasPrompt(content string) bool {
 // Handles BOTH normal mode AND --dangerously-skip-permissions mode
 //
 // Claude Code UI States (from research):
-// - BUSY: Shows "esc to interrupt" with spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)
+// - BUSY: Shows "ctrl+c to interrupt" (2024+) or "esc to interrupt" (older) with spinner
 // - WAITING (normal mode): Shows permission dialogs with Yes/No options
 // - WAITING (--dangerously-skip-permissions): Shows just ">" prompt
 // - THINKING: Extended reasoning mode with "think"/"think harder" keywords
@@ -96,9 +119,8 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 	// Priority: Check busy state FIRST - if busy, definitely not waiting
 	// ═══════════════════════════════════════════════════════════════════════
 	busyIndicators := []string{
-		"esc to interrupt",   // Main busy indicator from Claude Code
-		"(esc to interrupt)", // Sometimes in parentheses
-		"· esc to interrupt", // With separator
+		"ctrl+c to interrupt", // PRIMARY - current Claude Code (2024+)
+		"esc to interrupt",    // FALLBACK - older versions
 	}
 	for _, indicator := range busyIndicators {
 		if strings.Contains(recentLower, indicator) {
@@ -107,13 +129,25 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 	}
 
 	// Check for spinner characters in last 3 lines (indicates active processing)
-	// These are the exact braille spinner chars from cli-spinners "dots"
-	spinnerChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	last3Lines := lastLines
-	if len(last3Lines) > 3 {
-		last3Lines = last3Lines[len(last3Lines)-3:]
+	// Includes braille spinner chars (cli-spinners "dots") AND asterisk spinners (Claude 2.1.25+)
+	spinnerChars := []string{
+		"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+		"✳", "✽", "✶", "✢", // Claude 2.1.25+ asterisk spinner chars
 	}
-	for _, line := range last3Lines {
+	// Check last 10 lines (spinner can be further up due to tip lines, borders, status bar)
+	last10Lines := lastLines
+	if len(last10Lines) > 10 {
+		last10Lines = last10Lines[len(last10Lines)-10:]
+	}
+	for _, line := range last10Lines {
+		// Skip lines starting with box-drawing characters (UI borders)
+		trimmedLine := strings.TrimSpace(line)
+		if len(trimmedLine) > 0 {
+			r := []rune(trimmedLine)[0]
+			if r == '│' || r == '├' || r == '└' || r == '─' || r == '┌' || r == '┐' || r == '┘' || r == '┤' || r == '┬' || r == '┴' || r == '┼' || r == '╭' || r == '╰' || r == '╮' || r == '╯' {
+				continue
+			}
+		}
 		for _, spinner := range spinnerChars {
 			if strings.Contains(line, spinner) {
 				// Spinner present in recent output = actively working
@@ -123,8 +157,13 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 	}
 
 	// Check for timing indicators that show Claude is processing
-	// Format: "Thinking… (45s · 1234 tokens · esc to interrupt)"
-	// Or: "Connecting… (80s · 121 tokens · esc to interrupt)"
+	// Claude 2.1.25+ uses whimsical words (90+ words like "Hullaballooing", "Clauding", etc.)
+	// with unicode ellipsis: "✢ Hullaballooing… (53s · ↓ 749 tokens)"
+	// Check for the universal pattern: unicode ellipsis + "tokens" in recent content
+	if strings.Contains(recentLower, "…") && strings.Contains(recentLower, "tokens") {
+		return false // Actively processing (any whimsical word with timing info)
+	}
+	// Legacy patterns (pre-2.1.25)
 	if strings.Contains(recentLower, "thinking") && strings.Contains(recentLower, "tokens") {
 		return false // Actively thinking
 	}
@@ -158,6 +197,13 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 		// Tool permission prompts
 		"Run this command?",
 		"Execute this?",
+		"Action Required",
+		"Waiting for user confirmation",
+		"Allow execution of",
+		// AskUserQuestion / interactive question UI
+		// Claude Code renders selection options with these indicators
+		"Use arrow keys to navigate",
+		"Press Enter to select",
 	}
 	for _, prompt := range permissionPrompts {
 		if strings.Contains(content, prompt) {
@@ -179,25 +225,50 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 		cleanLastLine := StripANSI(lastLine)
 		cleanLastLine = strings.TrimSpace(cleanLastLine)
 
-		// Claude Code shows just ">" when waiting for input
+		// Claude Code shows just ">" or "❯" when waiting for input
+		// Note: Claude Code uses "❯" (Unicode U+276F), not ASCII ">"
 		// This is the standard prompt in --dangerously-skip-permissions mode
-		if cleanLastLine == ">" {
+		if cleanLastLine == ">" || cleanLastLine == "❯" {
 			return true
 		}
 
-		// Also check for "> " (with trailing space/cursor position)
-		if cleanLastLine == "> " {
+		// Also check for "> " or "❯ " (with trailing space/cursor position)
+		if cleanLastLine == "> " || cleanLastLine == "❯ " {
 			return true
 		}
 
 		// Check for prompt with partial user input (user started typing)
-		// Pattern: "> some text" where user is typing
-		if strings.HasPrefix(cleanLastLine, "> ") && !strings.Contains(cleanLastLine, "esc") {
+		// Pattern: "> some text" or "❯ some text" where user is typing
+		if (strings.HasPrefix(cleanLastLine, "> ") || strings.HasPrefix(cleanLastLine, "❯ ")) && !strings.Contains(cleanLastLine, "esc") {
 			// Make sure it's not a quote or output line
 			// Real prompts are short (user input in progress)
 			if len(cleanLastLine) < 100 {
 				return true
 			}
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// WAITING indicators - Prompt in recent lines (not just last line)
+	// Claude Code's UI has status bar AFTER the prompt, so check last 5 lines
+	// ═══════════════════════════════════════════════════════════════════════
+	checkLines := lastLines
+	if len(checkLines) > 5 {
+		checkLines = checkLines[len(checkLines)-5:]
+	}
+	for _, line := range checkLines {
+		cleanLine := strings.TrimSpace(StripANSI(line))
+		// Normalize non-breaking spaces (U+00A0) to regular spaces
+		// Claude Code uses NBSP after the prompt character
+		cleanLine = strings.ReplaceAll(cleanLine, "\u00A0", " ")
+		// Check for standalone prompt character (user hasn't typed yet)
+		if cleanLine == ">" || cleanLine == "❯" || cleanLine == "> " || cleanLine == "❯ " {
+			return true
+		}
+		// Check for prompt with suggestion (Claude shows "❯ Try..." when waiting)
+		// This is Claude's suggestion feature - still means waiting for input
+		if strings.HasPrefix(cleanLine, "❯ Try ") || strings.HasPrefix(cleanLine, "> Try ") {
+			return true
 		}
 	}
 
@@ -245,12 +316,76 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 		}
 	}
 	if hasCompletionIndicator {
-		// Check if there's a ">" in the last few lines
-		for _, line := range last3Lines {
+		// Check if there's a ">" or "❯" in the last few lines
+		completionCheckLines := lastLines
+		if len(completionCheckLines) > 3 {
+			completionCheckLines = completionCheckLines[len(completionCheckLines)-3:]
+		}
+		for _, line := range completionCheckLines {
 			cleanLine := strings.TrimSpace(StripANSI(line))
-			if cleanLine == ">" || cleanLine == "> " {
+			if cleanLine == ">" || cleanLine == "> " || cleanLine == "❯" || cleanLine == "❯ " {
 				return true
 			}
+		}
+	}
+
+	return false
+}
+
+// hasCodexPromptMarker detects the › (U+203A) prompt marker used by Codex CLI.
+// Codex renders its prompt as:
+//
+//	› Run /review on my current changes
+//	  gpt-5.4 · ~/path/to/project · branch · 100% left · 0% used
+//
+// The marker appears at (or near) the start of a line in the last few lines.
+func (d *PromptDetector) hasCodexPromptMarker(content string) bool {
+	lines := strings.Split(content, "\n")
+	// Check last 10 non-empty lines (prompt may not be the very last line
+	// due to the status bar below it).
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 10; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append(lastLines, line)
+		}
+	}
+	for _, line := range lastLines {
+		clean := strings.TrimSpace(StripANSI(line))
+		if clean == "›" || clean == "› " ||
+			strings.HasPrefix(clean, "› ") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasGeminiPrompt detects if Gemini CLI is waiting for input.
+// Checks last 10 non-blank lines for known Gemini prompt patterns.
+func (d *PromptDetector) hasGeminiPrompt(content string) bool {
+	lines := strings.Split(content, "\n")
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 10; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append([]string{line}, lastLines...)
+		}
+	}
+
+	for _, line := range lastLines {
+		// Direct prompt patterns
+		if line == "gemini>" || strings.Contains(line, "gemini>") {
+			return true
+		}
+		if strings.Contains(line, "Yes, allow once") {
+			return true
+		}
+		if strings.Contains(line, "Type your message") {
+			return true
+		}
+		// Generic trailing ">" prompt (common Gemini waiting state)
+		if strings.HasSuffix(line, ">") {
+			return true
 		}
 	}
 
@@ -321,46 +456,129 @@ func (d *PromptDetector) hasShellPrompt(content string) bool {
 	return false
 }
 
+// hasOpencodeBusyIndicator checks if opencode's TUI shows signs of active processing.
+// OpenCode uses a Bubble Tea TUI with these busy signals:
+//   - Help bar: "esc interrupt" / "esc to exit" (only during processing)
+//   - Pulse spinner: █ ▓ ▒ ░ (cycles at 125ms)
+//   - Task text: "Thinking...", "Generating...", etc.
+func (d *PromptDetector) hasOpencodeBusyIndicator(content string) bool {
+	// Authoritative busy indicators: always override prompt detection.
+	if strings.Contains(content, "esc interrupt") || strings.Contains(content, "esc to exit") {
+		return true
+	}
+	// Authoritative busy task text.
+	busyStrings := []string{
+		"Thinking...",
+		"Generating...",
+		"Building tool call...",
+		"Waiting for tool response...",
+	}
+	for _, s := range busyStrings {
+		if strings.Contains(content, s) {
+			return true
+		}
+	}
+	// Pulse spinner chars: only indicate busy when no prompt-indicating strings
+	// are present. This prevents false positives when pulse chars appear in
+	// static UI elements (progress bars, decorative borders) alongside
+	// question tool prompts. (#255)
+	hasPromptIndicator := strings.Contains(content, "enter submit") ||
+		strings.Contains(content, "esc dismiss") ||
+		strings.Contains(content, "press enter to send") ||
+		strings.Contains(content, "Ask anything")
+	if !hasPromptIndicator {
+		pulseChars := []string{"█", "▓", "▒", "░"}
+		for _, ch := range pulseChars {
+			if strings.Contains(content, ch) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // =============================================================================
 // ANSI Stripping Utility
 // =============================================================================
 
-// StripANSI removes ANSI escape codes from content
-// This is important because terminal output contains color codes
+// StripANSI removes ANSI escape codes from content using O(n) single-pass algorithm.
+// This is important because terminal output contains color codes.
+//
+// PERFORMANCE: Uses strings.Builder with pre-allocation for O(n) time complexity.
+// Previous implementation used string concatenation in loops which was O(n²)
+// and caused 2-11 second UI freezes on large terminal output (Issue #39).
+//
+// NOTE: We intentionally avoid regex here because complex ANSI regex patterns
+// can cause catastrophic backtracking on malformed escape sequences.
 func StripANSI(content string) string {
-	// Simple but effective ANSI stripping
-	result := content
+	// Fast path: if no escape chars, return as-is
+	// Note: Using IndexByte instead of ContainsAny to avoid UTF-8 validation issues
+	// \x1b is ESC, \x9B is CSI (C1 control character)
+	if strings.IndexByte(content, '\x1b') < 0 && strings.IndexByte(content, '\x9B') < 0 {
+		return content
+	}
 
-	// Remove CSI sequences (most common): ESC [ ... letter
-	for {
-		start := strings.Index(result, "\x1b[")
-		if start == -1 {
-			break
-		}
-		end := start + 2
-		for end < len(result) {
-			c := result[end]
-			if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
-				end++
-				break
+	var b strings.Builder
+	b.Grow(len(content)) // Pre-allocate to avoid reallocations
+
+	i := 0
+	for i < len(content) {
+		// Check for ESC character
+		if content[i] == '\x1b' {
+			// CSI sequence: ESC [ ... letter
+			if i+1 < len(content) && content[i+1] == '[' {
+				j := i + 2
+				// Skip until we find the terminating letter
+				for j < len(content) {
+					c := content[j]
+					if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+						j++
+						break
+					}
+					j++
+				}
+				i = j
+				continue
 			}
-			end++
+			// OSC sequence: ESC ] ... BEL
+			if i+1 < len(content) && content[i+1] == ']' {
+				// Find BEL terminator
+				bellPos := strings.Index(content[i:], "\x07")
+				if bellPos != -1 {
+					i += bellPos + 1
+					continue
+				}
+				// No BEL found - find ST (ESC \) as alternative terminator
+				stPos := strings.Index(content[i:], "\x1b\\")
+				if stPos != -1 {
+					i += stPos + 2
+					continue
+				}
+			}
+			// Other escape sequence: ESC followed by single char
+			if i+1 < len(content) {
+				i += 2
+				continue
+			}
 		}
-		result = result[:start] + result[end:]
+		// Check for CSI without ESC (8-bit CSI: 0x9B)
+		if content[i] == '\x9B' {
+			j := i + 1
+			for j < len(content) {
+				c := content[j]
+				if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+					j++
+					break
+				}
+				j++
+			}
+			i = j
+			continue
+		}
+		// Regular character - copy to output
+		b.WriteByte(content[i])
+		i++
 	}
 
-	// Remove OSC sequences: ESC ] ... BEL
-	for {
-		start := strings.Index(result, "\x1b]")
-		if start == -1 {
-			break
-		}
-		end := strings.Index(result[start:], "\x07")
-		if end == -1 {
-			break
-		}
-		result = result[:start] + result[start+end+1:]
-	}
-
-	return result
+	return b.String()
 }

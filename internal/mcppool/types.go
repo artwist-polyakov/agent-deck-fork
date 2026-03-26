@@ -5,9 +5,10 @@ type ServerStatus int
 
 const (
 	StatusStopped ServerStatus = iota
-	StatusStarting  
+	StatusStarting
 	StatusRunning
 	StatusFailed
+	StatusPermanentlyFailed
 )
 
 func (s ServerStatus) String() string {
@@ -20,6 +21,8 @@ func (s ServerStatus) String() string {
 		return "running"
 	case StatusFailed:
 		return "failed"
+	case StatusPermanentlyFailed:
+		return "permanently_failed"
 	default:
 		return "unknown"
 	}

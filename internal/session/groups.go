@@ -1,9 +1,13 @@
 package session
 
 import (
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/asheshgoplani/agent-deck/internal/git"
 )
 
 // DefaultGroupName is the display name for the default group where ungrouped sessions go
@@ -18,29 +22,41 @@ type ItemType int
 const (
 	ItemTypeGroup ItemType = iota
 	ItemTypeSession
+	ItemTypeRemoteGroup
+	ItemTypeRemoteSession
+	ItemTypeWindow
 )
 
 // Item represents a single item in the flattened group tree view
 type Item struct {
-	Type               ItemType
-	Group              *Group
-	Session            *Instance
-	Level              int    // Indentation level (0 for root groups, 1 for sessions)
-	Path               string // Group path for this item
-	IsLastInGroup      bool   // True if this is the last session in its group (for tree rendering)
-	RootGroupNum       int    // Pre-computed root group number for hotkey display (1-9, 0 if not a root group)
-	IsSubSession       bool   // True if this session has a parent session
-	IsLastSubSession   bool   // True if this is the last sub-session of its parent (for tree rendering)
-	ParentIsLastInGroup bool  // True if parent session is last top-level item (for tree line rendering)
+	Type                ItemType
+	Group               *Group
+	Session             *Instance
+	RemoteSession       *RemoteSessionInfo // Set for ItemTypeRemoteSession/ItemTypeRemoteGroup
+	RemoteName          string             // Remote name for remote items
+	Level               int                // Indentation level (0 for root groups, 1 for sessions)
+	Path                string             // Group path for this item
+	IsLastInGroup       bool               // True if this is the last session in its group (for tree rendering)
+	RootGroupNum        int                // Pre-computed root group number for hotkey display (1-9, 0 if not a root group)
+	IsSubSession        bool               // True if this session has a parent session
+	IsLastSubSession    bool               // True if this is the last sub-session of its parent (for tree rendering)
+	ParentIsLastInGroup bool               // True if parent session is last top-level item (for tree line rendering)
+	IsWindow            bool               // True for ItemTypeWindow items
+	IsLastWindow        bool               // True if last window of parent session
+	WindowIndex         int                // Tmux window index (for ItemTypeWindow)
+	WindowName          string             // Tmux window name (for ItemTypeWindow)
+	WindowSessionID     string             // Parent session ID (for ItemTypeWindow)
+	WindowTool          string             // Detected tool in this window (claude, gemini, etc.)
 }
 
 // Group represents a group of sessions
 type Group struct {
-	Name     string
-	Path     string // Full path like "projects" or "projects/devops"
-	Expanded bool
-	Sessions []*Instance
-	Order    int
+	Name        string
+	Path        string // Full path like "projects" or "projects/devops"
+	Expanded    bool
+	Sessions    []*Instance
+	Order       int
+	DefaultPath string // Explicit default path for new sessions in this group
 }
 
 // GroupTree manages hierarchical session organization
@@ -85,8 +101,20 @@ func NewGroupTree(instances []*Instance) *GroupTree {
 		group.Sessions = append(group.Sessions, inst)
 	}
 
+	// Sort sessions within each group by persisted Order
+	for _, group := range tree.Groups {
+		sort.SliceStable(group.Sessions, func(i, j int) bool {
+			return group.Sessions[i].Order < group.Sessions[j].Order
+		})
+	}
+
 	// Sort groups alphabetically and assign order
 	tree.rebuildGroupList()
+
+	// Update default paths for all groups
+	for groupPath := range tree.Groups {
+		tree.updateGroupDefaultPath(groupPath)
+	}
 
 	return tree
 }
@@ -101,11 +129,12 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 	// First, create groups from stored data (preserves empty groups)
 	for _, gd := range storedGroups {
 		group := &Group{
-			Name:     gd.Name,
-			Path:     gd.Path,
-			Expanded: gd.Expanded,
-			Sessions: []*Instance{},
-			Order:    gd.Order,
+			Name:        gd.Name,
+			Path:        gd.Path,
+			Expanded:    gd.Expanded,
+			Sessions:    []*Instance{},
+			Order:       gd.Order,
+			DefaultPath: gd.DefaultPath,
 		}
 		tree.Groups[gd.Path] = group
 		tree.Expanded[gd.Path] = gd.Expanded
@@ -140,8 +169,20 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 		group.Sessions = append(group.Sessions, inst)
 	}
 
+	// Sort sessions within each group by persisted Order
+	for _, group := range tree.Groups {
+		sort.SliceStable(group.Sessions, func(i, j int) bool {
+			return group.Sessions[i].Order < group.Sessions[j].Order
+		})
+	}
+
 	// Rebuild group list maintaining stored order
 	tree.rebuildGroupList()
+
+	// Update default paths for all groups (may override stored if sessions have newer paths)
+	for groupPath := range tree.Groups {
+		tree.updateGroupDefaultPath(groupPath)
+	}
 
 	return tree
 }
@@ -152,6 +193,10 @@ func NewGroupTreeWithGroups(instances []*Instance, storedGroups []*GroupData) *G
 func (t *GroupTree) rebuildGroupList() {
 	t.GroupList = make([]*Group, 0, len(t.Groups))
 	for _, g := range t.Groups {
+		// Always pin the "conductor" group to the top
+		if g.Path == "conductor" && g.Order >= 0 {
+			g.Order = -1
+		}
 		t.GroupList = append(t.GroupList, g)
 	}
 	sort.Slice(t.GroupList, func(i, j int) bool {
@@ -179,13 +224,64 @@ func (t *GroupTree) rebuildGroupList() {
 			return t.GroupList[i].Name < t.GroupList[j].Name
 		}
 
-		// Different parents - sort by full path to keep hierarchy together
+		// Different parents - compare at root level to keep tree structure
+		// This ensures subgroups stay grouped with their root ancestors
+		rootI := getRootPath(pathI)
+		rootJ := getRootPath(pathJ)
+
+		if rootI == rootJ {
+			// Same root - find the branch ancestors at the divergence point and compare as siblings
+			// Example: comparing "a/b/c" with "a/d" - find "b" and "d" (children of common ancestor "a")
+			partsI := strings.Split(pathI, "/")
+			partsJ := strings.Split(pathJ, "/")
+
+			// Find the first point where paths diverge
+			divergeLevel := 0
+			for divergeLevel < len(partsI) && divergeLevel < len(partsJ) {
+				if partsI[divergeLevel] != partsJ[divergeLevel] {
+					break
+				}
+				divergeLevel++
+			}
+
+			// Get the branch paths at the divergence point
+			branchPathI := strings.Join(partsI[:divergeLevel+1], "/")
+			branchPathJ := strings.Join(partsJ[:divergeLevel+1], "/")
+
+			// Compare branch roots as siblings (by Order, then Name)
+			branchI := t.Groups[branchPathI]
+			branchJ := t.Groups[branchPathJ]
+
+			if branchI != nil && branchJ != nil {
+				if branchI.Order != branchJ.Order {
+					return branchI.Order < branchJ.Order
+				}
+				return branchI.Name < branchJ.Name
+			}
+
+			// Fallback to path comparison if branches not found
+			return pathI < pathJ
+		}
+
+		// Different root ancestors - compare roots by order then name
+		// This ensures entire subtrees are kept together
+		rootGroupI := t.Groups[rootI]
+		rootGroupJ := t.Groups[rootJ]
+		if rootGroupI != nil && rootGroupJ != nil {
+			if rootGroupI.Order != rootGroupJ.Order {
+				return rootGroupI.Order < rootGroupJ.Order
+			}
+			return rootGroupI.Name < rootGroupJ.Name
+		}
+
+		// Fallback to full path comparison if root groups not found
 		return pathI < pathJ
 	})
-	// Assign sequential orders (preserving relative order)
-	for i, g := range t.GroupList {
-		g.Order = i
-	}
+	// Note: Do NOT reassign Order values here - this would destroy user-customized
+	// order stored in state.db. Order values are set:
+	// 1. When loaded from storage (preserved)
+	// 2. When creating new groups (Order = len(GroupList))
+	// 3. When manually reordering with K/J keys (MoveGroupUp/Down)
 }
 
 // getParentPath returns the parent path of a group path
@@ -194,6 +290,15 @@ func getParentPath(path string) string {
 		return path[:idx]
 	}
 	return "" // root level
+}
+
+// getRootPath returns the root-level path (first segment) of a hierarchical path
+// e.g., "parent/child/grandchild" -> "parent", "root" -> "root"
+func getRootPath(path string) string {
+	if idx := strings.Index(path, "/"); idx != -1 {
+		return path[:idx]
+	}
+	return path // already root level
 }
 
 // extractGroupName extracts the display name from a group path
@@ -461,6 +566,10 @@ func (t *GroupTree) MoveSessionUp(inst *Instance) {
 			break
 		}
 	}
+	// Normalize Order for all sessions in group
+	for i, s := range group.Sessions {
+		s.Order = i
+	}
 }
 
 // MoveSessionDown moves a session down within its group
@@ -476,12 +585,18 @@ func (t *GroupTree) MoveSessionDown(inst *Instance) {
 			break
 		}
 	}
+	// Normalize Order for all sessions in group
+	for i, s := range group.Sessions {
+		s.Order = i
+	}
 }
 
 // MoveSessionToGroup moves a session to a different group
 func (t *GroupTree) MoveSessionToGroup(inst *Instance, newGroupPath string) {
+	oldGroupPath := inst.GroupPath
+
 	// Remove from old group
-	if oldGroup, exists := t.Groups[inst.GroupPath]; exists {
+	if oldGroup, exists := t.Groups[oldGroupPath]; exists {
 		for i, s := range oldGroup.Sessions {
 			if s.ID == inst.ID {
 				oldGroup.Sessions = append(oldGroup.Sessions[:i], oldGroup.Sessions[i+1:]...)
@@ -504,7 +619,12 @@ func (t *GroupTree) MoveSessionToGroup(inst *Instance, newGroupPath string) {
 		t.Groups[newGroupPath] = newGroup
 		t.rebuildGroupList()
 	}
+	inst.Order = len(newGroup.Sessions)
 	newGroup.Sessions = append(newGroup.Sessions, inst)
+
+	// Update default paths for both old and new groups
+	t.updateGroupDefaultPath(oldGroupPath)
+	t.updateGroupDefaultPath(newGroupPath)
 }
 
 // sanitizeGroupName removes dangerous characters from group names
@@ -551,12 +671,20 @@ func (t *GroupTree) CreateGroup(name string) *Group {
 		return t.Groups[path]
 	}
 
+	// Count existing root-level groups to assign sibling-relative order
+	rootCount := 0
+	for p := range t.Groups {
+		if getParentPath(p) == "" { // Root level
+			rootCount++
+		}
+	}
+
 	group := &Group{
 		Name:     sanitizedName,
 		Path:     path,
 		Expanded: true,
 		Sessions: []*Instance{},
-		Order:    len(t.GroupList),
+		Order:    rootCount, // Order among root groups
 	}
 	t.Groups[path] = group
 	t.Expanded[path] = true
@@ -575,12 +703,20 @@ func (t *GroupTree) CreateSubgroup(parentPath, name string) *Group {
 		return t.Groups[fullPath]
 	}
 
+	// Count existing siblings to assign sibling-relative order
+	siblingCount := 0
+	for p := range t.Groups {
+		if getParentPath(p) == parentPath {
+			siblingCount++
+		}
+	}
+
 	group := &Group{
 		Name:     sanitizedName,
 		Path:     fullPath,
 		Expanded: true,
 		Sessions: []*Instance{},
-		Order:    len(t.GroupList),
+		Order:    siblingCount, // Order among siblings
 	}
 	t.Groups[fullPath] = group
 	t.Expanded[fullPath] = true
@@ -597,7 +733,17 @@ func (t *GroupTree) RenameGroup(oldPath, newName string) {
 
 	// Sanitize name to prevent path traversal and security issues
 	sanitizedName := sanitizeGroupName(newName)
-	newPath := strings.ToLower(strings.ReplaceAll(sanitizedName, " ", "-"))
+	newBasePath := strings.ToLower(strings.ReplaceAll(sanitizedName, " ", "-"))
+
+	// Preserve parent path for subgroups
+	parentPath := getParentPath(oldPath)
+	var newPath string
+	if parentPath != "" {
+		newPath = parentPath + "/" + newBasePath
+	} else {
+		newPath = newBasePath
+	}
+
 	if newPath == oldPath {
 		group.Name = sanitizedName
 		return
@@ -727,6 +873,19 @@ func (t *GroupTree) SessionCount() int {
 	return count
 }
 
+// SessionCountForGroup returns session count for a group INCLUDING all its subgroups
+// This enables hierarchical counts like "Project (5)" where 5 includes all nested sessions
+func (t *GroupTree) SessionCountForGroup(groupPath string) int {
+	count := 0
+	for path, g := range t.Groups {
+		// Count this group if it matches OR is a subgroup (prefix match)
+		if path == groupPath || strings.HasPrefix(path, groupPath+"/") {
+			count += len(g.Sessions)
+		}
+	}
+	return count
+}
+
 // GroupCount returns total group count
 func (t *GroupTree) GroupCount() int {
 	return len(t.Groups)
@@ -760,7 +919,9 @@ func (t *GroupTree) AddSession(inst *Instance) {
 		t.Expanded[groupPath] = true
 		t.rebuildGroupList()
 	}
+	inst.Order = len(group.Sessions)
 	group.Sessions = append(group.Sessions, inst)
+	t.updateGroupDefaultPath(groupPath)
 }
 
 // RemoveSession removes a session from its group
@@ -830,11 +991,23 @@ func (t *GroupTree) SyncWithInstances(instances []*Instance) {
 		group.Sessions = append(group.Sessions, inst)
 	}
 
+	// Sort sessions within each group by persisted Order
+	for _, group := range t.Groups {
+		sort.SliceStable(group.Sessions, func(i, j int) bool {
+			return group.Sessions[i].Order < group.Sessions[j].Order
+		})
+	}
+
 	// Always rebuild GroupList at the end to ensure consistency between
 	// Groups map and GroupList slice. This fixes the bug where flatItems
 	// could be empty while instances has data (filter bar shows counts
 	// but main panel shows "No Sessions Yet").
 	t.rebuildGroupList()
+
+	// Update default paths for all groups after syncing
+	for groupPath := range t.Groups {
+		t.updateGroupDefaultPath(groupPath)
+	}
 }
 
 // ShallowCopyForSave creates a copy of the GroupTree that's safe to use
@@ -852,10 +1025,11 @@ func (t *GroupTree) ShallowCopyForSave() *GroupTree {
 	groupListCopy := make([]*Group, len(t.GroupList))
 	for i, g := range t.GroupList {
 		groupListCopy[i] = &Group{
-			Name:     g.Name,
-			Path:     g.Path,
-			Expanded: g.Expanded,
-			Order:    g.Order,
+			Name:        g.Name,
+			Path:        g.Path,
+			Expanded:    g.Expanded,
+			Order:       g.Order,
+			DefaultPath: g.DefaultPath,
 			// Don't copy Sessions - not needed for save, only metadata is saved
 		}
 	}
@@ -863,5 +1037,114 @@ func (t *GroupTree) ShallowCopyForSave() *GroupTree {
 	return &GroupTree{
 		GroupList: groupListCopy,
 		// Groups and Expanded maps not needed since only GroupList is iterated in save
+	}
+}
+
+// mostRecentPathForSessions returns the project path from the most recently accessed session
+// in the given list. Returns empty string if no sessions have paths.
+func mostRecentPathForSessions(sessions []*Instance) string {
+	if len(sessions) == 0 {
+		return ""
+	}
+
+	var mostRecent *Instance
+	for _, s := range sessions {
+		if s.ProjectPath == "" {
+			continue
+		}
+		if mostRecent == nil || s.LastAccessedAt.After(mostRecent.LastAccessedAt) {
+			mostRecent = s
+		}
+	}
+
+	if mostRecent != nil {
+		// Prefer the original repo root over a worktree path so the new-session
+		// dialog doesn't pre-populate with a path that may not exist.
+		if mostRecent.WorktreeRepoRoot != "" {
+			return mostRecent.WorktreeRepoRoot
+		}
+		return mostRecent.ProjectPath
+	}
+	return ""
+}
+
+// resolveGroupDefaultPath normalizes a default path and maps git worktree paths
+// to their base repository root.
+func resolveGroupDefaultPath(defaultPath string) string {
+	defaultPath = strings.TrimSpace(defaultPath)
+	if defaultPath == "" {
+		return ""
+	}
+
+	// Expand ~ for user-supplied paths.
+	if defaultPath == "~" || strings.HasPrefix(defaultPath, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			if defaultPath == "~" {
+				defaultPath = home
+			} else {
+				defaultPath = filepath.Join(home, defaultPath[2:])
+			}
+		}
+	}
+
+	if !filepath.IsAbs(defaultPath) {
+		if abs, err := filepath.Abs(defaultPath); err == nil {
+			defaultPath = abs
+		}
+	}
+
+	info, err := os.Stat(defaultPath)
+	if err != nil || !info.IsDir() {
+		return defaultPath
+	}
+
+	if !git.IsGitRepo(defaultPath) {
+		return defaultPath
+	}
+
+	baseRoot, err := git.GetWorktreeBaseRoot(defaultPath)
+	if err != nil || baseRoot == "" {
+		return defaultPath
+	}
+
+	return baseRoot
+}
+
+// DefaultPathForGroup returns the effective default path for creating new sessions
+// in the group: explicit configured default_path first, then most recent session path.
+func (t *GroupTree) DefaultPathForGroup(groupPath string) string {
+	group, exists := t.Groups[groupPath]
+	if !exists {
+		return ""
+	}
+
+	if group.DefaultPath != "" {
+		return resolveGroupDefaultPath(group.DefaultPath)
+	}
+
+	return resolveGroupDefaultPath(mostRecentPathForSessions(group.Sessions))
+}
+
+// SetDefaultPathForGroup sets (or clears) an explicit default path for a group.
+func (t *GroupTree) SetDefaultPathForGroup(groupPath, defaultPath string) bool {
+	group, exists := t.Groups[groupPath]
+	if !exists {
+		return false
+	}
+
+	group.DefaultPath = resolveGroupDefaultPath(defaultPath)
+	return true
+}
+
+// updateGroupDefaultPath normalizes persisted explicit default paths.
+// Derived fallback paths are computed on demand in DefaultPathForGroup().
+func (t *GroupTree) updateGroupDefaultPath(groupPath string) {
+	group, exists := t.Groups[groupPath]
+	if !exists {
+		return
+	}
+
+	if group.DefaultPath != "" {
+		group.DefaultPath = resolveGroupDefaultPath(group.DefaultPath)
 	}
 }

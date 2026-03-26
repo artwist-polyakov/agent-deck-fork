@@ -1,19 +1,26 @@
 package ui
 
 import (
-	"log"
+	"log/slog"
+	"strings"
+	"time"
+	"unicode"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-// MCPScope represents LOCAL or GLOBAL scope
+var mcpDialogLog = logging.ForComponent(logging.CompMCP)
+
+// MCPScope represents LOCAL, GLOBAL, or USER scope
 type MCPScope int
 
 const (
 	MCPScopeLocal MCPScope = iota
 	MCPScopeGlobal
+	MCPScopeUser // NEW: Manages ~/.claude.json (ROOT)
 )
 
 // MCPColumn represents Attached or Available column
@@ -22,14 +29,19 @@ type MCPColumn int
 const (
 	MCPColumnAttached MCPColumn = iota
 	MCPColumnAvailable
+
+	mcpTypeJumpTimeout = 1200 * time.Millisecond
 )
 
 // MCPItem represents an MCP in the dialog list
 type MCPItem struct {
-	Name        string
-	Description string
-	IsOrphan    bool // True if MCP is attached but not in config.toml pool
-	IsPooled    bool // True if this MCP uses socket pool
+	Name         string
+	Description  string
+	IsOrphan     bool   // True if MCP is attached but not in config.toml pool
+	IsPooled     bool   // True if this MCP uses socket pool
+	Transport    string // "stdio", "http", or "sse"
+	HTTPStatus   string // For HTTP MCPs: "running", "stopped", "external", etc.
+	HasServerCfg bool   // True if HTTP MCP has [mcps.X.server] config
 }
 
 // MCPDialog handles MCP management for Claude and Gemini sessions
@@ -50,19 +62,26 @@ type MCPDialog struct {
 	localAvailable  []MCPItem
 	globalAttached  []MCPItem
 	globalAvailable []MCPItem
+	userAttached    []MCPItem // USER scope: ~/.claude.json (ROOT)
+	userAvailable   []MCPItem // USER scope: ~/.claude.json (ROOT)
 
-	// Selection index per scope/column (4 combinations)
+	// Selection index per scope/column (6 combinations)
 	localAttachedIdx   int
 	localAvailableIdx  int
 	globalAttachedIdx  int
 	globalAvailableIdx int
+	userAttachedIdx    int // USER scope index
+	userAvailableIdx   int // USER scope index
 
 	// Track changes
 	localChanged  bool
 	globalChanged bool
+	userChanged   bool // USER scope changed
 
-	err         error
-	configError string // Error message from config parsing
+	err           error
+	configError   string // Error message from config parsing
+	typeJumpBuf   string
+	typeJumpUntil time.Time
 }
 
 // NewMCPDialog creates a new MCP management dialog
@@ -87,16 +106,53 @@ func (m *MCPDialog) Show(projectPath string, sessionID string, tool string) erro
 	availableMCPs := session.GetAvailableMCPs()
 	allNames := session.GetAvailableMCPNames()
 
-	// Build items lookup for descriptions and pool status
+	// Build items lookup for descriptions, transport, and pool status
 	pool := session.GetGlobalPool()
+	httpPool := session.GetGlobalHTTPPool()
 	itemsMap := make(map[string]MCPItem)
 	for _, name := range allNames {
+		def, ok := availableMCPs[name]
 		desc := ""
-		if def, ok := availableMCPs[name]; ok {
+		if ok {
 			desc = def.Description
 		}
-		isPooled := pool != nil && pool.ShouldPool(name) && pool.IsRunning(name)
-		itemsMap[name] = MCPItem{Name: name, Description: desc, IsPooled: isPooled}
+
+		// Determine transport type and status
+		transport := "stdio"
+		httpStatus := ""
+		hasServerCfg := false
+		isPooled := false
+
+		if ok && def.IsHTTP() {
+			transport = def.GetTransport()
+			hasServerCfg = def.HasAutoStartServer()
+
+			// Check HTTP server status
+			if httpPool != nil && httpPool.IsRunning(name) {
+				server := httpPool.GetServer(name)
+				if server != nil && server.StartedByUs() {
+					httpStatus = "running"
+				} else {
+					httpStatus = "external"
+				}
+			} else if hasServerCfg {
+				httpStatus = "stopped"
+			} else {
+				httpStatus = "external"
+			}
+		} else {
+			// stdio MCP - check socket pool
+			isPooled = pool != nil && pool.ShouldPool(name) && pool.IsRunning(name)
+		}
+
+		itemsMap[name] = MCPItem{
+			Name:         name,
+			Description:  desc,
+			IsPooled:     isPooled,
+			Transport:    transport,
+			HTTPStatus:   httpStatus,
+			HasServerCfg: hasServerCfg,
+		}
 	}
 
 	// Track which MCPs are in the config.toml pool
@@ -110,6 +166,8 @@ func (m *MCPDialog) Show(projectPath string, sessionID string, tool string) erro
 	m.localAvailable = nil
 	m.globalAttached = nil
 	m.globalAvailable = nil
+	m.userAttached = nil
+	m.userAvailable = nil
 
 	if tool == "gemini" {
 		// Gemini: Only global MCPs from settings.json
@@ -200,24 +258,63 @@ func (m *MCPDialog) Show(projectPath string, sessionID string, tool string) erro
 				})
 			}
 		}
+
+		// Load USER attached from ~/.claude.json (ROOT config)
+		userAttachedNames := make(map[string]bool)
+		for _, name := range session.GetUserMCPNames() {
+			userAttachedNames[name] = true
+		}
+
+		// Build attached/available lists for USER
+		for _, name := range allNames {
+			item := itemsMap[name]
+			if userAttachedNames[name] {
+				m.userAttached = append(m.userAttached, item)
+			} else {
+				m.userAvailable = append(m.userAvailable, item)
+			}
+		}
+
+		// Add orphan USER MCPs (attached in ~/.claude.json but not in config.toml pool)
+		for name := range userAttachedNames {
+			if !poolNames[name] {
+				m.userAttached = append(m.userAttached, MCPItem{
+					Name:        name,
+					Description: "(not in config.toml)",
+					IsOrphan:    true,
+				})
+			}
+		}
 	}
 
 	m.visible = true
 	m.projectPath = projectPath
-	// Gemini only has global scope, Claude starts with local
+	// Gemini only has global scope, Claude uses configured default
 	if tool == "gemini" {
 		m.scope = MCPScopeGlobal
 	} else {
-		m.scope = MCPScopeLocal
+		switch session.GetMCPDefaultScope() {
+		case "global":
+			m.scope = MCPScopeGlobal
+		case "user":
+			m.scope = MCPScopeUser
+		default:
+			m.scope = MCPScopeLocal
+		}
 	}
 	m.column = MCPColumnAttached
 	m.localAttachedIdx = 0
 	m.localAvailableIdx = 0
 	m.globalAttachedIdx = 0
 	m.globalAvailableIdx = 0
+	m.userAttachedIdx = 0
+	m.userAvailableIdx = 0
 	m.localChanged = false
 	m.globalChanged = false
+	m.userChanged = false
 	m.err = nil
+	m.typeJumpBuf = ""
+	m.typeJumpUntil = time.Time{}
 
 	return nil
 }
@@ -229,7 +326,11 @@ func (m *MCPDialog) Hide() {
 	m.localAvailable = nil
 	m.globalAttached = nil
 	m.globalAvailable = nil
+	m.userAttached = nil
+	m.userAvailable = nil
 	m.err = nil
+	m.typeJumpBuf = ""
+	m.typeJumpUntil = time.Time{}
 }
 
 // IsVisible returns whether the dialog is visible
@@ -242,11 +343,14 @@ func (m *MCPDialog) HasItems() bool {
 	return len(m.localAttached)+len(m.localAvailable)+len(m.globalAttached)+len(m.globalAvailable) > 0
 }
 
-// HasChanged returns true if any MCPs were changed (either scope)
+// HasChanged returns true if any MCPs were changed (any scope)
 func (m *MCPDialog) HasChanged() bool {
-	result := m.localChanged || m.globalChanged
-	log.Printf("[MCP-DEBUG] HasChanged() called - localChanged=%v, globalChanged=%v, result=%v",
-		m.localChanged, m.globalChanged, result)
+	result := m.localChanged || m.globalChanged || m.userChanged
+	mcpDialogLog.Debug("has_changed_check",
+		slog.Bool("local_changed", m.localChanged),
+		slog.Bool("global_changed", m.globalChanged),
+		slog.Bool("user_changed", m.userChanged),
+		slog.Bool("result", result))
 	return result
 }
 
@@ -263,6 +367,22 @@ func (m *MCPDialog) GetSessionID() string {
 // GetError returns any error that occurred
 func (m *MCPDialog) GetError() error {
 	return m.err
+}
+
+// ScrollUp moves the active list cursor up by one (mouse wheel support).
+func (m *MCPDialog) ScrollUp() {
+	list, idx := m.getCurrentList()
+	if len(*list) > 0 && *idx > 0 {
+		*idx--
+	}
+}
+
+// ScrollDown moves the active list cursor down by one (mouse wheel support).
+func (m *MCPDialog) ScrollDown() {
+	list, idx := m.getCurrentList()
+	if len(*list) > 0 && *idx < len(*list)-1 {
+		*idx++
+	}
 }
 
 // SetSize sets the dialog size
@@ -282,21 +402,27 @@ func (m *MCPDialog) getCurrentList() (*[]MCPItem, *int) {
 		return &m.globalAttached, &m.globalAttachedIdx
 	case m.scope == MCPScopeGlobal && m.column == MCPColumnAvailable:
 		return &m.globalAvailable, &m.globalAvailableIdx
+	case m.scope == MCPScopeUser && m.column == MCPColumnAttached:
+		return &m.userAttached, &m.userAttachedIdx
+	case m.scope == MCPScopeUser && m.column == MCPColumnAvailable:
+		return &m.userAvailable, &m.userAvailableIdx
 	}
 	return &m.localAttached, &m.localAttachedIdx
 }
 
 // Move moves the selected item between Attached <-> Available
 func (m *MCPDialog) Move() {
-	log.Printf("[MCP-DEBUG] Move() called - scope=%d, column=%d", m.scope, m.column)
+	mcpDialogLog.Debug("mcp_move_start",
+		slog.Int("scope", int(m.scope)),
+		slog.Int("column", int(m.column)))
 	list, idx := m.getCurrentList()
 	if len(*list) == 0 || *idx < 0 || *idx >= len(*list) {
-		log.Printf("[MCP-DEBUG] Move() early return - list empty or invalid index")
+		mcpDialogLog.Debug("mcp_move_early_return", slog.String("reason", "list_empty_or_invalid_index"))
 		return
 	}
 
 	item := (*list)[*idx]
-	log.Printf("[MCP-DEBUG] Moving item: %q", item.Name)
+	mcpDialogLog.Debug("mcp_move_item", slog.String("name", item.Name))
 
 	// Remove from current list
 	*list = append((*list)[:*idx], (*list)[*idx+1:]...)
@@ -304,29 +430,42 @@ func (m *MCPDialog) Move() {
 	// Add to other column
 	if m.column == MCPColumnAttached {
 		// Moving from Attached -> Available
-		if m.scope == MCPScopeLocal {
+		switch m.scope {
+		case MCPScopeLocal:
 			m.localAvailable = append(m.localAvailable, item)
 			m.localChanged = true
-			log.Printf("[MCP-DEBUG] Moved to localAvailable, localChanged=true")
-		} else {
+			mcpDialogLog.Debug("mcp_moved_to_available", slog.String("scope", "local"))
+		case MCPScopeGlobal:
 			m.globalAvailable = append(m.globalAvailable, item)
 			m.globalChanged = true
-			log.Printf("[MCP-DEBUG] Moved to globalAvailable, globalChanged=true")
+			mcpDialogLog.Debug("mcp_moved_to_available", slog.String("scope", "global"))
+		case MCPScopeUser:
+			m.userAvailable = append(m.userAvailable, item)
+			m.userChanged = true
+			mcpDialogLog.Debug("mcp_moved_to_available", slog.String("scope", "user"))
 		}
 	} else {
 		// Moving from Available -> Attached
-		if m.scope == MCPScopeLocal {
+		switch m.scope {
+		case MCPScopeLocal:
 			m.localAttached = append(m.localAttached, item)
 			m.localChanged = true
-			log.Printf("[MCP-DEBUG] Moved to localAttached, localChanged=true")
-		} else {
+			mcpDialogLog.Debug("mcp_moved_to_attached", slog.String("scope", "local"))
+		case MCPScopeGlobal:
 			m.globalAttached = append(m.globalAttached, item)
 			m.globalChanged = true
-			log.Printf("[MCP-DEBUG] Moved to globalAttached, globalChanged=true")
+			mcpDialogLog.Debug("mcp_moved_to_attached", slog.String("scope", "global"))
+		case MCPScopeUser:
+			m.userAttached = append(m.userAttached, item)
+			m.userChanged = true
+			mcpDialogLog.Debug("mcp_moved_to_attached", slog.String("scope", "user"))
 		}
 	}
 
-	log.Printf("[MCP-DEBUG] After Move: localChanged=%v, globalChanged=%v", m.localChanged, m.globalChanged)
+	mcpDialogLog.Debug("mcp_move_complete",
+		slog.Bool("local_changed", m.localChanged),
+		slog.Bool("global_changed", m.globalChanged),
+		slog.Bool("user_changed", m.userChanged))
 
 	// Adjust index if needed
 	if *idx >= len(*list) && len(*list) > 0 {
@@ -334,10 +473,61 @@ func (m *MCPDialog) Move() {
 	}
 }
 
-// Apply saves the changes to LOCAL (.mcp.json) and GLOBAL (Claude/Gemini config)
+func (m *MCPDialog) resetTypeJump() {
+	m.typeJumpBuf = ""
+	m.typeJumpUntil = time.Time{}
+}
+
+func (m *MCPDialog) typeJump(r rune) {
+	if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' && r != '.' {
+		return
+	}
+
+	now := time.Now()
+	if now.After(m.typeJumpUntil) {
+		m.typeJumpBuf = ""
+	}
+	m.typeJumpBuf += strings.ToLower(string(r))
+	m.typeJumpUntil = now.Add(mcpTypeJumpTimeout)
+
+	list, idx := m.getCurrentList()
+	if len(*list) == 0 {
+		return
+	}
+
+	findFrom := func(prefix string) int {
+		start := *idx + 1
+		for i := 0; i < len(*list); i++ {
+			j := (start + i) % len(*list)
+			name := strings.ToLower((*list)[j].Name)
+			if strings.HasPrefix(name, prefix) {
+				return j
+			}
+		}
+		return -1
+	}
+
+	if match := findFrom(m.typeJumpBuf); match >= 0 {
+		*idx = match
+		return
+	}
+
+	// Fallback: if multi-char prefix misses, try latest rune by itself.
+	last := strings.ToLower(string(r))
+	if match := findFrom(last); match >= 0 {
+		m.typeJumpBuf = last
+		*idx = match
+	}
+}
+
+// Apply saves the changes to LOCAL (.mcp.json), GLOBAL (Claude/Gemini config), and USER (~/.claude.json)
 func (m *MCPDialog) Apply() error {
-	log.Printf("[MCP-DEBUG] Apply() called - tool=%q, localChanged=%v, globalChanged=%v, projectPath=%q",
-		m.tool, m.localChanged, m.globalChanged, m.projectPath)
+	mcpDialogLog.Debug("mcp_apply_start",
+		slog.String("tool", m.tool),
+		slog.Bool("local_changed", m.localChanged),
+		slog.Bool("global_changed", m.globalChanged),
+		slog.Bool("user_changed", m.userChanged),
+		slog.String("project_path", m.projectPath))
 
 	if m.tool == "gemini" {
 		// Gemini: Only global scope, write to settings.json
@@ -400,6 +590,24 @@ func (m *MCPDialog) Apply() error {
 		session.ClearMCPCache(m.projectPath)
 	}
 
+	// Claude: Apply USER changes (affects ALL sessions!)
+	if m.userChanged {
+		// Get names of attached MCPs
+		enabledNames := make([]string, len(m.userAttached))
+		for i, item := range m.userAttached {
+			enabledNames[i] = item.Name
+		}
+
+		// Write to ~/.claude.json (ROOT config)
+		if err := session.WriteUserMCP(enabledNames); err != nil {
+			m.err = err
+			return err
+		}
+
+		// Clear MCP cache so preview updates
+		session.ClearMCPCache(m.projectPath)
+	}
+
 	return nil
 }
 
@@ -409,36 +617,50 @@ func (m *MCPDialog) Update(msg tea.KeyMsg) (*MCPDialog, tea.Cmd) {
 
 	switch msg.String() {
 	case "tab":
-		// Switch scope: LOCAL <-> GLOBAL (Claude only)
+		// Switch scope: LOCAL -> GLOBAL -> USER -> LOCAL (Claude only)
 		// Gemini only has global scope, so Tab does nothing
 		if m.tool != "gemini" {
-			if m.scope == MCPScopeLocal {
+			switch m.scope {
+			case MCPScopeLocal:
 				m.scope = MCPScopeGlobal
-			} else {
+			case MCPScopeGlobal:
+				m.scope = MCPScopeUser
+			case MCPScopeUser:
 				m.scope = MCPScopeLocal
 			}
 		}
+		m.resetTypeJump()
 
 	case "left", "h":
 		// Switch to Attached column
 		m.column = MCPColumnAttached
+		m.resetTypeJump()
 
 	case "right", "l":
 		// Switch to Available column
 		m.column = MCPColumnAvailable
+		m.resetTypeJump()
 
 	case "up", "k":
+		m.resetTypeJump()
 		if len(*list) > 0 && *idx > 0 {
 			*idx--
 		}
 
 	case "down", "j":
+		m.resetTypeJump()
 		if len(*list) > 0 && *idx < len(*list)-1 {
 			*idx++
 		}
 
 	case " ":
+		m.resetTypeJump()
 		m.Move()
+
+	default:
+		if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
+			m.typeJump(msg.Runes[0])
+		}
 	}
 
 	return m, nil
@@ -463,32 +685,55 @@ func (m *MCPDialog) View() string {
 		globalTab := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent).Render("[GLOBAL]")
 		tabs = "──────────────── " + globalTab + " ────────────────"
 	} else {
-		// Claude: Show LOCAL/GLOBAL tabs
+		// Claude: Show LOCAL/GLOBAL/USER tabs
 		localTab := "LOCAL"
 		globalTab := "GLOBAL"
-		if m.scope == MCPScopeLocal {
-			localTab = lipgloss.NewStyle().Bold(true).Foreground(ColorAccent).Render("[" + localTab + "]")
-			globalTab = lipgloss.NewStyle().Foreground(ColorTextDim).Render(" " + globalTab + " ")
-		} else {
-			localTab = lipgloss.NewStyle().Foreground(ColorTextDim).Render(" " + localTab + " ")
-			globalTab = lipgloss.NewStyle().Bold(true).Foreground(ColorAccent).Render("[" + globalTab + "]")
+		userTab := "USER"
+
+		localStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+		globalStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+		userStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+
+		switch m.scope {
+		case MCPScopeLocal:
+			localStyle = lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+			localTab = "[" + localTab + "]"
+			globalTab = " " + globalTab + " "
+			userTab = " " + userTab + " "
+		case MCPScopeGlobal:
+			globalStyle = lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+			localTab = " " + localTab + " "
+			globalTab = "[" + globalTab + "]"
+			userTab = " " + userTab + " "
+		case MCPScopeUser:
+			userStyle = lipgloss.NewStyle().Bold(true).Foreground(ColorYellow) // Yellow to indicate caution
+			localTab = " " + localTab + " "
+			globalTab = " " + globalTab + " "
+			userTab = "[" + userTab + "]"
 		}
-		tabs = localTab + " ───────────────────── " + globalTab
+
+		tabs = localStyle.Render(localTab) + " ─── " + globalStyle.Render(globalTab) + " ─── " + userStyle.Render(userTab)
 	}
 
 	// Get current scope's lists
 	var attached, available []MCPItem
 	var attachedIdx, availableIdx int
-	if m.scope == MCPScopeLocal {
+	switch m.scope {
+	case MCPScopeLocal:
 		attached = m.localAttached
 		available = m.localAvailable
 		attachedIdx = m.localAttachedIdx
 		availableIdx = m.localAvailableIdx
-	} else {
+	case MCPScopeGlobal:
 		attached = m.globalAttached
 		available = m.globalAvailable
 		attachedIdx = m.globalAttachedIdx
 		availableIdx = m.globalAvailableIdx
+	case MCPScopeUser:
+		attached = m.userAttached
+		available = m.userAvailable
+		attachedIdx = m.userAttachedIdx
+		availableIdx = m.userAvailableIdx
 	}
 
 	// Render columns
@@ -501,10 +746,19 @@ func (m *MCPDialog) View() string {
 	var scopeDesc string
 	if m.tool == "gemini" {
 		scopeDesc = DimStyle.Render("Writes to: ~/.gemini/settings.json")
-	} else if m.scope == MCPScopeLocal {
-		scopeDesc = DimStyle.Render("Writes to: .mcp.json (this project only)")
 	} else {
-		scopeDesc = DimStyle.Render("Writes to: Claude config (global + project-specific)")
+		switch m.scope {
+		case MCPScopeLocal:
+			if !session.GetManageMCPJson() {
+				scopeDesc = lipgloss.NewStyle().Foreground(ColorYellow).Render("⚠ .mcp.json management disabled (manage_mcp_json = false in config.toml)")
+			} else {
+				scopeDesc = DimStyle.Render("Writes to: .mcp.json (this project only)")
+			}
+		case MCPScopeGlobal:
+			scopeDesc = DimStyle.Render("Writes to: Claude config (profile-specific)")
+		case MCPScopeUser:
+			scopeDesc = lipgloss.NewStyle().Foreground(ColorYellow).Render("⚠ Writes to: ~/.claude.json (ALL sessions!)")
+		}
 	}
 
 	// Error display
@@ -517,9 +771,12 @@ func (m *MCPDialog) View() string {
 	hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	var hint string
 	if m.tool == "gemini" {
-		hint = hintStyle.Render("←→ column │ Space move │ Enter apply │ Esc cancel")
+		hint = hintStyle.Render("←→ column │ Type jump │ Space move │ Enter apply │ Esc cancel")
 	} else {
-		hint = hintStyle.Render("Tab scope │ ←→ column │ Space move │ Enter apply │ Esc cancel")
+		hint = hintStyle.Render("Tab scope │ ←→ column │ Type jump │ Space move │ Enter apply │ Esc cancel")
+	}
+	if m.typeJumpBuf != "" && time.Now().Before(m.typeJumpUntil) {
+		hint += lipgloss.NewStyle().Foreground(ColorTextDim).Render("  (" + m.typeJumpBuf + ")")
 	}
 
 	// Legend for orphan MCPs
@@ -542,6 +799,10 @@ func (m *MCPDialog) View() string {
 	if hasOrphans {
 		orphanLegend = lipgloss.NewStyle().Foreground(ColorYellow).Render("⚠ = not in config.toml (add to manage)")
 	}
+
+	// Transport legend
+	transportLegend := lipgloss.NewStyle().Foreground(ColorTextDim).Render(
+		"[S]=stdio  [H]=http  [E]=sse  ●=running  ○=external  ✗=stopped")
 
 	// Responsive dialog width
 	dialogWidth := 64
@@ -589,6 +850,7 @@ func (m *MCPDialog) View() string {
 	if orphanLegend != "" {
 		parts = append(parts, orphanLegend)
 	}
+	parts = append(parts, transportLegend)
 	parts = append(parts, "", hint)
 
 	dialogContent := lipgloss.JoinVertical(lipgloss.Left, parts...)
@@ -638,7 +900,7 @@ func (m *MCPDialog) renderColumn(title string, items []MCPItem, selectedIdx int,
 	header := headerStyle.Render("- " + title + " ")
 
 	// Pad header to column width
-	colWidth := 26
+	colWidth := 28
 	headerLen := len("- " + title + " ")
 	headerPad := colWidth - headerLen
 	if headerPad > 0 {
@@ -654,17 +916,41 @@ func (m *MCPDialog) renderColumn(title string, items []MCPItem, selectedIdx int,
 		lines = append(lines, emptyStyle.Render("  (empty)"))
 	} else {
 		for i, item := range items {
-			name := item.Name
-			// Add pool indicator for MCPs in socket pool
-			if item.IsPooled {
-				name = name + " 🔌"
+			// Build transport/status prefix
+			prefix := "[S]" // Default: stdio
+			switch item.Transport {
+			case "http":
+				prefix = "[H]"
+				// Add server status indicator for HTTP MCPs
+				switch item.HTTPStatus {
+				case "running":
+					prefix += "●" // Green dot for running
+				case "external":
+					prefix += "○" // Hollow dot for external
+				case "stopped":
+					prefix += "✗" // X for stopped
+				default:
+					prefix += " "
+				}
+			case "sse":
+				prefix = "[E]"
+			default:
+				// stdio - add pool indicator
+				if item.IsPooled {
+					prefix += "●" // Green dot for pooled
+				} else {
+					prefix += " "
+				}
 			}
+
+			name := prefix + " " + item.Name
+
 			// Add orphan indicator for MCPs not in config.toml
 			if item.IsOrphan {
 				name = name + " ⚠"
 			}
-			if len(name) > 20 {
-				name = name[:17] + "..."
+			if len(name) > 24 {
+				name = name[:21] + "..."
 			}
 
 			var line string
@@ -679,6 +965,12 @@ func (m *MCPDialog) renderColumn(title string, items []MCPItem, selectedIdx int,
 				// Orphan MCPs shown in yellow/warning color
 				line = lipgloss.NewStyle().
 					Foreground(ColorYellow).
+					Width(colWidth).
+					Render("   " + name)
+			} else if item.Transport == "http" || item.Transport == "sse" {
+				// HTTP/SSE MCPs get a subtle highlight
+				line = lipgloss.NewStyle().
+					Foreground(ColorPurple).
 					Width(colWidth).
 					Render("   " + name)
 			} else {

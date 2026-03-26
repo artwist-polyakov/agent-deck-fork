@@ -3,20 +3,39 @@ package session
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/docker"
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
+)
+
+var (
+	sessionLog                  = logging.ForComponent(logging.CompSession)
+	mcpLog                      = logging.ForComponent(logging.CompMCP)
+	codexSessionIDPathPatternRE = regexp.MustCompile(`/.codex/sessions/\S*/rollout-\S*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl`)
+	uuidPatternRE               = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	geminiPromptRE              = regexp.MustCompile(`^(>|>>>|\$|❯|➜|gemini>|✦)\s*$`)
+	shellPromptRE               = regexp.MustCompile(`^[\s]*(>|>>>|\$|❯|➜|#|%)\s*$`)
 )
 
 // Status represents the current state of a session
@@ -28,16 +47,46 @@ const (
 	StatusIdle     Status = "idle"
 	StatusError    Status = "error"
 	StatusStarting Status = "starting" // Session is being created (tmux initializing)
+	StatusStopped  Status = "stopped"  // Session intentionally stopped by user (not crashed)
+)
+
+const wrapperPlaceholder = "{command}"
+
+const (
+	hookFastPathWindow             = 2 * time.Minute
+	codexHookRunningFastPathWindow = 20 * time.Second
+	codexHookWaitingFastPathWindow = 2 * time.Minute
+	codexBootstrapScanInterval     = 2 * time.Second
+	codexRotationScanInterval      = 30 * time.Second
+	// codexProbeScanInterval rate-limits process-file probing to avoid
+	// repeated /proc and lsof scans on every status tick.
+	codexProbeScanInterval    = 2 * time.Second
+	codexProbeMissingSentinel = "__AGENT_DECK_MISSING_TOOL__"
 )
 
 // Instance represents a single agent/shell session
 type Instance struct {
-	ID             string    `json:"id"`
-	Title          string    `json:"title"`
-	ProjectPath    string    `json:"project_path"`
-	GroupPath      string    `json:"group_path"` // e.g., "projects/devops"
-	ParentSessionID string   `json:"parent_session_id,omitempty"` // Links to parent session (makes this a sub-session)
+	ID                string `json:"id"`
+	Title             string `json:"title"`
+	ProjectPath       string `json:"project_path"`
+	GroupPath         string `json:"group_path"`                    // e.g., "projects/devops"
+	Order             int    `json:"order"`                         // Position within group (for reorder persistence)
+	ParentSessionID   string `json:"parent_session_id,omitempty"`   // Links to parent session (makes this a sub-session)
+	ParentProjectPath string `json:"parent_project_path,omitempty"` // Parent's project path (for --add-dir access)
+
+	// Git worktree support
+	WorktreePath     string `json:"worktree_path,omitempty"`      // Path to worktree (if session is in worktree)
+	WorktreeRepoRoot string `json:"worktree_repo_root,omitempty"` // Original repo root
+	WorktreeBranch   string `json:"worktree_branch,omitempty"`    // Branch name in worktree
+
+	// Multi-repo support
+	MultiRepoEnabled   bool                `json:"multi_repo_enabled,omitempty"`
+	AdditionalPaths    []string            `json:"additional_paths,omitempty"`    // Paths beyond ProjectPath
+	MultiRepoTempDir   string              `json:"multi_repo_temp_dir,omitempty"` // Temp cwd for multi-repo sessions
+	MultiRepoWorktrees []MultiRepoWorktree `json:"multi_repo_worktrees,omitempty"`
+
 	Command        string    `json:"command"`
+	Wrapper        string    `json:"wrapper,omitempty"` // Optional wrapper command with {command} placeholder
 	Tool           string    `json:"tool"`
 	Status         Status    `json:"status"`
 	CreatedAt      time.Time `json:"created_at"`
@@ -48,8 +97,44 @@ type Instance struct {
 	ClaudeDetectedAt time.Time `json:"claude_detected_at,omitempty"`
 
 	// Gemini CLI integration
-	GeminiSessionID  string    `json:"gemini_session_id,omitempty"`
-	GeminiDetectedAt time.Time `json:"gemini_detected_at,omitempty"`
+	GeminiSessionID  string                  `json:"gemini_session_id,omitempty"`
+	GeminiDetectedAt time.Time               `json:"gemini_detected_at,omitempty"`
+	GeminiYoloMode   *bool                   `json:"gemini_yolo_mode,omitempty"` // Per-session override (nil = use global config)
+	GeminiModel      string                  `json:"gemini_model,omitempty"`     // Active model for this session
+	GeminiAnalytics  *GeminiSessionAnalytics `json:"gemini_analytics,omitempty"` // Per-session analytics
+
+	// OpenCode CLI integration
+	OpenCodeSessionID  string    `json:"opencode_session_id,omitempty"`
+	OpenCodeDetectedAt time.Time `json:"opencode_detected_at,omitempty"`
+	OpenCodeStartedAt  int64     `json:"-"` // Unix millis when we started OpenCode (for session matching, not persisted)
+
+	// Codex CLI integration
+	CodexSessionID   string    `json:"codex_session_id,omitempty"`
+	CodexDetectedAt  time.Time `json:"codex_detected_at,omitempty"`
+	CodexStartedAt   int64     `json:"-"` // Unix millis when we started Codex (for session matching, not persisted)
+	lastCodexScanAt  time.Time // Rate-limits expensive ~/.codex/sessions scans
+	lastCodexProbeAt time.Time // Rate-limits expensive Codex process-file probes
+	// pendingCodexRestartWarning is consumed by UI/CLI after Restart() succeeds.
+	// It is intentionally transient and never persisted.
+	pendingCodexRestartWarning string `json:"-"`
+
+	// Latest user input for context (extracted from session files)
+	LatestPrompt      string    `json:"latest_prompt,omitempty"`
+	Notes             string    `json:"notes,omitempty"`
+	lastPromptModTime time.Time // mtime cache for updateGeminiLatestPrompt (not serialized)
+
+	// JSONL tail-read cache: skip re-reading if file hasn't grown
+	lastJSONLSize int64
+	lastJSONLPath string
+	cachedPrompt  string
+
+	// Docker sandbox support.
+	Sandbox          *SandboxConfig `json:"sandbox,omitempty"`
+	SandboxContainer string         `json:"sandbox_container,omitempty"` // Container name when running in sandbox.
+
+	// SSH remote support
+	SSHHost       string `json:"ssh_host,omitempty"`
+	SSHRemotePath string `json:"ssh_remote_path,omitempty"`
 
 	// MCP tracking - which MCPs were loaded when session started/restarted
 	// Used to detect pending MCPs (added after session start) and stale MCPs (removed but still running)
@@ -61,15 +146,185 @@ type Instance struct {
 
 	tmuxSession *tmux.Session // Internal tmux session
 
+	// Hook-based status detection (set by StatusFileWatcher from Claude Code hooks)
+	hookStatus     string    // running, idle, waiting, dead (empty = no hook data)
+	hookSessionID  string    // Session ID from hook payload
+	hookLastUpdate time.Time // When hook status was last received
+
+	// mu protects fields written by backgroundStatusUpdate and read by the TUI goroutine.
+	// Use GetStatus()/SetStatus() and GetTool()/SetTool() for thread-safe access.
+	// UpdateStatus() acquires the write lock internally.
+	mu sync.RWMutex
+
 	// lastErrorCheck tracks when we last confirmed the session doesn't exist
 	// Used to skip expensive Exists() checks for ghost sessions (sessions in JSON but not in tmux)
 	// Not serialized - resets on load, but that's fine since we'll recheck on first poll
 	lastErrorCheck time.Time
 
+	// Tiered polling: skip expensive checks for idle sessions with no activity
+	lastIdleCheck     time.Time // When we last did a full check for an idle session
+	lastKnownActivity int64     // Last window_activity timestamp seen
+
 	// lastStartTime tracks when Start() was called
 	// Used to provide grace period for tmux session creation (prevents error flash)
 	// Not serialized - only relevant for current TUI session
 	lastStartTime time.Time
+
+	// Rate-limits expensive session metadata sync work (Claude/Gemini/Codex)
+	// that runs from UpdateStatus while this instance lock is held.
+	lastSessionMetaSync time.Time
+
+	// SkipMCPRegenerate skips .mcp.json regeneration on next Restart()
+	// Set by MCP dialog Apply() to avoid race condition where Apply writes
+	// config then Restart immediately overwrites it with different pool state
+	SkipMCPRegenerate bool `json:"-"` // Don't persist, transient flag
+}
+
+// SandboxConfig holds per-session Docker sandbox settings.
+type SandboxConfig struct {
+	// Enabled indicates the session runs inside a container.
+	Enabled bool `json:"enabled"`
+
+	// Image is the Docker image name (e.g. "ghcr.io/asheshgoplani/agent-deck-sandbox:latest").
+	Image string `json:"image"`
+
+	// CPULimit is the optional CPU quota for the container (e.g. "2.0").
+	CPULimit *string `json:"cpu_limit,omitempty"`
+
+	// MemoryLimit is the optional memory cap for the container (e.g. "4g").
+	MemoryLimit *string `json:"memory_limit,omitempty"`
+
+	// ExtraVolumes maps host paths to container paths for additional bind mounts.
+	ExtraVolumes map[string]string `json:"extra_volumes,omitempty"`
+}
+
+// resolveRealPath resolves symlinks to get the canonical path for comparison.
+// Falls back to the original path on error (e.g., path doesn't exist yet).
+func resolveRealPath(p string) string {
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real
+	}
+	return p
+}
+
+// DeduplicateDirnames returns unique directory names for the given paths.
+// When multiple paths share the same basename, a numeric suffix is appended (e.g., "src-1").
+func DeduplicateDirnames(paths []string) []string {
+	seen := make(map[string]int)
+	result := make([]string, len(paths))
+	for i, p := range paths {
+		dirname := filepath.Base(p)
+		if n := seen[dirname]; n > 0 {
+			result[i] = fmt.Sprintf("%s-%d", dirname, n)
+		} else {
+			result[i] = dirname
+		}
+		seen[dirname]++
+	}
+	return result
+}
+
+// MultiRepoWorktree tracks a worktree created for one repo in a multi-repo session.
+type MultiRepoWorktree struct {
+	OriginalPath string `json:"original_path"`
+	WorktreePath string `json:"worktree_path"`
+	RepoRoot     string `json:"repo_root"`
+	Branch       string `json:"branch"`
+}
+
+// IsMultiRepo returns true if this session has multi-repo mode enabled.
+func (inst *Instance) IsMultiRepo() bool {
+	return inst.MultiRepoEnabled
+}
+
+// AllProjectPaths returns all project paths: [ProjectPath] + AdditionalPaths.
+func (inst *Instance) AllProjectPaths() []string {
+	paths := []string{inst.ProjectPath}
+	paths = append(paths, inst.AdditionalPaths...)
+	return paths
+}
+
+// EffectiveWorkingDir returns the working directory for this session.
+// For multi-repo sessions, this is the temp dir; otherwise the ProjectPath.
+func (inst *Instance) EffectiveWorkingDir() string {
+	if inst.MultiRepoEnabled && inst.MultiRepoTempDir != "" {
+		return inst.MultiRepoTempDir
+	}
+	return inst.ProjectPath
+}
+
+// CleanupMultiRepoTempDir removes the multi-repo temporary directory.
+func (inst *Instance) CleanupMultiRepoTempDir() error {
+	if inst.MultiRepoTempDir == "" {
+		return nil
+	}
+	return os.RemoveAll(inst.MultiRepoTempDir)
+}
+
+// IsSandboxed returns true if this instance is configured to run in a Docker sandbox.
+func (inst *Instance) IsSandboxed() bool {
+	return inst.Sandbox != nil && inst.Sandbox.Enabled
+}
+
+// IsSSH returns true if this instance runs on a remote host via SSH.
+func (inst *Instance) IsSSH() bool {
+	return inst.SSHHost != ""
+}
+
+// NewSandboxConfig builds a SandboxConfig from CLI flags and user settings.
+// imageOverride takes precedence; when empty the global default image is used.
+// CPU and memory limits are applied from DockerSettings when configured.
+func NewSandboxConfig(imageOverride string) *SandboxConfig {
+	dockerSettings := GetDockerSettings()
+	image := dockerSettings.DefaultImage
+	if imageOverride != "" {
+		image = imageOverride
+	}
+	if image == "" {
+		image = docker.DefaultImage()
+	}
+	cfg := &SandboxConfig{
+		Enabled: true,
+		Image:   image,
+	}
+	if dockerSettings.CPULimit != "" {
+		cfg.CPULimit = &dockerSettings.CPULimit
+	}
+	if dockerSettings.MemoryLimit != "" {
+		cfg.MemoryLimit = &dockerSettings.MemoryLimit
+	}
+	return cfg
+}
+
+// GetStatusThreadSafe returns the session status with read-lock protection.
+// Use this when reading Status from a goroutine concurrent with backgroundStatusUpdate.
+func (inst *Instance) GetStatusThreadSafe() Status {
+	inst.mu.RLock()
+	s := inst.Status
+	inst.mu.RUnlock()
+	return s
+}
+
+// SetStatusThreadSafe sets the session status with write-lock protection.
+func (inst *Instance) SetStatusThreadSafe(s Status) {
+	inst.mu.Lock()
+	inst.Status = s
+	inst.mu.Unlock()
+}
+
+// GetToolThreadSafe returns the tool name with read-lock protection.
+func (inst *Instance) GetToolThreadSafe() string {
+	inst.mu.RLock()
+	t := inst.Tool
+	inst.mu.RUnlock()
+	return t
+}
+
+// SetToolThreadSafe sets the tool name with write-lock protection.
+func (inst *Instance) SetToolThreadSafe(t string) {
+	inst.mu.Lock()
+	inst.Tool = t
+	inst.mu.Unlock()
 }
 
 // MarkAccessed updates the LastAccessedAt timestamp to now
@@ -90,9 +345,27 @@ func (inst *Instance) GetLastActivityTime() time.Time {
 	return inst.CreatedAt
 }
 
+// GetWaitingSince returns when the session transitioned to waiting status
+// Used for sorting notification bar (newest waiting sessions first)
+func (inst *Instance) GetWaitingSince() time.Time {
+	if inst.tmuxSession != nil {
+		waitingSince := inst.tmuxSession.GetWaitingSince()
+		if !waitingSince.IsZero() {
+			return waitingSince
+		}
+	}
+	// Fallback to CreatedAt if no waiting time tracked
+	return inst.CreatedAt
+}
+
 // IsSubSession returns true if this session has a parent
 func (inst *Instance) IsSubSession() bool {
 	return inst.ParentSessionID != ""
+}
+
+// IsWorktree returns true if this session is running in a git worktree
+func (inst *Instance) IsWorktree() bool {
+	return inst.WorktreePath != ""
 }
 
 // SetParent sets the parent session ID
@@ -100,22 +373,35 @@ func (inst *Instance) SetParent(parentID string) {
 	inst.ParentSessionID = parentID
 }
 
+// SetParentWithPath sets both parent session ID and parent's project path
+// The project path is used to grant subagent access via --add-dir
+func (inst *Instance) SetParentWithPath(parentID, parentProjectPath string) {
+	inst.ParentSessionID = parentID
+	inst.ParentProjectPath = parentProjectPath
+}
+
 // ClearParent removes the parent session link
 func (inst *Instance) ClearParent() {
 	inst.ParentSessionID = ""
+	inst.ParentProjectPath = ""
 }
 
 // NewInstance creates a new session instance
 func NewInstance(title, projectPath string) *Instance {
+	id := generateID()
+	tmuxSess := tmux.NewSession(title, projectPath)
+	tmuxSess.InstanceID = id // Pass instance ID for activity hooks
+	tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
+
 	return &Instance{
-		ID:          generateID(),
+		ID:          id,
 		Title:       title,
 		ProjectPath: projectPath,
 		GroupPath:   extractGroupPath(projectPath), // Auto-assign group from path
 		Tool:        "shell",
 		Status:      StatusIdle,
 		CreatedAt:   time.Now(),
-		tmuxSession: tmux.NewSession(title, projectPath),
+		tmuxSession: tmuxSess,
 	}
 }
 
@@ -128,15 +414,20 @@ func NewInstanceWithGroup(title, projectPath, groupPath string) *Instance {
 
 // NewInstanceWithTool creates a new session with tool-specific initialization
 func NewInstanceWithTool(title, projectPath, tool string) *Instance {
+	id := generateID()
+	tmuxSess := tmux.NewSession(title, projectPath)
+	tmuxSess.InstanceID = id // Pass instance ID for activity hooks
+	tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
+
 	inst := &Instance{
-		ID:          generateID(),
+		ID:          id,
 		Title:       title,
 		ProjectPath: projectPath,
 		GroupPath:   extractGroupPath(projectPath),
 		Tool:        tool,
 		Status:      StatusIdle,
 		CreatedAt:   time.Now(),
-		tmuxSession: tmux.NewSession(title, projectPath),
+		tmuxSession: tmuxSess,
 	}
 
 	// Claude session ID will be detected from files Claude creates
@@ -176,26 +467,18 @@ func extractGroupPath(projectPath string) string {
 // buildClaudeCommand builds the claude command with session capture
 // For new sessions: captures session ID via print mode, stores in tmux env, then resumes
 // This ensures we always know the session ID for fork/restart features
-// Respects: CLAUDE_CONFIG_DIR, dangerous_mode from user config
+// Respects: CLAUDE_CONFIG_DIR, dangerous_mode from user config, and [shell].env_files
 func (i *Instance) buildClaudeCommand(baseCommand string) string {
-	return i.buildClaudeCommandWithMessage(baseCommand, "")
+	envPrefix := i.buildEnvSourceCommand()
+	cmd := i.buildClaudeCommandWithMessage(baseCommand, "")
+	return envPrefix + cmd
 }
 
 // buildClaudeCommandWithMessage builds the command with optional initial message
 // Respects ClaudeOptions from instance if set, otherwise falls back to config defaults
 func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) string {
-	if i.Tool != "claude" {
+	if !IsClaudeCompatible(i.Tool) {
 		return baseCommand
-	}
-
-	// Check if CLAUDE_CONFIG_DIR is explicitly configured (env var or config.toml)
-	// If NOT explicit, we don't set it in the command - let the shell's environment handle it.
-	// This is critical for WSL and other environments where users have CLAUDE_CONFIG_DIR
-	// set in their .bashrc/.zshrc - we should NOT override that with a default path.
-	configDirPrefix := ""
-	if IsClaudeConfigDirExplicit() {
-		configDir := GetClaudeConfigDir()
-		configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 	}
 
 	// Get options - either from instance or create defaults from config
@@ -206,24 +489,53 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 		opts = NewClaudeOptions(userConfig)
 	}
 
+	claudeCmd, hasCustomCommand := resolveClaudeLaunchCommand(opts)
+
+	// Check if CLAUDE_CONFIG_DIR is explicitly configured (env var or config.toml)
+	// If NOT explicit, we don't set it in the command - let the shell's environment handle it.
+	// This is critical for WSL and other environments where users have CLAUDE_CONFIG_DIR
+	// set in their .bashrc/.zshrc - we should NOT override that with a default path.
+	// Also skip if using a custom command alias (alias handles config dir).
+	configDirPrefix := ""
+	if !hasCustomCommand && IsClaudeConfigDirExplicit() {
+		configDir := GetClaudeConfigDir()
+		configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
+	}
+
+	// AGENTDECK_INSTANCE_ID is set as an inline env var so Claude's hook subprocesses
+	// can identify which agent-deck session they belong to.
+	instanceIDPrefix := fmt.Sprintf("AGENTDECK_INSTANCE_ID=%s ", i.ID)
+	configDirPrefix = instanceIDPrefix + configDirPrefix
+
 	// If baseCommand is just "claude", build the appropriate command
 	if baseCommand == "claude" {
-		// Build extra flags string from options
+		// Build extra flags string from options (includes --add-dir if ParentProjectPath set)
 		extraFlags := i.buildClaudeExtraFlags(opts)
 
 		// Handle different session modes
 		switch opts.SessionMode {
 		case "continue":
 			// Simple -c mode: continue last session
-			return fmt.Sprintf(`%sclaude -c%s`, configDirPrefix, extraFlags)
+			return fmt.Sprintf(`%s%s -c%s`, configDirPrefix, claudeCmd, extraFlags)
 
 		case "resume":
 			// Resume specific session by ID
 			if opts.ResumeSessionID != "" {
-				return fmt.Sprintf(`%sclaude --resume %s%s`,
-					configDirPrefix, opts.ResumeSessionID, extraFlags)
+				// Check if session has actual conversation data
+				if sessionHasConversationData(opts.ResumeSessionID, i.ProjectPath) {
+					// Session has conversation history - use normal --resume
+					return fmt.Sprintf(`%s%s --resume %s%s`,
+						configDirPrefix, claudeCmd, opts.ResumeSessionID, extraFlags)
+				}
+				// Session was never interacted with - use --session-id with same UUID.
+				// CLAUDE_SESSION_ID is propagated via host-side SyncSessionIDsToTmux after start.
+				bashExportPrefix := i.buildBashExportPrefix()
+				return fmt.Sprintf(
+					`%s%s --session-id "%s"%s`,
+					bashExportPrefix, claudeCmd, opts.ResumeSessionID, extraFlags)
 			}
-			// Fall through to default if no ID provided
+			// No session ID provided - use -r flag for interactive picker
+			return fmt.Sprintf(`%s%s -r%s`, configDirPrefix, claudeCmd, extraFlags)
 		}
 
 		// Default: new session with capture-resume pattern
@@ -231,32 +543,41 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 		// 2. Stores session ID in tmux environment (if capture succeeded)
 		// 3. Resumes that session interactively
 		// Fallback ensures Claude starts (without fork/restart support) rather than failing completely
-		var baseCmd string
-		baseCmd = fmt.Sprintf(
-			`session_id=$(%sclaude -p "." --output-format json 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; `+
-				`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
-				`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
-				`%sclaude --resume "$session_id"%s; `+
-				`else %sclaude%s; fi`,
-			configDirPrefix, configDirPrefix, extraFlags, configDirPrefix, extraFlags)
+		//
+		// NOTE: These commands get wrapped in `bash -c` for fish compatibility (#47),
+		// so shell aliases won't work — but real binaries/scripts are fine.
+		//
+		bashExportPrefix := i.buildBashExportPrefix()
 
-		// If message provided, append wait-and-send logic
+		// Pre-generate UUID in Go to avoid shell uuidgen (may be absent in Docker sandbox).
+		// CLAUDE_SESSION_ID is also propagated via host-side SetEnvironment after tmux start.
+		// Use `exec` before the final claude invocation so that when this compound
+		// command is wrapped in `bash -c` (for fish compatibility), exec replaces
+		// the bash process with claude, enabling proper job control (Ctrl+Z suspend / fg resume).
+		sessionUUID := generateUUID()
+		i.ClaudeSessionID = sessionUUID
+
+		var baseCmd string
+		// Use pre-generated literal UUID with --session-id flag.
+		// CLAUDE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+		baseCmd = fmt.Sprintf(
+			`%sexec %s --session-id "%s"%s`,
+			bashExportPrefix, claudeCmd, sessionUUID, extraFlags)
+
+		// If message provided, append wait-and-send logic in background.
 		if message != "" {
 			// Escape single quotes in message for bash
 			escapedMsg := strings.ReplaceAll(message, "'", "'\"'\"'")
 
-			// Run wait-and-send in background, keep Claude in foreground
-			// The wait loop runs in a subshell that polls for ">" prompt (Claude's input prompt)
-			// Once detected, sends the message via tmux send-keys (text + Enter separately)
-			// Note: wait-and-send works regardless of session capture (Claude shows ">" prompt either way)
+			// The background subshell runs independently; exec replaces
+			// the current shell with claude for proper job control.
 			baseCmd = fmt.Sprintf(
-				`session_id=$(%sclaude -p "." --output-format json 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; `+
-					`(sleep 2; SESSION_NAME=$(tmux display-message -p '#S'); while ! tmux capture-pane -p -t "$SESSION_NAME" | tail -5 | grep -qE "^>"; do sleep 0.2; done; tmux send-keys -l -t "$SESSION_NAME" '%s'; tmux send-keys -t "$SESSION_NAME" Enter) & `+
-					`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
-					`tmux set-environment CLAUDE_SESSION_ID "$session_id"; `+
-					`%sclaude --resume "$session_id"%s; `+
-					`else %sclaude%s; fi`,
-				configDirPrefix, escapedMsg, configDirPrefix, extraFlags, configDirPrefix, extraFlags)
+				`(sleep 2; SESSION_NAME=$(tmux display-message -p '#S'); `+
+					`while ! tmux capture-pane -p -t "$SESSION_NAME" | tail -5 | grep -qE "^>"; do sleep 0.2; done; `+
+					`tmux send-keys -l -t "$SESSION_NAME" -- '%s' \; send-keys -t "$SESSION_NAME" Enter) & `+
+					`%sexec %s --session-id "%s"%s`,
+				escapedMsg,
+				bashExportPrefix, claudeCmd, sessionUUID, extraFlags)
 		}
 
 		return baseCmd
@@ -266,19 +587,83 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	return baseCommand
 }
 
-// buildClaudeExtraFlags builds extra command-line flags string from ClaudeOptions
-func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
+func resolveClaudeLaunchCommand(opts *ClaudeOptions) (cmd string, hasCustomCommand bool) {
 	if opts == nil {
-		return ""
+		userConfig, _ := LoadUserConfig()
+		opts = NewClaudeOptions(userConfig)
 	}
 
+	configuredCmd := GetClaudeCommand()
+	if configuredCmd == "" {
+		configuredCmd = "claude"
+	}
+
+	hasCustomCommand = configuredCmd != "claude"
+	if hasCustomCommand {
+		return configuredCmd, true
+	}
+
+	if opts != nil {
+		if opts.UseHappy {
+			return "happy", false
+		}
+		return configuredCmd, false
+	}
+
+	return configuredCmd, false
+}
+
+// buildBashExportPrefix builds the export prefix used in bash -c commands.
+// It always exports AGENTDECK_INSTANCE_ID, and conditionally adds CLAUDE_CONFIG_DIR.
+func (i *Instance) buildBashExportPrefix() string {
+	prefix := fmt.Sprintf("export AGENTDECK_INSTANCE_ID=%s; ", i.ID)
+	if IsClaudeConfigDirExplicit() {
+		prefix += fmt.Sprintf("export CLAUDE_CONFIG_DIR=%s; ", GetClaudeConfigDir())
+	}
+	return prefix
+}
+
+// buildClaudeExtraFlags builds extra command-line flags string from ClaudeOptions
+// Also handles instance-level flags like --add-dir for subagent access
+func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 	var flags []string
 
-	if opts.SkipPermissions {
-		flags = append(flags, "--dangerously-skip-permissions")
+	// Instance-level flags (not from ClaudeOptions)
+	// --add-dir: Grant subagent access to parent's project directory (for worktrees, etc.)
+	if i.ParentProjectPath != "" {
+		flags = append(flags, fmt.Sprintf("--add-dir %s", i.ParentProjectPath))
 	}
-	if opts.UseChrome {
-		flags = append(flags, "--chrome")
+
+	// Multi-repo: pass all project paths via --add-dir (deduplicated, excluding cwd)
+	if i.MultiRepoEnabled {
+		seen := make(map[string]bool)
+		if i.ParentProjectPath != "" {
+			seen[resolveRealPath(i.ParentProjectPath)] = true // already added above
+		}
+		seen[resolveRealPath(i.EffectiveWorkingDir())] = true // exclude cwd
+		for _, p := range i.AllProjectPaths() {
+			real := resolveRealPath(p)
+			if seen[real] {
+				continue
+			}
+			seen[real] = true
+			flags = append(flags, fmt.Sprintf("--add-dir %s", p))
+		}
+	}
+
+	// Options-level flags
+	if opts != nil {
+		if opts.SkipPermissions {
+			flags = append(flags, "--dangerously-skip-permissions")
+		} else if opts.AllowSkipPermissions {
+			flags = append(flags, "--allow-dangerously-skip-permissions")
+		}
+		if opts.UseChrome {
+			flags = append(flags, "--chrome")
+		}
+		if opts.UseTeammateMode {
+			flags = append(flags, "--teammate-mode tmux")
+		}
 	}
 
 	if len(flags) == 0 {
@@ -292,37 +677,1203 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 // For sessions with known ID: uses simple resume
 // This ensures we always know the session ID for restart features
 // VERIFIED: gemini --output-format stream-json provides immediate session ID in first message
+// Also sources .env files from [shell].env_files and [gemini].env_file
 func (i *Instance) buildGeminiCommand(baseCommand string) string {
 	if i.Tool != "gemini" {
 		return baseCommand
+	}
+
+	envPrefix := i.buildEnvSourceCommand()
+
+	// Determine if YOLO mode is enabled (per-session overrides global config)
+	yoloMode := false
+	if i.GeminiYoloMode != nil {
+		yoloMode = *i.GeminiYoloMode
+	} else {
+		// Check global config
+		userConfig, _ := LoadUserConfig()
+		if userConfig != nil {
+			yoloMode = userConfig.Gemini.YoloMode
+		}
+	}
+
+	yoloFlag := ""
+	if yoloMode {
+		yoloFlag = " --yolo"
+	}
+
+	// Determine model flag
+	modelFlag := ""
+	if i.GeminiModel != "" {
+		modelFlag = " --model " + i.GeminiModel
+	} else if i.GeminiSessionID == "" {
+		// Only apply default model for NEW sessions (not resumes)
+		userConfig, _ := LoadUserConfig()
+		if userConfig != nil && userConfig.Gemini.DefaultModel != "" {
+			modelFlag = " --model " + userConfig.Gemini.DefaultModel
+		}
 	}
 
 	// If baseCommand is just "gemini", handle specially
 	if baseCommand == "gemini" {
 		// If we already have a session ID, use simple resume
 		if i.GeminiSessionID != "" {
-			return fmt.Sprintf("gemini --resume %s", i.GeminiSessionID)
+			// GEMINI_YOLO_MODE and GEMINI_SESSION_ID are propagated via host-side
+			// SetEnvironment after tmux start. No inline tmux set-environment.
+			return envPrefix + fmt.Sprintf(
+				"gemini --resume %s%s%s",
+				i.GeminiSessionID,
+				yoloFlag,
+				modelFlag,
+			)
 		}
 
-		// Build the capture-resume command for new sessions with fallback
-		// This command:
-		// 1. Runs Gemini with a minimal prompt "." to completion (saves session to disk)
-		// 2. Extracts session_id from the JSON output
-		// 3. Stores session ID in tmux environment (for retrieval by agent-deck)
-		// 4. Resumes that session interactively
-		// Fallback: If capture fails (jq not installed, auth issues), start Gemini fresh
-		// NOTE: Using --output-format json (not stream-json with head -1) because:
-		// - head -1 sends SIGPIPE which kills Gemini before it saves the session
-		// - json mode runs to completion, ensuring session file is written
-		return `session_id=$(gemini --output-format json "." 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; ` +
-			`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then ` +
-			`tmux set-environment GEMINI_SESSION_ID "$session_id"; ` +
-			`gemini --resume "$session_id"; ` +
-			`else gemini; fi`
+		// Start Gemini fresh - session ID will be captured when user interacts
+		// The previous capture-resume approach (gemini --output-format json ".") would hang
+		// because Gemini processes the "." prompt which takes too long
+		// GEMINI_YOLO_MODE is propagated via host-side SetEnvironment after tmux start.
+		return envPrefix + fmt.Sprintf(
+			`gemini%s%s`,
+			yoloFlag,
+			modelFlag,
+		)
 	}
 
 	// For custom commands (e.g., resume commands), return as-is
-	return baseCommand
+	return envPrefix + baseCommand
+}
+
+// buildOpenCodeCommand builds the command for OpenCode CLI
+// OpenCode stores sessions in ~/.local/share/opencode/storage/session/
+// Session IDs are in format: ses_XXXXX
+// Resume: opencode -s <session-id> or opencode --session <session-id>
+// Continue last: opencode -c or opencode --continue
+// Model: opencode -m provider/model
+// Agent: opencode --agent name
+// Also sources .env files from [shell].env_files
+func (i *Instance) buildOpenCodeCommand(baseCommand string) string {
+	if i.Tool != "opencode" {
+		return baseCommand
+	}
+
+	envPrefix := i.buildEnvSourceCommand()
+
+	// If baseCommand is just "opencode", handle specially
+	if baseCommand == "opencode" {
+		extraFlags := i.buildOpenCodeExtraFlags()
+
+		// If we already have a session ID, use resume with -s flag.
+		// OPENCODE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+		if i.OpenCodeSessionID != "" {
+			return envPrefix + fmt.Sprintf("opencode -s %s%s",
+				i.OpenCodeSessionID, extraFlags)
+		}
+
+		// Start OpenCode fresh - session ID will be captured async after startup
+		return envPrefix + "opencode" + extraFlags
+	}
+
+	// For custom commands (e.g., fork commands), return as-is
+	return envPrefix + baseCommand
+}
+
+// buildOpenCodeExtraFlags returns extra CLI flags from OpenCodeOptions (model, agent).
+// Returns a string with leading space, or empty string if no flags.
+func (i *Instance) buildOpenCodeExtraFlags() string {
+	opts := i.GetOpenCodeOptions()
+	if opts == nil {
+		// Fall back to global config defaults
+		if config, err := LoadUserConfig(); err == nil && config != nil {
+			opts = NewOpenCodeOptions(config)
+		}
+	}
+	if opts == nil {
+		return ""
+	}
+
+	var flags string
+	if opts.Model != "" {
+		flags += " -m " + opts.Model
+	}
+	if opts.Agent != "" {
+		flags += " --agent " + opts.Agent
+	}
+	return flags
+}
+
+// DetectOpenCodeSession is the public wrapper for async OpenCode session detection
+// Call this for restored sessions that don't have a session ID yet
+func (i *Instance) DetectOpenCodeSession() {
+	i.detectOpenCodeSessionAsync()
+}
+
+// resolveCodexYoloFlag returns " --yolo" if yolo mode is enabled
+// (per-session override > global config), or "".
+func (i *Instance) resolveCodexYoloFlag() string {
+	opts := i.GetCodexOptions()
+	if opts != nil && opts.YoloMode != nil {
+		if *opts.YoloMode {
+			return " --yolo"
+		}
+		return ""
+	}
+	// Fallback to global config
+	if config, err := LoadUserConfig(); err == nil && config != nil {
+		if config.Codex.YoloMode {
+			return " --yolo"
+		}
+	}
+	return ""
+}
+
+func (i *Instance) resolveCodexUseHappy() bool {
+	opts := i.GetCodexOptions()
+	if opts != nil && opts.UseHappy != nil {
+		return *opts.UseHappy
+	}
+	if config, err := LoadUserConfig(); err == nil && config != nil {
+		return config.Codex.UseHappy
+	}
+	return false
+}
+
+// Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
+// Resume: codex resume <session-id> or codex resume --last
+// Also sources .env files from [shell].env_files
+func (i *Instance) buildCodexCommand(baseCommand string) string {
+	if i.Tool != "codex" {
+		return baseCommand
+	}
+
+	envPrefix := i.buildEnvSourceCommand()
+	agentdeckEnvPrefix := fmt.Sprintf("AGENTDECK_INSTANCE_ID=%s AGENTDECK_TITLE=%q AGENTDECK_TOOL=%s ",
+		i.ID, i.Title, i.Tool)
+	envPrefix += agentdeckEnvPrefix
+
+	yoloFlag := i.resolveCodexYoloFlag()
+	codexCmd := "codex"
+	if i.resolveCodexUseHappy() {
+		codexCmd = "happy codex"
+	}
+
+	// If baseCommand is just "codex", handle specially
+	if baseCommand == "codex" {
+		// If we already have a session ID, use resume.
+		// CODEX_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+		if i.CodexSessionID != "" {
+			return envPrefix + fmt.Sprintf("%s%s resume %s",
+				codexCmd, yoloFlag, i.CodexSessionID)
+		}
+
+		// Start Codex fresh - session ID will be captured async after startup
+		return envPrefix + codexCmd + yoloFlag
+	}
+
+	// For custom commands (e.g., resume commands), preserve env propagation.
+	return envPrefix + baseCommand
+}
+
+// detectOpenCodeSessionAsync detects the OpenCode session ID after startup
+// OpenCode generates session IDs internally (format: ses_XXXXX)
+// We query "opencode session list --format json" and match by project directory,
+// picking the most recently updated session (since OpenCode auto-resumes the last session)
+func (i *Instance) detectOpenCodeSessionAsync() {
+	time.Sleep(1 * time.Second)
+
+	// Phase 1: Quick detection for existing sessions (5 attempts over ~15s)
+	quickDelays := []time.Duration{0, 2 * time.Second, 3 * time.Second, 4 * time.Second, 5 * time.Second}
+
+	for attempt, delay := range quickDelays {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+
+		if sessionID := i.queryOpenCodeSession(); sessionID != "" {
+			i.setOpenCodeSession(sessionID)
+			sessionLog.Debug(
+				"opencode_session_detected",
+				slog.String("session_id", sessionID),
+				slog.String("phase", "quick"),
+				slog.Int("attempt", attempt+1),
+			)
+			return
+		}
+
+		sessionLog.Debug(
+			"opencode_session_not_found",
+			slog.Int("attempt", attempt+1),
+			slog.Int("total", len(quickDelays)),
+		)
+	}
+
+	// Phase 2: Long-running background watcher for new sessions
+	// OpenCode only persists new sessions after significant user activity
+	go i.watchForOpenCodeSession()
+}
+
+// watchForOpenCodeSession polls for session creation over an extended period.
+// New sessions may take minutes to be persisted by OpenCode.
+func (i *Instance) watchForOpenCodeSession() {
+	const (
+		pollInterval = 10 * time.Second
+		maxDuration  = 5 * time.Minute
+	)
+
+	deadline := time.Now().Add(maxDuration)
+	attempt := 0
+
+	for time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+		attempt++
+
+		if i.OpenCodeSessionID != "" {
+			sessionLog.Debug("opencode_watcher_already_set")
+			return
+		}
+
+		if sessionID := i.queryOpenCodeSession(); sessionID != "" {
+			i.setOpenCodeSession(sessionID)
+			sessionLog.Debug(
+				"opencode_watcher_detected",
+				slog.String("session_id", sessionID),
+				slog.Int("attempt", attempt),
+			)
+			return
+		}
+
+		sessionLog.Debug("opencode_watcher_not_found", slog.Int("attempt", attempt))
+	}
+
+	sessionLog.Debug("opencode_watcher_timeout", slog.Duration("max_duration", maxDuration))
+}
+
+// setOpenCodeSession sets the session ID and stores it in tmux environment.
+func (i *Instance) setOpenCodeSession(sessionID string) {
+	i.OpenCodeSessionID = sessionID
+	i.OpenCodeDetectedAt = time.Now()
+
+	if i.tmuxSession != nil {
+		if err := i.tmuxSession.SetEnvironment("OPENCODE_SESSION_ID", sessionID); err != nil {
+			sessionLog.Warn("opencode_set_env_failed", slog.String("error", err.Error()))
+		}
+	}
+}
+
+// queryOpenCodeSession queries OpenCode CLI for session matching our project directory
+// OpenCode automatically resumes the most recent session for a directory, so we
+// simply find the most recently updated session matching our project path.
+func (i *Instance) queryOpenCodeSession() string {
+	// Run: opencode session list --format json
+	cmd := exec.Command("opencode", "session", "list", "--format", "json")
+	cmd.Dir = i.ProjectPath
+
+	sessionLog.Debug("opencode_query_sessions", slog.String("dir", i.ProjectPath))
+
+	output, err := cmd.Output()
+	if err != nil {
+		sessionLog.Debug("opencode_query_failed", slog.String("error", err.Error()))
+		return ""
+	}
+
+	sessionLog.Debug("opencode_session_data_size", slog.Int("bytes", len(output)))
+
+	// Parse JSON response
+	// Expected format: array of session objects with id, directory, created, updated fields
+	var sessions []struct {
+		ID        string `json:"id"`
+		Directory string `json:"directory"`
+		Path      string `json:"path"`    // Some versions use path instead of directory
+		Created   int64  `json:"created"` // Unix timestamp (milliseconds)
+		Updated   int64  `json:"updated"` // Unix timestamp (milliseconds) - when last active
+	}
+
+	if err := json.Unmarshal(output, &sessions); err != nil {
+		sessionLog.Debug("opencode_parse_failed", slog.String("error", err.Error()))
+		return ""
+	}
+
+	sessionLog.Debug("opencode_parsed_sessions", slog.Int("count", len(sessions)))
+
+	// Find the most recently updated session matching our project path
+	// OpenCode auto-resumes the most recent session when you run `opencode` in a directory,
+	// so we track that same session (no startTime check needed)
+	projectPath := i.ProjectPath
+
+	var bestMatch string
+	var bestMatchTime int64
+
+	for _, sess := range sessions {
+		// Check directory match (normalize paths)
+		sessDir := sess.Directory
+		if sessDir == "" {
+			sessDir = sess.Path
+		}
+
+		normalizedSessDir := normalizePath(sessDir)
+		normalizedProjectPath := normalizePath(projectPath)
+
+		sessionLog.Debug(
+			"opencode_session_compare",
+			slog.String("session_id", sess.ID),
+			slog.String("sess_dir", sessDir),
+			slog.String("project_path", projectPath),
+			slog.Int64("created", sess.Created),
+			slog.Int64("updated", sess.Updated),
+		)
+
+		// Normalize both paths for comparison
+		if sessDir == "" || normalizedSessDir != normalizedProjectPath {
+			sessionLog.Debug("opencode_session_dir_mismatch", slog.String("session_id", sess.ID))
+			continue
+		}
+
+		// Pick the most recently updated session for this directory
+		updatedAt := sess.Updated
+		if updatedAt == 0 {
+			updatedAt = sess.Created // Fallback to created if updated not available
+		}
+
+		sessionLog.Debug(
+			"opencode_session_dir_match",
+			slog.String("session_id", sess.ID),
+			slog.Int64("updated", updatedAt),
+		)
+
+		if bestMatch == "" || updatedAt > bestMatchTime {
+			bestMatch = sess.ID
+			bestMatchTime = updatedAt
+		}
+	}
+
+	sessionLog.Debug("opencode_best_match", slog.String("session_id", bestMatch), slog.Int64("updated", bestMatchTime))
+	return bestMatch
+}
+
+// normalizePath normalizes a file path for comparison
+func normalizePath(p string) string {
+	// Expand home directory
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = strings.Replace(p, "~", home, 1)
+		}
+	}
+
+	// Clean the path
+	p = filepath.Clean(p)
+
+	// Resolve symlinks if possible
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+
+	return p
+}
+
+// DetectCodexSession is the public wrapper for async Codex session detection
+// Call this for restored sessions that don't have a session ID yet
+func (i *Instance) DetectCodexSession() {
+	i.detectCodexSessionAsync()
+}
+
+// detectCodexSessionAsync detects the Codex session ID after startup
+// Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
+// Session ID is a UUID that can be extracted from the filename
+// Since Codex has no "session list" command, we scan the filesystem
+func (i *Instance) detectCodexSessionAsync() {
+	// Brief wait for Codex to initialize
+	time.Sleep(1 * time.Second)
+
+	// Try up to 3 times with short delays
+	delays := []time.Duration{0, 1 * time.Second, 2 * time.Second}
+
+	for attempt, delay := range delays {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+
+		sessionID, _ := i.queryCodexSessionFromProcessFiles()
+		if sessionID == "" {
+			sessionID = i.queryCodexSession(i.collectOtherCodexSessionIDs(), true)
+		}
+		if sessionID != "" {
+			i.CodexSessionID = sessionID
+			i.CodexDetectedAt = time.Now()
+
+			// Store in tmux environment for restart
+			if i.tmuxSession != nil {
+				if err := i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID); err != nil {
+					sessionLog.Warn("codex_set_env_failed", slog.String("error", err.Error()))
+				}
+			}
+
+			sessionLog.Debug(
+				"codex_session_detected",
+				slog.String("session_id", sessionID),
+				slog.Int("attempt", attempt+1),
+			)
+			return
+		}
+
+		sessionLog.Debug("codex_session_not_found", slog.Int("attempt", attempt+1), slog.Int("total", len(delays)))
+	}
+
+	sessionLog.Warn("codex_detection_failed", slog.Int("attempts", len(delays)))
+}
+
+func getCodexHomeDir() string {
+	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+		return codexHome
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), ".codex")
+	}
+	return filepath.Join(home, ".codex")
+}
+
+// queryCodexSession scans Codex sessions and returns the best candidate.
+// Selection strategy:
+//  1. Prefer sessions whose JSONL metadata matches this instance's project path.
+//  2. Optionally allow unscoped fallback (no cwd metadata) for initial bootstrap.
+func (i *Instance) queryCodexSession(excludeIDs map[string]bool, allowUnscoped bool) string {
+	sessionsDir := filepath.Join(getCodexHomeDir(), "sessions")
+	if _, err := os.Stat(sessionsDir); os.IsNotExist(err) {
+		return ""
+	}
+
+	uuidPattern := uuidPatternRE
+
+	var bestScopedID string
+	var bestScopedTime time.Time
+	var bestUnscopedID string
+	var bestUnscopedTime time.Time
+
+	normalizedProjectPath := normalizePath(i.ProjectPath)
+
+	err := filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // Skip errors
+		}
+
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+
+		sessionID := uuidPattern.FindString(d.Name())
+		if sessionID == "" {
+			return nil
+		}
+		if excludeIDs != nil && excludeIDs[sessionID] {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		// Only consider sessions created after we started this instance.
+		if i.CodexStartedAt > 0 {
+			startTime := time.UnixMilli(i.CodexStartedAt)
+			if info.ModTime().Before(startTime) {
+				return nil
+			}
+		}
+
+		matchesProject, hasProjectMetadata := codexSessionMatchesProject(path, normalizedProjectPath)
+		if matchesProject {
+			if bestScopedID == "" || info.ModTime().After(bestScopedTime) {
+				bestScopedID = sessionID
+				bestScopedTime = info.ModTime()
+			}
+			return nil
+		}
+
+		// Use unscoped records only when bootstrapping and metadata is unavailable.
+		if allowUnscoped && !hasProjectMetadata {
+			if bestUnscopedID == "" || info.ModTime().After(bestUnscopedTime) {
+				bestUnscopedID = sessionID
+				bestUnscopedTime = info.ModTime()
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		sessionLog.Debug("codex_scan_error", slog.String("error", err.Error()))
+	}
+
+	if bestScopedID != "" {
+		return bestScopedID
+	}
+	if allowUnscoped {
+		return bestUnscopedID
+	}
+	return ""
+}
+
+// codexSessionMatchesProject checks whether a Codex session file belongs to the
+// current project by inspecting JSONL metadata fields (cwd/workdir/path).
+// Returns:
+//   - match=true if project path matches
+//   - known=true if any project metadata field was found
+func codexSessionMatchesProject(sessionFilePath, normalizedProjectPath string) (match bool, known bool) {
+	if normalizedProjectPath == "" {
+		return false, false
+	}
+
+	file, err := os.Open(sessionFilePath)
+	if err != nil {
+		return false, false
+	}
+	defer file.Close()
+
+	const maxLines = 256
+
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	lineCount := 0
+	foundMetadata := false
+
+	for scanner.Scan() {
+		lineCount++
+		cwd := extractCodexCWDFromJSONLine(scanner.Bytes())
+		if cwd != "" {
+			foundMetadata = true
+			if normalizePath(cwd) == normalizedProjectPath {
+				return true, true
+			}
+		}
+		if lineCount >= maxLines {
+			break
+		}
+	}
+
+	return false, foundMetadata
+}
+
+// extractCodexCWDFromJSONLine extracts cwd-like project fields from one JSONL record.
+func extractCodexCWDFromJSONLine(line []byte) string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(line, &raw); err != nil {
+		return ""
+	}
+
+	keys := []string{"cwd", "workdir", "working_dir", "directory", "path"}
+	for _, key := range keys {
+		if val := decodeJSONStringField(raw, key); val != "" {
+			return val
+		}
+	}
+
+	if payloadRaw, ok := raw["payload"]; ok && len(payloadRaw) > 0 {
+		var payloadObj map[string]json.RawMessage
+		if err := json.Unmarshal(payloadRaw, &payloadObj); err == nil {
+			for _, key := range keys {
+				if val := decodeJSONStringField(payloadObj, key); val != "" {
+					return val
+				}
+			}
+		}
+	}
+	if contextRaw, ok := raw["context"]; ok && len(contextRaw) > 0 {
+		var contextObj map[string]json.RawMessage
+		if err := json.Unmarshal(contextRaw, &contextObj); err == nil {
+			for _, key := range keys {
+				if val := decodeJSONStringField(contextObj, key); val != "" {
+					return val
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func decodeJSONStringField(raw map[string]json.RawMessage, key string) string {
+	value, ok := raw[key]
+	if !ok || len(value) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(value, &s); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+// collectOtherCodexSessionIDs enumerates other managed tmux sessions and returns
+// the CODEX_SESSION_ID values they currently own.
+func (i *Instance) collectOtherCodexSessionIDs() map[string]bool {
+	exclude := make(map[string]bool)
+
+	tmuxSessions, err := tmux.ListAgentDeckSessions()
+	if err != nil {
+		return exclude
+	}
+
+	myTmuxName := ""
+	if i.tmuxSession != nil {
+		myTmuxName = i.tmuxSession.Name
+	}
+
+	for _, sessName := range tmuxSessions {
+		if sessName == myTmuxName {
+			continue
+		}
+		other := &tmux.Session{Name: sessName}
+		if id, err := other.GetEnvironment("CODEX_SESSION_ID"); err == nil && id != "" {
+			exclude[id] = true
+		}
+	}
+
+	return exclude
+}
+
+// shouldScanCodexSession returns whether we should run an expensive filesystem
+// scan for Codex session rotation right now.
+func (i *Instance) shouldScanCodexSession(allowUnscoped bool) bool {
+	interval := codexRotationScanInterval
+	if allowUnscoped {
+		interval = codexBootstrapScanInterval
+	}
+
+	if !i.lastCodexScanAt.IsZero() && time.Since(i.lastCodexScanAt) < interval {
+		return false
+	}
+
+	i.lastCodexScanAt = time.Now()
+	return true
+}
+
+// shouldRunCodexProcessProbe returns whether we should run Codex process/file
+// probing right now.
+func (i *Instance) shouldRunCodexProcessProbe(force bool) bool {
+	if force {
+		i.lastCodexProbeAt = time.Now()
+		return true
+	}
+
+	if !i.lastCodexProbeAt.IsZero() && time.Since(i.lastCodexProbeAt) < codexProbeScanInterval {
+		return false
+	}
+
+	i.lastCodexProbeAt = time.Now()
+	return true
+}
+
+// collectTmuxPaneProcessTreePIDs returns pane PID + descendant PIDs for this instance.
+func (i *Instance) collectTmuxPaneProcessTreePIDs() []int {
+	if i.tmuxSession == nil || !i.tmuxSession.Exists() {
+		return nil
+	}
+
+	target := i.tmuxSession.Name + ":"
+	out, err := exec.Command("tmux", "list-panes", "-t", target, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return nil
+	}
+
+	pidStr := strings.TrimSpace(string(out))
+	if idx := strings.IndexByte(pidStr, '\n'); idx >= 0 {
+		pidStr = pidStr[:idx]
+	}
+	panePID, err := strconv.Atoi(pidStr)
+	if err != nil || panePID <= 0 {
+		return nil
+	}
+
+	// Single snapshot of the process table is substantially cheaper than
+	// spawning pgrep once per node in deep process trees.
+	procTable, err := exec.Command("ps", "-eo", "pid=,ppid=").Output()
+	if err == nil {
+		if allPIDs := collectProcessTreePIDsFromTable(panePID, procTable); len(allPIDs) > 0 {
+			return allPIDs
+		}
+	}
+
+	// Fallback path for environments where ps output is unavailable/unexpected.
+	return collectProcessTreePIDsViaPgrep(panePID)
+}
+
+func collectProcessTreePIDsFromTable(rootPID int, procTable []byte) []int {
+	childrenByParent := parsePSParentChildMap(procTable)
+	if len(childrenByParent) == 0 {
+		return []int{rootPID}
+	}
+
+	var allPIDs []int
+	seen := map[int]bool{rootPID: true}
+	queue := []int{rootPID}
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		allPIDs = append(allPIDs, parent)
+
+		for _, childPID := range childrenByParent[parent] {
+			if childPID <= 0 || seen[childPID] {
+				continue
+			}
+			seen[childPID] = true
+			queue = append(queue, childPID)
+		}
+	}
+	return allPIDs
+}
+
+func parsePSParentChildMap(procTable []byte) map[int][]int {
+	childrenByParent := make(map[int][]int)
+	scanner := bufio.NewScanner(bytes.NewReader(procTable))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		ppid, err := strconv.Atoi(fields[1])
+		if err != nil || ppid <= 0 {
+			continue
+		}
+		childrenByParent[ppid] = append(childrenByParent[ppid], pid)
+	}
+	return childrenByParent
+}
+
+func collectProcessTreePIDsViaPgrep(rootPID int) []int {
+	var allPIDs []int
+	seen := map[int]bool{rootPID: true}
+	queue := []int{rootPID}
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		allPIDs = append(allPIDs, parent)
+
+		childrenRaw, err := exec.Command("pgrep", "-P", strconv.Itoa(parent)).Output()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(childrenRaw)), "\n") {
+			childPID, convErr := strconv.Atoi(strings.TrimSpace(line))
+			if convErr != nil || childPID <= 0 || seen[childPID] {
+				continue
+			}
+			seen[childPID] = true
+			queue = append(queue, childPID)
+		}
+	}
+	return allPIDs
+}
+
+func isLikelyCodexProcessPID(pid int) bool {
+	argsOut, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(strings.TrimSpace(string(argsOut))), "codex")
+}
+
+func extractCodexSessionIDFromPath(path string) string {
+	normalized := strings.TrimSpace(path)
+	normalized = strings.TrimSuffix(normalized, " (deleted)")
+	matches := codexSessionIDPathPatternRE.FindStringSubmatch(normalized)
+	if len(matches) < 2 {
+		return ""
+	}
+	return matches[1]
+}
+
+func extractCodexSessionIDFromLsofOutput(output []byte) string {
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	for scanner.Scan() {
+		if sessionID := extractCodexSessionIDFromPath(scanner.Text()); sessionID != "" {
+			return sessionID
+		}
+	}
+	return ""
+}
+
+func extractCodexSessionIDFromProcFD(pid int) string {
+	fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return ""
+	}
+
+	for _, entry := range entries {
+		targetPath := filepath.Join(fdDir, entry.Name())
+		target, err := os.Readlink(targetPath)
+		if err != nil {
+			continue
+		}
+		if sessionID := extractCodexSessionIDFromPath(target); sessionID != "" {
+			return sessionID
+		}
+	}
+	return ""
+}
+
+func (i *Instance) queryCodexSessionFromHostProcFD() string {
+	for _, pid := range i.collectTmuxPaneProcessTreePIDs() {
+		if !isLikelyCodexProcessPID(pid) {
+			continue
+		}
+		if sessionID := extractCodexSessionIDFromProcFD(pid); sessionID != "" {
+			return sessionID
+		}
+	}
+	return ""
+}
+
+func (i *Instance) queryCodexSessionFromDockerProcFD() (string, string) {
+	if strings.TrimSpace(i.SandboxContainer) == "" {
+		return "", ""
+	}
+
+	script := fmt.Sprintf(
+		`command -v readlink >/dev/null 2>&1 || {
+	echo %q
+	exit 0
+}
+for f in /proc/[0-9]*/fd/*; do
+	t=$(readlink "$f" 2>/dev/null || true)
+	case "$t" in
+		*/.codex/sessions/*rollout-*.jsonl*)
+			printf '%%s\n' "$t"
+			;;
+	esac
+done`,
+		codexProbeMissingSentinel,
+	)
+	out, err := exec.Command("docker", "exec", i.SandboxContainer, "sh", "-lc", script).Output()
+	if err != nil {
+		return "", ""
+	}
+	if bytes.Contains(out, []byte(codexProbeMissingSentinel)) {
+		return "", "readlink"
+	}
+	if sessionID := extractCodexSessionIDFromLsofOutput(out); sessionID != "" {
+		return sessionID, ""
+	}
+	return "", ""
+}
+
+func (i *Instance) queryCodexSessionFromHostLsof() (string, string) {
+	if _, err := exec.LookPath("lsof"); err != nil {
+		return "", "lsof"
+	}
+
+	for _, pid := range i.collectTmuxPaneProcessTreePIDs() {
+		if !isLikelyCodexProcessPID(pid) {
+			continue
+		}
+
+		out, err := exec.Command("lsof", "-p", strconv.Itoa(pid)).Output()
+		if err != nil {
+			var execErr *exec.Error
+			if errors.As(err, &execErr) && execErr.Err == exec.ErrNotFound {
+				return "", "lsof"
+			}
+			sessionLog.Debug("codex_lsof_probe_failed", slog.Int("pid", pid), slog.Any("error", err))
+			continue
+		}
+
+		if sessionID := extractCodexSessionIDFromLsofOutput(out); sessionID != "" {
+			return sessionID, ""
+		}
+	}
+
+	return "", ""
+}
+
+// queryCodexSessionFromProcessFiles inspects live Codex processes and returns
+// the active session UUID inferred from open rollout JSONL files.
+// The second return value is the missing dependency name (if any).
+func (i *Instance) queryCodexSessionFromProcessFiles() (string, string) {
+	// Sandboxed sessions run Codex inside Docker; probe container /proc.
+	if i.IsSandboxed() {
+		return i.queryCodexSessionFromDockerProcFD()
+	}
+
+	// Linux/WSL: pure in-process /proc scanning (no lsof dependency).
+	if runtime.GOOS == "linux" {
+		if sessionID := i.queryCodexSessionFromHostProcFD(); sessionID != "" {
+			return sessionID, ""
+		}
+		return "", ""
+	}
+
+	// Non-Linux (e.g. macOS): fallback to lsof compatibility path.
+	return i.queryCodexSessionFromHostLsof()
+}
+
+// ConsumeCodexRestartWarning returns and clears any pending Codex restart warning.
+func (i *Instance) ConsumeCodexRestartWarning() string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	warning := strings.TrimSpace(i.pendingCodexRestartWarning)
+	i.pendingCodexRestartWarning = ""
+	return warning
+}
+
+func codexProbeMissingWarning(missingDep string) string {
+	missingDep = strings.TrimSpace(missingDep)
+	if missingDep == "" {
+		return ""
+	}
+	return fmt.Sprintf("Codex session detection fallback: %s is not available", missingDep)
+}
+
+// UpdateCodexSession updates the Codex session ID.
+// Primary source: tmux environment.
+// Fallback: project-aware filesystem scan.
+func (i *Instance) UpdateCodexSession(excludeIDs map[string]bool) {
+	i.updateCodexSession(excludeIDs, false)
+}
+
+// updateCodexSession refreshes Codex session ID from env/process-files/disk.
+// Returns missing dependency name when probe prerequisites are unavailable.
+func (i *Instance) updateCodexSession(excludeIDs map[string]bool, forceProbe bool) string {
+	if i.Tool != "codex" {
+		return ""
+	}
+
+	envSessionID := ""
+
+	// 1. Try to read from tmux environment first (authoritative if set)
+	if i.tmuxSession != nil {
+		if sessionID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && sessionID != "" {
+			envSessionID = sessionID
+			if i.CodexSessionID != sessionID {
+				i.CodexSessionID = sessionID
+			}
+			i.CodexDetectedAt = time.Now()
+		}
+	}
+
+	// 2. Prefer live-process file detection (Linux /proc, macOS lsof fallback).
+	missingProbeDep := ""
+	if i.shouldRunCodexProcessProbe(forceProbe) {
+		if sessionID, missingDep := i.queryCodexSessionFromProcessFiles(); sessionID != "" {
+			changed := sessionID != i.CodexSessionID
+			if changed {
+				sessionLog.Debug(
+					"codex_session_update_from_probe",
+					slog.String("old_id", i.CodexSessionID),
+					slog.String("new_id", sessionID),
+				)
+			}
+			i.CodexSessionID = sessionID
+			i.CodexDetectedAt = time.Now()
+			if i.tmuxSession != nil && i.tmuxSession.Exists() && (changed || envSessionID == "") {
+				_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", i.CodexSessionID)
+			}
+			return ""
+		} else if missingDep != "" {
+			missingProbeDep = missingDep
+		}
+	}
+
+	// 3. Detect same-project session rotation (e.g. /new) from disk.
+	// Only allow unscoped fallback when we don't have a known session ID yet.
+	allowUnscoped := envSessionID == "" && i.CodexSessionID == "" && i.CodexStartedAt > 0
+	if !i.shouldScanCodexSession(allowUnscoped) {
+		return missingProbeDep
+	}
+
+	if sessionID := i.queryCodexSession(excludeIDs, allowUnscoped); sessionID != "" {
+		changed := sessionID != i.CodexSessionID
+		if sessionID != i.CodexSessionID {
+			sessionLog.Debug(
+				"codex_session_update",
+				slog.String("old_id", i.CodexSessionID),
+				slog.String("new_id", sessionID),
+			)
+		}
+		i.CodexSessionID = sessionID
+		i.CodexDetectedAt = time.Now()
+
+		// Sync back to tmux environment for future restarts
+		// Skip redundant writes when env already matches: each write is a tmux subprocess.
+		if i.tmuxSession != nil && i.tmuxSession.Exists() && (changed || envSessionID == "") {
+			_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", i.CodexSessionID)
+		}
+	}
+	return missingProbeDep
+}
+
+// buildGenericCommand builds commands for custom tools defined in [tools.*]
+// If the tool has session resume config, builds capture-resume command similar to Claude/Gemini
+// Otherwise returns the base command as-is
+// Also sources .env files from [shell].env_files and [tools.X].env_file
+//
+// Config fields used:
+//   - resume_flag: CLI flag to resume (e.g., "--resume")
+//   - session_id_env: tmux env var name (e.g., "VIBE_SESSION_ID")
+//   - session_id_json_path: jq path to extract ID (e.g., ".session_id")
+//   - output_format_flag: flag to get JSON output (e.g., "--output-format json")
+//   - dangerous_flag: flag to skip confirmations (e.g., "--auto-approve")
+//   - dangerous_mode: whether to enable dangerous flag by default
+//   - env_file: .env file to source for this tool
+func (i *Instance) buildGenericCommand(baseCommand string) string {
+	envPrefix := i.buildEnvSourceCommand()
+
+	toolDef := GetToolDef(i.Tool)
+	if toolDef == nil {
+		return envPrefix + baseCommand // No custom config, return with env prefix
+	}
+
+	// Check if tool supports session resume (needs both resume_flag and session_id_env)
+	if toolDef.ResumeFlag == "" || toolDef.SessionIDEnv == "" {
+		// No session resume support, just add dangerous flag if configured
+		if toolDef.DangerousMode && toolDef.DangerousFlag != "" {
+			return envPrefix + fmt.Sprintf("%s %s", baseCommand, toolDef.DangerousFlag)
+		}
+		return envPrefix + baseCommand
+	}
+
+	// Get existing session ID from tmux environment (for restart/resume)
+	existingSessionID := ""
+	if i.tmuxSession != nil {
+		if sid, err := i.tmuxSession.GetEnvironment(toolDef.SessionIDEnv); err == nil && sid != "" {
+			existingSessionID = sid
+		}
+	}
+
+	// Build dangerous flag if enabled
+	dangerousFlag := ""
+	if toolDef.DangerousMode && toolDef.DangerousFlag != "" {
+		dangerousFlag = " " + toolDef.DangerousFlag
+	}
+
+	// If we have an existing session ID, just resume.
+	// The session ID env var is propagated via host-side SetEnvironment after tmux start.
+	if existingSessionID != "" {
+		return envPrefix + fmt.Sprintf("%s %s %s%s",
+			baseCommand, toolDef.ResumeFlag, existingSessionID, dangerousFlag)
+	}
+
+	// No existing session ID - need to capture it on first run
+	// This requires output_format_flag and session_id_json_path
+	if toolDef.OutputFormatFlag == "" || toolDef.SessionIDJsonPath == "" {
+		// Can't capture session ID, just start normally
+		if dangerousFlag != "" {
+			return envPrefix + baseCommand + dangerousFlag
+		}
+		return envPrefix + baseCommand
+	}
+
+	// Build capture-resume command similar to Claude/Gemini
+	// Pattern:
+	// 1. Run tool with minimal prompt to get session ID
+	// 2. Extract ID using jq
+	// 3. Resume that session
+	// Note: session ID env var is set via host-side SyncSessionIDsToTmux() once detected.
+	// Fallback: If capture fails, start tool fresh
+	return envPrefix + fmt.Sprintf(
+		`session_id=$(%s %s "." 2>/dev/null | jq -r '%s' 2>/dev/null) || session_id=""; `+
+			`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then `+
+			`%s %s "$session_id"%s; `+
+			`else %s%s; fi`,
+		baseCommand, toolDef.OutputFormatFlag, toolDef.SessionIDJsonPath,
+		baseCommand, toolDef.ResumeFlag, dangerousFlag,
+		baseCommand, dangerousFlag)
+}
+
+// GetGenericSessionID gets session ID from tmux environment for a custom tool
+// Uses the session_id_env field from tool config
+func (i *Instance) GetGenericSessionID() string {
+	toolDef := GetToolDef(i.Tool)
+	if toolDef == nil || toolDef.SessionIDEnv == "" {
+		return ""
+	}
+	if i.tmuxSession == nil {
+		return ""
+	}
+	sessionID, err := i.tmuxSession.GetEnvironment(toolDef.SessionIDEnv)
+	if err != nil {
+		return ""
+	}
+	return sessionID
+}
+
+// CanRestartGeneric returns true if a custom tool can be restarted with session resume
+func (i *Instance) CanRestartGeneric() bool {
+	toolDef := GetToolDef(i.Tool)
+	if toolDef == nil {
+		return false
+	}
+	// Can restart if we have resume support AND an existing session ID
+	if toolDef.ResumeFlag == "" || toolDef.SessionIDEnv == "" {
+		return false
+	}
+	return i.GetGenericSessionID() != ""
+}
+
+func (i *Instance) applyWrapper(command string) (string, error) {
+	wrapper := i.Wrapper
+	if wrapper == "" {
+		if toolDef := GetToolDef(i.Tool); toolDef != nil {
+			wrapper = toolDef.Wrapper
+		}
+	}
+	if wrapper == "" {
+		return command, nil
+	}
+	if strings.Contains(wrapper, wrapperPlaceholder) {
+		return strings.ReplaceAll(wrapper, wrapperPlaceholder, command), nil
+	}
+	return wrapper, nil
+}
+
+// loadCustomPatternsFromConfig loads detection patterns from built-in defaults + config.toml
+// overrides, and sets them on the tmux session for status detection and tool auto-detection.
+// Works for ALL tools: built-in (claude, gemini, opencode, codex) and custom.
+func (i *Instance) loadCustomPatternsFromConfig() {
+	if i.tmuxSession == nil {
+		return
+	}
+
+	// Merge built-in defaults with any user config overrides/extras
+	raw := MergeToolPatterns(i.Tool)
+	if raw != nil {
+		resolved, err := tmux.CompilePatterns(raw)
+		if err != nil {
+			sessionLog.Warn("pattern_compile_error", slog.String("tool", i.Tool), slog.String("error", err.Error()))
+		}
+		if resolved != nil {
+			i.tmuxSession.SetPatterns(resolved)
+		}
+	}
+
+	// Keep detect patterns for DetectTool() (separate from busy/prompt detection)
+	if toolDef := GetToolDef(i.Tool); toolDef != nil {
+		i.tmuxSession.SetDetectPatterns(i.Tool, toolDef.DetectPatterns)
+	}
+}
+
+// buildTmuxOptionOverrides returns tmux option overrides from user config,
+// adding remain-on-exit for sandbox sessions (needed for dead-pane detection).
+// Returns nil if no overrides apply.
+func (i *Instance) buildTmuxOptionOverrides() map[string]string {
+	var overrides map[string]string
+	if tmuxCfg := GetTmuxSettings(); len(tmuxCfg.Options) > 0 {
+		overrides = maps.Clone(tmuxCfg.Options)
+	}
+	// Sandbox sessions need remain-on-exit so dead-pane detection works.
+	// Non-sandbox sessions use default tmux behaviour (pane closes on exit).
+	if i.IsSandboxed() {
+		if overrides == nil {
+			overrides = make(map[string]string)
+		}
+		overrides["remain-on-exit"] = "on"
+	}
+	return overrides
 }
 
 // Start starts the session in tmux
@@ -331,20 +1882,86 @@ func (i *Instance) Start() error {
 		return fmt.Errorf("tmux session not initialized")
 	}
 
-	// Build command (adds config dir for claude, capture-resume for gemini)
+	// Build command based on tool type
+	// Priority: claude-compatible (built-in + custom wrapping claude) → built-in tools → custom tools → raw command
 	var command string
-	switch i.Tool {
-	case "claude":
+	switch {
+	case IsClaudeCompatible(i.Tool):
 		command = i.buildClaudeCommand(i.Command)
-	case "gemini":
+	case i.Tool == "gemini":
 		command = i.buildGeminiCommand(i.Command)
+	case i.Tool == "opencode":
+		command = i.buildOpenCodeCommand(i.Command)
+		// Record start time for session ID detection (Unix millis)
+		i.OpenCodeStartedAt = time.Now().UnixMilli()
+	case i.Tool == "codex":
+		command = i.buildCodexCommand(i.Command)
+		// Record start time for session ID detection (Unix millis)
+		i.CodexStartedAt = time.Now().UnixMilli()
 	default:
-		command = i.Command
+		// Check if this is a custom tool with session resume config
+		if toolDef := GetToolDef(i.Tool); toolDef != nil {
+			command = i.buildGenericCommand(i.Command)
+		} else {
+			command = i.Command
+		}
 	}
+
+	var containerName string
+	var err error
+	command, containerName, err = i.prepareCommand(command)
+	if err != nil {
+		return err
+	}
+	if containerName != "" {
+		i.SandboxContainer = containerName
+	}
+
+	// Load custom patterns for status detection
+	i.loadCustomPatternsFromConfig()
+
+	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
+	// Sandbox sessions also get remain-on-exit for dead-pane detection.
+	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
+	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed()
 
 	// Start the tmux session
 	if err := i.tmuxSession.Start(command); err != nil {
 		return fmt.Errorf("failed to start tmux session: %w", err)
+	}
+
+	// Set AGENTDECK_INSTANCE_ID for Claude hooks to identify this session
+	// This enables real-time status updates via Stop/SessionStart hooks
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_INSTANCE_ID", i.ID); err != nil {
+		sessionLog.Warn("set_instance_id_failed", slog.String("error", err.Error()))
+	}
+
+	// Propagate tool session IDs into the tmux environment (host-side, works for both
+	// sandbox and non-sandbox sessions). This replaces the previous approach of embedding
+	// "tmux set-environment" calls in the shell command string, which silently failed
+	// inside Docker sandbox containers that have no access to the host tmux socket.
+	if i.ClaudeSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", i.ClaudeSessionID)
+	}
+	if i.GeminiSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", i.GeminiSessionID)
+	}
+	if i.Tool == "gemini" {
+		yoloVal := "false"
+		if i.GeminiYoloMode != nil && *i.GeminiYoloMode {
+			yoloVal = "true"
+		}
+		_ = i.tmuxSession.SetEnvironment("GEMINI_YOLO_MODE", yoloVal)
+	}
+	// OpenCode and Codex IDs are detected asynchronously; SyncSessionIDsToTmux() handles
+	// propagation once they are available.
+
+	// Propagate COLORFGBG into the tmux session environment so that any new
+	// shell or process spawned inside the session inherits the correct
+	// light/dark hint. The command prefix already exports it for the initial
+	// process, but set-environment covers subsequent shells/windows.
+	if colorfgbg := ThemeColorFGBG(); colorfgbg != "" {
+		_ = i.tmuxSession.SetEnvironment("COLORFGBG", colorfgbg)
 	}
 
 	// Capture MCPs that are now loaded (for sync tracking)
@@ -357,6 +1974,18 @@ func (i *Instance) Start() error {
 	// After 5s grace period, status will be properly detected from tmux
 	if command != "" {
 		i.Status = StatusStarting
+	}
+
+	// Start async session ID detection for OpenCode
+	// This runs in background and captures the session ID once OpenCode creates it
+	if i.Tool == "opencode" {
+		go i.detectOpenCodeSessionAsync()
+	}
+
+	// Start async session ID detection for Codex
+	// This runs in background and captures the session ID once Codex creates it
+	if i.Tool == "codex" {
+		go i.detectCodexSessionAsync()
 	}
 
 	return nil
@@ -372,19 +2001,78 @@ func (i *Instance) StartWithMessage(message string) error {
 	}
 
 	// Start session normally (no embedded message logic)
+	// Priority: built-in tools (claude, gemini, opencode, codex) → custom tools from config.toml → raw command
 	var command string
-	switch i.Tool {
-	case "claude":
+	switch {
+	case IsClaudeCompatible(i.Tool):
 		command = i.buildClaudeCommand(i.Command)
-	case "gemini":
+	case i.Tool == "gemini":
 		command = i.buildGeminiCommand(i.Command)
+	case i.Tool == "opencode":
+		command = i.buildOpenCodeCommand(i.Command)
+		i.OpenCodeStartedAt = time.Now().UnixMilli()
+	case i.Tool == "codex":
+		command = i.buildCodexCommand(i.Command)
+		i.CodexStartedAt = time.Now().UnixMilli()
 	default:
-		command = i.Command
+		// Check if this is a custom tool with session resume config
+		if toolDef := GetToolDef(i.Tool); toolDef != nil {
+			command = i.buildGenericCommand(i.Command)
+		} else {
+			command = i.Command
+		}
 	}
+
+	var containerName string
+	var err error
+	command, containerName, err = i.prepareCommand(command)
+	if err != nil {
+		return err
+	}
+	if containerName != "" {
+		i.SandboxContainer = containerName
+	}
+
+	// Load custom patterns for status detection.
+	i.loadCustomPatternsFromConfig()
+
+	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
+	// Sandbox sessions also get remain-on-exit for dead-pane detection.
+	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
+	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed()
 
 	// Start the tmux session
 	if err := i.tmuxSession.Start(command); err != nil {
 		return fmt.Errorf("failed to start tmux session: %w", err)
+	}
+
+	// Set AGENTDECK_INSTANCE_ID for Claude hooks to identify this session
+	// This enables real-time status updates via Stop/SessionStart hooks
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_INSTANCE_ID", i.ID); err != nil {
+		sessionLog.Warn("set_instance_id_failed", slog.String("error", err.Error()))
+	}
+
+	// Propagate tool session IDs into the tmux environment (host-side, works for both
+	// sandbox and non-sandbox sessions).
+	if i.ClaudeSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", i.ClaudeSessionID)
+	}
+	if i.GeminiSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", i.GeminiSessionID)
+	}
+	if i.Tool == "gemini" {
+		yoloVal := "false"
+		if i.GeminiYoloMode != nil && *i.GeminiYoloMode {
+			yoloVal = "true"
+		}
+		_ = i.tmuxSession.SetEnvironment("GEMINI_YOLO_MODE", yoloVal)
+	}
+
+	// Propagate COLORFGBG into the tmux session environment so that any new
+	// shell or process spawned inside the session inherits the correct
+	// light/dark hint.
+	if colorfgbg := ThemeColorFGBG(); colorfgbg != "" {
+		_ = i.tmuxSession.SetEnvironment("COLORFGBG", colorfgbg)
 	}
 
 	// Capture MCPs that are now loaded (for sync tracking)
@@ -395,6 +2083,14 @@ func (i *Instance) StartWithMessage(message string) error {
 
 	// New sessions start as STARTING
 	i.Status = StatusStarting
+
+	// Start async session ID detection for tools that persist IDs out-of-band.
+	if i.Tool == "opencode" {
+		go i.detectOpenCodeSessionAsync()
+	}
+	if i.Tool == "codex" {
+		go i.detectCodexSessionAsync()
+	}
 
 	// Send message synchronously (CLI will wait)
 	if message != "" {
@@ -420,12 +2116,10 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 		return fmt.Errorf("tmux session not initialized")
 	}
 
-	sessionName := i.tmuxSession.Name
-
 	// Track state transitions: we need to see "active" before accepting "waiting"
 	// This ensures we don't send the message during initial startup (false "waiting")
 	sawActive := false
-	waitingCount := 0 // Track consecutive "waiting" states to detect already-ready sessions
+	readyCount := 0    // Track consecutive waiting/idle states to detect already-ready sessions
 	maxAttempts := 300 // 60 seconds max (300 * 200ms) - Claude with MCPs can take 40-60s
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -434,43 +2128,122 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 		// Use the existing robust status detection
 		status, err := i.tmuxSession.GetStatus()
 		if err != nil {
-			waitingCount = 0 // Reset on error
+			readyCount = 0 // Reset on error
 			continue
 		}
 
 		if status == "active" {
 			sawActive = true
-			waitingCount = 0
+			readyCount = 0
 			continue
 		}
 
-		if status == "waiting" {
-			waitingCount++
+		if status == "waiting" || status == "idle" {
+			readyCount++
 		} else {
-			waitingCount = 0
+			readyCount = 0
 		}
 
 		// Agent is ready when either:
 		// 1. We've seen "active" (loading) and now see "waiting" (ready)
-		// 2. We've seen "waiting" 10+ times consecutively (already processed initial ".")
+		// 2. We've seen waiting/idle 10+ times consecutively (already processed initial ".")
 		//    This handles the race where Claude finishes before we start checking
-		alreadyReady := waitingCount >= 10 && attempt >= 15 // At least 3s elapsed
-		if (sawActive && status == "waiting") || alreadyReady {
+		alreadyReady := readyCount >= 10 && attempt >= 15 // At least 3s elapsed
+		if (sawActive && (status == "waiting" || status == "idle")) || alreadyReady {
+			if IsClaudeCompatible(i.Tool) {
+				if rawContent, captureErr := i.tmuxSession.CapturePaneFresh(); captureErr == nil && !send.HasCurrentComposerPrompt(tmux.StripANSI(rawContent)) {
+					// Claude can report waiting before the interactive prompt is visible.
+					// Keep polling until the prompt line is present.
+					continue
+				}
+			}
+			// Gate Codex sends on prompt readiness: wait for "codex>" or
+			// "Continue?" to be visible before considering the agent ready.
+			if i.Tool == "codex" {
+				if rawContent, captureErr := i.tmuxSession.CapturePaneFresh(); captureErr == nil {
+					content := tmux.StripANSI(rawContent)
+					detector := tmux.NewPromptDetector("codex")
+					if !detector.HasPrompt(content) {
+						continue
+					}
+				}
+			}
 			// Small delay to ensure UI is fully rendered
 			time.Sleep(300 * time.Millisecond)
 
-			// Send the message using tmux send-keys
-			// -l flag for literal text, then Enter separately
-			cmd := exec.Command("tmux", "send-keys", "-l", "-t", sessionName, message)
-			if err := cmd.Run(); err != nil {
+			// Send message atomically (text + Enter in single tmux invocation)
+			if err := i.tmuxSession.SendKeysAndEnter(message); err != nil {
 				return fmt.Errorf("failed to send message: %w", err)
 			}
 
-			cmd = exec.Command("tmux", "send-keys", "-t", sessionName, "Enter")
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("failed to send Enter: %w", err)
+			// Verify the agent accepted Enter and began processing.
+			// Strategy:
+			// - If unsent prompt is visible, press Enter again immediately.
+			// - Consider success only after sustained post-send activity ("active").
+			// - If we never observe active and remain in waiting/idle, keep a
+			//   periodic fallback Enter cadence instead of returning early.
+			const verifyRetries = 50
+			const verifyDelay = 300 * time.Millisecond
+			const activeSuccessThreshold = 2
+			const waitingAfterActiveThreshold = 2
+			waitingNoMarkerChecks := 0
+			activeChecks := 0
+			sawActiveAfterSend := false
+
+			for retry := 0; retry < verifyRetries; retry++ {
+				time.Sleep(verifyDelay)
+
+				unsentPromptDetected := false
+				if rawContent, captureErr := i.tmuxSession.CapturePaneFresh(); captureErr == nil {
+					content := tmux.StripANSI(rawContent)
+					unsentPromptDetected = send.HasUnsentPastedPrompt(content) || send.HasUnsentComposerPrompt(content, message)
+				}
+				verifiedStatus, statusErr := i.tmuxSession.GetStatus()
+
+				if unsentPromptDetected {
+					waitingNoMarkerChecks = 0
+					activeChecks = 0
+					_ = i.tmuxSession.SendEnter()
+					continue
+				}
+
+				if statusErr == nil && verifiedStatus == "active" {
+					sawActiveAfterSend = true
+					waitingNoMarkerChecks = 0
+					activeChecks++
+					if activeChecks >= activeSuccessThreshold {
+						return nil
+					}
+					continue
+				}
+				activeChecks = 0
+
+				if statusErr == nil && (verifiedStatus == "waiting" || verifiedStatus == "idle") {
+					if sawActiveAfterSend {
+						waitingNoMarkerChecks++
+						if waitingNoMarkerChecks >= waitingAfterActiveThreshold {
+							return nil
+						}
+					} else {
+						waitingNoMarkerChecks = 0
+						// We haven't observed any post-send activity yet.
+						// Nudge Enter aggressively in the early window (every
+						// iteration for first 5 retries) then every 2nd iteration.
+						if retry < 5 || retry%2 == 0 {
+							_ = i.tmuxSession.SendEnter()
+						}
+					}
+					continue
+				}
+
+				waitingNoMarkerChecks = 0
+				// Increased from 2 to 4 for TUI frameworks needing more time.
+				if retry < 4 {
+					_ = i.tmuxSession.SendEnter()
+				}
 			}
 
+			// Best effort: don't fail if verification remains inconclusive.
 			return nil
 		}
 	}
@@ -483,44 +2256,172 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 // instead of every 500ms tick, dramatically reducing subprocess spawns
 const errorRecheckInterval = 30 * time.Second
 
-// UpdateStatus updates the session status by checking tmux
+func hookFastPathFreshnessForTool(tool, hookStatus string) time.Duration {
+	if tool != "codex" {
+		return hookFastPathWindow
+	}
+
+	// Codex hook events are turn-based and can be sparse depending on command mode.
+	// Keep running freshness short, but preserve completion/waiting signals longer so
+	// the user can reliably see attention-needed state.
+	switch hookStatus {
+	case "waiting":
+		return codexHookWaitingFastPathWindow
+	default:
+		return codexHookRunningFastPathWindow
+	}
+}
+
+// UpdateStatus updates the session status by checking tmux.
+// Thread-safe: acquires write lock to protect Status, Tool, and internal cache fields.
 func (i *Instance) UpdateStatus() error {
-	// Grace period FIRST: Skip all checks for recently created sessions
-	// If session was created within last 5 seconds, keep status as starting
-	// This prevents error flash during auto-reload while tmux initializes
-	if time.Since(i.CreatedAt) < 5*time.Second {
-		// Keep status as starting during grace period
-		if i.Status != StatusRunning && i.Status != StatusIdle {
-			i.Status = StatusStarting
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	// Short grace period for tmux initialization (not Claude startup)
+	// Use lastStartTime for accuracy on restarts, fallback to CreatedAt
+	graceTime := i.lastStartTime
+	if graceTime.IsZero() {
+		graceTime = i.CreatedAt
+	}
+	// 1.5 seconds is enough for tmux to create the session (<100ms typically)
+	// Don't block status detection once tmux session exists
+	if time.Since(graceTime) < 1500*time.Millisecond {
+		// Only skip if tmux session doesn't exist yet
+		if i.tmuxSession == nil || !i.tmuxSession.Exists() {
+			if i.Status != StatusRunning && i.Status != StatusIdle {
+				i.Status = StatusStarting
+			}
+			return nil
+		}
+		// Session exists - allow normal status detection below
+	}
+
+	if i.tmuxSession == nil {
+		if i.Status != StatusStopped {
+			i.Status = StatusError
 		}
 		return nil
 	}
 
-	if i.tmuxSession == nil {
-		i.Status = StatusError
-		return nil
-	}
-
-	// Optimization: Skip expensive Exists() check for sessions already in error status
+	// Optimization: Skip expensive Exists() check for sessions already in error/stopped status
 	// Ghost sessions (in JSON but not in tmux) only get rechecked every 30 seconds
 	// This reduces subprocess spawns from 74/sec to ~5/sec for 28 ghost sessions
-	if i.Status == StatusError && !i.lastErrorCheck.IsZero() &&
+	if (i.Status == StatusError || i.Status == StatusStopped) && !i.lastErrorCheck.IsZero() &&
 		time.Since(i.lastErrorCheck) < errorRecheckInterval {
-		return nil // Skip - still in error, checked recently
+		return nil // Skip - still in error/stopped, checked recently
 	}
 
 	// Check if tmux session exists
 	if !i.tmuxSession.Exists() {
-		i.Status = StatusError
-		i.lastErrorCheck = time.Now() // Record when we confirmed error
+		if i.Status != StatusStopped {
+			i.Status = StatusError
+		}
+		i.lastErrorCheck = time.Now() // Record when we confirmed error/stopped
 		return nil
+	}
+
+	// Session exists again (user manually started it) - clear stopped status
+	if i.Status == StatusStopped {
+		i.Status = StatusRunning
 	}
 
 	// Session exists - clear error check timestamp
 	i.lastErrorCheck = time.Time{}
 
-	// Get status from tmux session
+	// Tiered polling: skip expensive checks for idle sessions with no new activity
+	if i.Status == StatusIdle {
+		currentTS := i.tmuxSession.GetCachedWindowActivity()
+		if currentTS == i.lastKnownActivity && !i.lastIdleCheck.IsZero() &&
+			time.Since(i.lastIdleCheck) < 10*time.Second {
+			return nil // No activity detected, skip full check
+		}
+		// Activity detected OR recheck interval passed: do full check
+		i.lastIdleCheck = time.Now()
+		i.lastKnownActivity = currentTS
+	}
+
+	// COLD LOAD: CLI doesn't run StatusFileWatcher, so hookStatus is always empty.
+	// Read the hook file from disk once to give CLI the same fast path as the TUI.
+	if i.hookStatus == "" && (IsClaudeCompatible(i.Tool) || i.Tool == "codex" || i.Tool == "gemini") {
+		if hs := readHookStatusFile(i.ID); hs != nil {
+			i.hookStatus = hs.Status
+			i.hookLastUpdate = hs.UpdatedAt
+			i.hookSessionID = hs.SessionID
+			// Reset stale acknowledged flag from ReconnectSessionLazy.
+			// Without this, sessions loaded from SQLite with previousStatus="idle"
+			// would report idle even when the hook file says waiting/running.
+			if i.tmuxSession != nil && (hs.Status == "running" || hs.Status == "waiting") {
+				i.tmuxSession.ResetAcknowledged()
+			}
+		}
+	}
+
+	// HOOK FAST PATH: hook-based status for tools that emit lifecycle events.
+	// Freshness is tool- and state-specific (e.g. Codex running vs waiting).
+	// When this path is stale/missing, control naturally falls through to tmux
+	// polling and tool-specific session sync (tmux env/process-files/disk).
+	if (IsClaudeCompatible(i.Tool) || i.Tool == "codex" || i.Tool == "gemini") &&
+		i.hookStatus != "" &&
+		time.Since(i.hookLastUpdate) < hookFastPathFreshnessForTool(i.Tool, i.hookStatus) {
+		switch i.hookStatus {
+		case "running":
+			i.Status = StatusRunning
+			// Reset acknowledged: new activity means output not yet seen.
+			// Without this, a previously-acknowledged session would go straight
+			// to idle (gray) after Stop, skipping the waiting (orange) state.
+			if i.tmuxSession != nil {
+				i.tmuxSession.ResetAcknowledged()
+			}
+		case "waiting":
+			if i.Tool == "codex" {
+				// Codex completion should surface as attention-needed.
+				// Keep this as waiting and let tmux settle to idle if the user
+				// has acknowledged and no new activity appears.
+				if i.tmuxSession != nil {
+					i.tmuxSession.ResetAcknowledged()
+				}
+				i.Status = StatusWaiting
+			} else {
+				// Check acknowledgment: orange (waiting) vs gray (idle)
+				// Acknowledge() is called when user attaches to a session.
+				// ResetAcknowledged() is called by u key or when new activity occurs.
+				if i.tmuxSession != nil && i.tmuxSession.IsAcknowledged() {
+					i.Status = StatusIdle
+				} else {
+					i.Status = StatusWaiting
+				}
+			}
+		case "dead":
+			i.Status = StatusError
+		}
+		if i.hookSessionID != "" {
+			switch {
+			case IsClaudeCompatible(i.Tool):
+				if i.hookSessionID != i.ClaudeSessionID {
+					i.ClaudeSessionID = i.hookSessionID
+					i.ClaudeDetectedAt = time.Now()
+				}
+			case i.Tool == "codex":
+				if i.hookSessionID != i.CodexSessionID {
+					i.CodexSessionID = i.hookSessionID
+					i.CodexDetectedAt = time.Now()
+				}
+			case i.Tool == "gemini":
+				if i.hookSessionID != i.GeminiSessionID {
+					i.GeminiSessionID = i.hookSessionID
+					i.GeminiDetectedAt = time.Now()
+				}
+			}
+		}
+		return nil
+	}
+
+	// Release lock for potentially slow tmux calls (GetStatus calls CapturePane)
+	i.mu.Unlock()
 	status, err := i.tmuxSession.GetStatus()
+	i.mu.Lock()
+
 	if err != nil {
 		i.Status = StatusError
 		return err
@@ -531,25 +2432,78 @@ func (i *Instance) UpdateStatus() error {
 	case "active":
 		i.Status = StatusRunning
 	case "waiting":
-		i.Status = StatusWaiting
+		if i.Tool == "shell" {
+			i.Status = StatusIdle
+		} else {
+			i.Status = StatusWaiting
+		}
 	case "idle":
 		i.Status = StatusIdle
+	case "starting":
+		i.Status = StatusStarting
+	case "inactive":
+		i.Status = StatusError
 	default:
 		i.Status = StatusError
 	}
 
-	// Update tool detection dynamically (enables fork when Claude starts)
+	// Update tool detection dynamically (enables fork when Claude starts).
+	// Only override for built-in tools — custom tools (openclaw, etc.) must not be
+	// clobbered by the fallback "shell" detection from content sniffing.
 	if detectedTool := i.tmuxSession.DetectTool(); detectedTool != "" {
-		i.Tool = detectedTool
+		switch detectedTool {
+		case "claude", "gemini", "opencode", "codex":
+			i.Tool = detectedTool
+		case "shell":
+			// Only override if current tool is also a built-in (or already shell).
+			// Custom tools should keep their configured identity.
+			switch i.Tool {
+			case "", "shell", "claude", "gemini", "opencode", "codex":
+				i.Tool = detectedTool
+			}
+		}
 	}
 
-	// Update Claude session tracking (non-blocking, best-effort)
-	// Pass nil for excludeIDs - deduplication happens at manager level
-	i.UpdateClaudeSession(nil)
+	// Update session metadata tracking only for active/waiting sessions.
+	// This path can perform filesystem and tmux env reads while i.mu is held, so
+	// rate-limit it to reduce intermittent render/key handling stalls under load.
+	if i.Status == StatusRunning || i.Status == StatusWaiting {
+		interval := 2 * time.Second
+		// Bootstrap unknown IDs faster for newly-started sessions.
+		switch i.Tool {
+		case "claude":
+			if i.ClaudeSessionID == "" {
+				interval = 500 * time.Millisecond
+			}
+		case "gemini":
+			if i.GeminiSessionID == "" {
+				interval = 500 * time.Millisecond
+			}
+		case "codex":
+			if i.CodexSessionID == "" {
+				interval = 500 * time.Millisecond
+			}
+		}
+		if i.lastSessionMetaSync.IsZero() || time.Since(i.lastSessionMetaSync) >= interval {
+			i.lastSessionMetaSync = time.Now()
 
-	// Update Gemini session tracking (non-blocking, best-effort)
-	if i.Tool == "gemini" {
-		i.UpdateGeminiSession(nil)
+			// Update Claude session tracking (non-blocking, best-effort)
+			i.UpdateClaudeSession(nil)
+
+			// Update Gemini session tracking (non-blocking, best-effort)
+			if i.Tool == "gemini" {
+				i.UpdateGeminiSession(nil)
+			}
+
+			// Update Codex session tracking (non-blocking, best-effort)
+			if i.Tool == "codex" {
+				var exclude map[string]bool
+				if i.CodexSessionID == "" {
+					exclude = i.collectOtherCodexSessionIDs()
+				}
+				i.UpdateCodexSession(exclude)
+			}
+		}
 	}
 
 	return nil
@@ -561,45 +2515,385 @@ func (i *Instance) UpdateStatus() error {
 //
 // No file scanning fallback - we rely on the consistent capture-resume pattern.
 func (i *Instance) UpdateClaudeSession(excludeIDs map[string]bool) {
-	if i.Tool != "claude" {
+	if !IsClaudeCompatible(i.Tool) {
 		return
 	}
 
 	// Read from tmux environment (set by capture-resume pattern)
 	if sessionID := i.GetSessionIDFromTmux(); sessionID != "" {
 		if i.ClaudeSessionID != sessionID {
+			// Quality gate: don't adopt a zombie ID from tmux env when current has real data
+			if i.ClaudeSessionID != "" {
+				currentHasData := sessionHasConversationData(i.ClaudeSessionID, i.ProjectPath)
+				candidateHasData := sessionHasConversationData(sessionID, i.ProjectPath)
+				if currentHasData && !candidateHasData {
+					sessionLog.Debug("claude_session_tmux_rejected_zombie",
+						slog.String("current_id", i.ClaudeSessionID),
+						slog.String("zombie_id", sessionID),
+						slog.String("reason", "tmux_env_has_zombie_id"),
+					)
+					// Don't adopt the zombie; skip the update but still refresh prompt below
+					sessionID = i.ClaudeSessionID
+				}
+			}
 			i.ClaudeSessionID = sessionID
 		}
 		i.ClaudeDetectedAt = time.Now()
 	}
+
+	// Update latest prompt from JSONL file (tail-read with size caching)
+	if i.ClaudeSessionID != "" {
+		jsonlPath := i.GetJSONLPath()
+		if jsonlPath != "" {
+			if prompt := i.readJSONLTail(jsonlPath); prompt != "" {
+				i.LatestPrompt = prompt
+			}
+		}
+	}
 }
 
-// UpdateGeminiSession updates the Gemini session ID from tmux environment.
-// The capture-resume pattern (used in Start/Restart) sets GEMINI_SESSION_ID
-// in the tmux environment, making this the single authoritative source.
-//
-// No file scanning fallback - we rely on the consistent capture-resume pattern.
-func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
+// collectOtherClaudeSessionIDs enumerates all agent-deck tmux sessions (except this one)
+// and returns the set of CLAUDE_SESSION_ID values they own. Used to avoid stealing
+// another instance's session when scanning for the most recent .jsonl on disk.
+func (i *Instance) collectOtherClaudeSessionIDs() map[string]bool {
+	exclude := make(map[string]bool)
+
+	tmuxSessions, err := tmux.ListAgentDeckSessions()
+	if err != nil {
+		return exclude
+	}
+
+	myTmuxName := ""
+	if i.tmuxSession != nil {
+		myTmuxName = i.tmuxSession.Name
+	}
+
+	for _, sessName := range tmuxSessions {
+		if sessName == myTmuxName {
+			continue
+		}
+		// Read CLAUDE_SESSION_ID from the other tmux session
+		other := &tmux.Session{Name: sessName}
+		if id, err := other.GetEnvironment("CLAUDE_SESSION_ID"); err == nil && id != "" {
+			exclude[id] = true
+		}
+	}
+
+	return exclude
+}
+
+// syncClaudeSessionFromDisk scans the filesystem for the most recent session file,
+// excluding IDs owned by other agent-deck instances. If a different (newer) session
+// is found, it updates ClaudeSessionID, ClaudeDetectedAt, and the tmux env var.
+// This handles the case where /clear in Claude Code creates a new session UUID
+// that the tmux env var doesn't know about yet.
+func (i *Instance) syncClaudeSessionFromDisk() {
+	if !IsClaudeCompatible(i.Tool) {
+		return
+	}
+
+	configDir := GetClaudeConfigDir()
+	exclude := i.collectOtherClaudeSessionIDs()
+
+	activeID := findActiveSessionIDExcluding(configDir, i.ProjectPath, exclude)
+	if activeID == "" || activeID == i.ClaudeSessionID {
+		return
+	}
+
+	// Quality gate: don't replace a session with real conversation data with a zombie
+	// (a zombie is a session file with no conversation data, typically from a crashed startup)
+	if i.ClaudeSessionID != "" {
+		currentHasData := sessionHasConversationData(i.ClaudeSessionID, i.ProjectPath)
+		candidateHasData := sessionHasConversationData(activeID, i.ProjectPath)
+
+		// Decision matrix:
+		//   current=real, candidate=real   → ACCEPT (handles /clear: both real, newer wins)
+		//   current=real, candidate=zombie  → REJECT (never replace real with zombie)
+		//   current=zombie, candidate=real  → ACCEPT (upgrade from zombie to real)
+		//   current=zombie, candidate=zombie → REJECT (don't swap zombies)
+		if currentHasData && !candidateHasData {
+			sessionLog.Debug("claude_session_sync_rejected_zombie",
+				slog.String("current_id", i.ClaudeSessionID),
+				slog.String("zombie_id", activeID),
+				slog.String("reason", "candidate_has_no_conversation_data"),
+			)
+			return
+		}
+		if !currentHasData && !candidateHasData {
+			sessionLog.Debug("claude_session_sync_rejected_zombie",
+				slog.String("current_id", i.ClaudeSessionID),
+				slog.String("candidate_id", activeID),
+				slog.String("reason", "both_have_no_conversation_data"),
+			)
+			return
+		}
+	}
+
+	sessionLog.Debug("claude_session_update_from_disk", slog.String("old_id", i.ClaudeSessionID), slog.String("new_id", activeID))
+	i.ClaudeSessionID = activeID
+	i.ClaudeDetectedAt = time.Now()
+
+	// Sync back to tmux environment so restart uses the new ID
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", activeID)
+	}
+}
+
+// UpdateHookStatus updates the instance's hook-based status fields.
+// Called by StatusFileWatcher when a hook status file changes.
+func (i *Instance) UpdateHookStatus(status *HookStatus) {
+	if status == nil {
+		return
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.hookStatus = status.Status
+	i.hookLastUpdate = status.UpdatedAt
+
+	// Resolve session ID from hook payload first, then sidecar anchor.
+	sessionID := strings.TrimSpace(status.SessionID)
+	if sessionID == "" {
+		sessionID = ReadHookSessionAnchor(i.ID)
+	}
+	if sessionID == "" {
+		return
+	}
+
+	switch {
+	case IsClaudeCompatible(i.Tool):
+		if sessionID == i.ClaudeSessionID {
+			return
+		}
+		// Quality gate: only accept if the hook session has conversation data,
+		// OR if the current session ID is empty (first detection).
+		if i.ClaudeSessionID == "" || sessionHasConversationData(sessionID, i.ProjectPath) {
+			sessionLog.Debug("claude_session_update_from_hook",
+				slog.String("old_id", i.ClaudeSessionID),
+				slog.String("new_id", sessionID),
+				slog.String("event", status.Event),
+			)
+			i.ClaudeSessionID = sessionID
+			i.ClaudeDetectedAt = time.Now()
+			i.hookSessionID = sessionID
+
+			if i.tmuxSession != nil && i.tmuxSession.Exists() {
+				_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", sessionID)
+			}
+		}
+	case i.Tool == "codex":
+		if sessionID == i.CodexSessionID {
+			return
+		}
+		sessionLog.Debug("codex_session_update_from_hook",
+			slog.String("old_id", i.CodexSessionID),
+			slog.String("new_id", sessionID),
+			slog.String("event", status.Event),
+		)
+		i.CodexSessionID = sessionID
+		i.CodexDetectedAt = time.Now()
+		i.hookSessionID = sessionID
+
+		if i.tmuxSession != nil && i.tmuxSession.Exists() {
+			_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID)
+		}
+	case i.Tool == "gemini":
+		if sessionID == i.GeminiSessionID {
+			return
+		}
+		// Quality gate: only accept when candidate session appears valid on disk,
+		// OR when current session is empty (first detection/bootstrap).
+		if i.GeminiSessionID == "" || geminiSessionHasConversationData(sessionID, i.ProjectPath) {
+			sessionLog.Debug("gemini_session_update_from_hook",
+				slog.String("old_id", i.GeminiSessionID),
+				slog.String("new_id", sessionID),
+				slog.String("event", status.Event),
+			)
+			i.GeminiSessionID = sessionID
+			i.GeminiDetectedAt = time.Now()
+			i.hookSessionID = sessionID
+
+			if i.tmuxSession != nil && i.tmuxSession.Exists() {
+				_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", sessionID)
+			}
+		}
+	}
+}
+
+// GetHookStatus returns the current hook-based status and its freshness.
+// Freshness window is tool-specific.
+func (i *Instance) GetHookStatus() (string, bool) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+
+	if i.hookStatus == "" {
+		return "", false
+	}
+	fresh := time.Since(i.hookLastUpdate) < hookFastPathFreshnessForTool(i.Tool, i.hookStatus)
+	return i.hookStatus, fresh
+}
+
+// ClearHookStatus resets the hook-based status, forcing the next UpdateStatus()
+// to fall through to polling. Used when the user manually overrides status (e.g., pressing 'u'
+// to unacknowledge after an Escape interrupt where the Stop hook didn't fire).
+func (i *Instance) ClearHookStatus() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.hookStatus = ""
+	i.hookLastUpdate = time.Time{}
+}
+
+// ForceNextStatusCheck clears the idle polling optimization so the next
+// UpdateStatus() performs a full check instead of short-circuiting.
+// Call this before UpdateStatus() when a status-affecting change was made
+// externally (e.g. the u key toggling acknowledged state).
+func (i *Instance) ForceNextStatusCheck() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.lastIdleCheck = time.Time{}
+}
+
+// SetGeminiYoloMode sets the YOLO mode for Gemini and syncs it to the tmux environment.
+// This ensures the background status worker sees the correct state during restarts.
+func (i *Instance) SetGeminiYoloMode(enabled bool) {
 	if i.Tool != "gemini" {
 		return
 	}
 
-	// Read from tmux environment (set by capture-resume pattern)
-	if i.tmuxSession != nil {
-		if sessionID, err := i.tmuxSession.GetEnvironment("GEMINI_SESSION_ID"); err == nil && sessionID != "" {
-			if i.GeminiSessionID != sessionID {
-				i.GeminiSessionID = sessionID
+	i.GeminiYoloMode = &enabled
+
+	// Sync to tmux environment immediately if session exists
+	// This ensures background detection (UpdateGeminiSession) sees the new value
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		val := "false"
+		if enabled {
+			val = "true"
+		}
+		_ = i.tmuxSession.SetEnvironment("GEMINI_YOLO_MODE", val)
+	}
+}
+
+// UpdateGeminiSession updates the Gemini session ID, YOLO mode, analytics, and latest prompt.
+// Delegates to focused helpers for each concern.
+func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
+	if i.Tool != "gemini" {
+		return
+	}
+	i.syncGeminiSessionFromTmux()
+	i.syncGeminiSessionFromDisk()
+	i.updateGeminiAnalytics()
+	i.updateGeminiLatestPrompt()
+}
+
+// syncGeminiSessionFromTmux reads session ID and YOLO mode from tmux environment (authoritative source).
+func (i *Instance) syncGeminiSessionFromTmux() {
+	if i.tmuxSession == nil {
+		return
+	}
+	if sessionID, err := i.tmuxSession.GetEnvironment("GEMINI_SESSION_ID"); err == nil && sessionID != "" {
+		if i.GeminiSessionID != sessionID {
+			i.GeminiSessionID = sessionID
+		}
+		i.GeminiDetectedAt = time.Now()
+	}
+
+	// Detect YOLO Mode from environment (authoritative sync)
+	if yoloEnv, err := i.tmuxSession.GetEnvironment("GEMINI_YOLO_MODE"); err == nil && yoloEnv != "" {
+		enabled := yoloEnv == "true"
+		i.GeminiYoloMode = &enabled
+	}
+}
+
+// syncGeminiSessionFromDisk scans the filesystem for the most recent session.
+// Krudony fix: user may have started a NEW session, so always scan rather than using stale cached ID.
+func (i *Instance) syncGeminiSessionFromDisk() {
+	sessions, err := ListGeminiSessions(i.ProjectPath)
+	if err != nil || len(sessions) == 0 {
+		return
+	}
+
+	// Pick the most recent session (list is sorted by LastUpdated desc)
+	mostRecent := sessions[0]
+	if mostRecent.SessionID != i.GeminiSessionID {
+		sessionLog.Debug(
+			"gemini_session_update",
+			slog.String("old_id", i.GeminiSessionID),
+			slog.String("new_id", mostRecent.SessionID),
+		)
+	}
+	i.GeminiSessionID = mostRecent.SessionID
+	i.GeminiDetectedAt = time.Now()
+
+	// Sync back to tmux environment for future restarts
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", i.GeminiSessionID)
+	}
+}
+
+// updateGeminiAnalytics refreshes token counts, cost, and model from the session file.
+// Syncs the detected model back to the instance's GeminiModel field.
+func (i *Instance) updateGeminiAnalytics() {
+	if i.GeminiSessionID == "" {
+		return
+	}
+	if i.GeminiAnalytics == nil {
+		i.GeminiAnalytics = &GeminiSessionAnalytics{}
+	}
+	// Non-blocking update (ignore errors, best effort)
+	_ = UpdateGeminiAnalyticsFromDisk(i.ProjectPath, i.GeminiSessionID, i.GeminiAnalytics)
+
+	// Sync detected model from analytics to instance (if not explicitly set by user)
+	if i.GeminiModel == "" && i.GeminiAnalytics.Model != "" {
+		i.GeminiModel = i.GeminiAnalytics.Model
+	}
+}
+
+// updateGeminiLatestPrompt extracts the latest user prompt from the session file.
+// Uses mtime caching to skip re-reading unchanged files (important for large session files).
+func (i *Instance) updateGeminiLatestPrompt() {
+	if i.GeminiSessionID == "" || len(i.GeminiSessionID) < 8 {
+		return
+	}
+
+	sessionsDir := GetGeminiSessionsDir(i.ProjectPath)
+	pattern := filepath.Join(sessionsDir, "session-*-"+i.GeminiSessionID[:8]+".json")
+	filePath, fileMtime := findNewestFile(pattern)
+
+	// Fallback: cross-project search
+	if filePath == "" {
+		filePath = findGeminiSessionInAllProjects(i.GeminiSessionID)
+		if filePath != "" {
+			if info, err := os.Stat(filePath); err == nil {
+				fileMtime = info.ModTime()
 			}
-			i.GeminiDetectedAt = time.Now()
 		}
 	}
+
+	if filePath == "" {
+		return
+	}
+
+	// mtime cache: skip re-read if file hasn't changed since last read
+	if !i.lastPromptModTime.IsZero() && !fileMtime.IsZero() && fileMtime.Equal(i.lastPromptModTime) {
+		return
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return
+	}
+	if prompt, err := parseGeminiLatestUserPrompt(data); err == nil && prompt != "" {
+		i.LatestPrompt = prompt
+	}
+	i.lastPromptModTime = fileMtime
 }
 
 // WaitForClaudeSession waits for the tmux environment variable to be set.
 // The capture-resume pattern sets CLAUDE_SESSION_ID in tmux env, so we poll for that.
 // Returns the detected session ID or empty string after timeout.
 func (i *Instance) WaitForClaudeSession(maxWait time.Duration) string {
-	if i.Tool != "claude" {
+	if !IsClaudeCompatible(i.Tool) {
 		return ""
 	}
 
@@ -626,6 +2920,23 @@ func (i *Instance) WaitForClaudeSession(maxWait time.Duration) string {
 func (i *Instance) WaitForClaudeSessionWithExclude(maxWait time.Duration, excludeIDs map[string]bool) string {
 	// tmux env is authoritative - no need for exclusion logic
 	return i.WaitForClaudeSession(maxWait)
+}
+
+// PostStartSync captures session IDs from tmux environment after Start() or Restart().
+// Designed for CLI commands that exit after starting. The TUI doesn't need this
+// because its background worker handles detection.
+//
+// For Claude: polls tmux env for CLAUDE_SESSION_ID (set by bash uuidgen before exec).
+// For Gemini: reads session ID from filesystem.
+// For OpenCode/Codex: no-op (async goroutine detection, too slow for sync CLI).
+func (i *Instance) PostStartSync(maxWait time.Duration) {
+	switch {
+	case IsClaudeCompatible(i.Tool):
+		i.WaitForClaudeSession(maxWait)
+	case i.Tool == "gemini":
+		i.UpdateGeminiSession(nil)
+	}
+	// OpenCode/Codex: async detection already started by Start(), skip here
 }
 
 // Preview returns the last 3 lines of terminal output
@@ -656,6 +2967,14 @@ func (i *Instance) PreviewFull() (string, error) {
 	return i.tmuxSession.CaptureFullHistory()
 }
 
+// PreviewWindowFull returns the full scrollback of a specific tmux window.
+func (i *Instance) PreviewWindowFull(windowIndex int) (string, error) {
+	if i.tmuxSession == nil {
+		return "", fmt.Errorf("tmux session not initialized")
+	}
+	return i.tmuxSession.CaptureWindowFullHistory(windowIndex)
+}
+
 // HasUpdated checks if there's new output since last check
 func (i *Instance) HasUpdated() bool {
 	if i.tmuxSession == nil {
@@ -668,6 +2987,69 @@ func (i *Instance) HasUpdated() bool {
 	}
 
 	return updated
+}
+
+// SyncSessionIDsToTmux syncs session IDs from Instance to tmux environment.
+// PERFORMANCE: This is called on-demand (e.g., first attach) rather than at load time
+// to reduce subprocess overhead during TUI startup.
+//
+// Session IDs are needed in tmux environment for restart/resume operations that
+// spawn new processes. Without this sync, R key wouldn't resume the correct session.
+func (i *Instance) SyncSessionIDsToTmux() {
+	if i.tmuxSession == nil || !i.tmuxSession.Exists() {
+		return
+	}
+
+	// Sync ClaudeSessionID
+	if i.ClaudeSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("CLAUDE_SESSION_ID", i.ClaudeSessionID)
+	}
+
+	// Sync GeminiSessionID
+	if i.GeminiSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("GEMINI_SESSION_ID", i.GeminiSessionID)
+	}
+
+	// Sync OpenCodeSessionID
+	if i.OpenCodeSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("OPENCODE_SESSION_ID", i.OpenCodeSessionID)
+	}
+
+	// Sync CodexSessionID
+	if i.CodexSessionID != "" {
+		_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", i.CodexSessionID)
+	}
+}
+
+// SyncSessionIDsFromTmux reads tool session IDs from the tmux environment
+// into the Instance struct. This is the reverse of SyncSessionIDsToTmux.
+// Used in the stop path to capture IDs that may not have been saved during
+// start (e.g., if PostStartSync timed out but the tool started late).
+// Only updates fields where the tmux env has a non-empty value; does not
+// blank existing IDs if the tmux env is missing the variable.
+func (i *Instance) SyncSessionIDsFromTmux() {
+	if i.tmuxSession == nil || !i.tmuxSession.Exists() {
+		return
+	}
+
+	if id, err := i.tmuxSession.GetEnvironment("CLAUDE_SESSION_ID"); err == nil && id != "" {
+		i.ClaudeSessionID = id
+		if i.ClaudeDetectedAt.IsZero() {
+			i.ClaudeDetectedAt = time.Now()
+		}
+	}
+
+	if id, err := i.tmuxSession.GetEnvironment("GEMINI_SESSION_ID"); err == nil && id != "" {
+		i.GeminiSessionID = id
+	}
+
+	if id, err := i.tmuxSession.GetEnvironment("OPENCODE_SESSION_ID"); err == nil && id != "" {
+		i.OpenCodeSessionID = id
+	}
+
+	if id, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && id != "" {
+		i.CodexSessionID = id
+	}
 }
 
 // ResponseOutput represents a parsed response from an agent session
@@ -684,13 +3066,130 @@ type ResponseOutput struct {
 // For Gemini: Parses the JSON session file for the last assistant message
 // For Codex/Others: Attempts to parse terminal output
 func (i *Instance) GetLastResponse() (*ResponseOutput, error) {
-	if i.Tool == "claude" {
+	if IsClaudeCompatible(i.Tool) {
 		return i.getClaudeLastResponse()
 	}
 	if i.Tool == "gemini" {
 		return i.getGeminiLastResponse()
 	}
 	return i.getTerminalLastResponse()
+}
+
+// GetLastResponseBestEffort returns the last assistant response with fallback logic
+// intended for CLI read paths (like `session output`) where we prefer useful output
+// over hard errors.
+//
+// Behavior for Claude:
+// 1. Try structured JSONL read via stored ClaudeSessionID.
+// 2. Refresh ID from tmux env and retry.
+// 3. Scan disk for active session ID and retry.
+// 4. Fallback to terminal parsing.
+// 5. If still unavailable, return an empty response (no error).
+//
+// Behavior for Gemini (mirrors Claude):
+// 1. Try structured JSON read via stored GeminiSessionID.
+// 2. Refresh ID from tmux env and retry.
+// 3. Scan disk for latest session and retry.
+// 4. Fallback to terminal parsing.
+// 5. If still unavailable, return an empty response (no error).
+func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
+	resp, err := i.GetLastResponse()
+	if err == nil {
+		return resp, nil
+	}
+
+	// Claude-specific recovery path
+	if IsClaudeCompatible(i.Tool) {
+		// Refresh from tmux env (fast path)
+		if sessionID := i.GetSessionIDFromTmux(); sessionID != "" {
+			i.ClaudeSessionID = sessionID
+			i.ClaudeDetectedAt = time.Now()
+			if recovered, recoverErr := i.getClaudeLastResponse(); recoverErr == nil {
+				return recovered, nil
+			}
+		}
+
+		// Fallback: detect latest session on disk (handles startup race / stale ID)
+		i.syncClaudeSessionFromDisk()
+		if i.ClaudeSessionID != "" {
+			if recovered, recoverErr := i.getClaudeLastResponse(); recoverErr == nil {
+				return recovered, nil
+			}
+		}
+	}
+
+	// Gemini-specific recovery path (mirrors Claude recovery above)
+	if i.Tool == "gemini" {
+		// Refresh from tmux env (fast path)
+		i.syncGeminiSessionFromTmux()
+		if i.GeminiSessionID != "" {
+			if recovered, recoverErr := i.getGeminiLastResponse(); recoverErr == nil {
+				return recovered, nil
+			}
+		}
+
+		// Fallback: detect latest session on disk (handles startup race / stale ID)
+		i.syncGeminiSessionFromDisk()
+		if i.GeminiSessionID != "" {
+			if recovered, recoverErr := i.getGeminiLastResponse(); recoverErr == nil {
+				return recovered, nil
+			}
+		}
+	}
+
+	// Final fallback: terminal parsing (works for all tools).
+	if i.tmuxSession != nil {
+		if terminalResp, terminalErr := i.getTerminalLastResponse(); terminalErr == nil {
+			return terminalResp, nil
+		}
+	}
+
+	// For Claude and Gemini, prefer a graceful empty response instead of a hard error.
+	if IsClaudeCompatible(i.Tool) || i.Tool == "gemini" {
+		toolName := i.Tool
+		if IsClaudeCompatible(toolName) {
+			toolName = "claude"
+		}
+		return &ResponseOutput{
+			Tool:    toolName,
+			Role:    "assistant",
+			Content: "",
+		}, nil
+	}
+
+	return nil, err
+}
+
+// GetJSONLPath returns the path to the Claude session JSONL file for analytics
+// Returns empty string if this is not a Claude session or no session ID is available
+func (i *Instance) GetJSONLPath() string {
+	if !IsClaudeCompatible(i.Tool) || i.ClaudeSessionID == "" {
+		return ""
+	}
+
+	configDir := GetClaudeConfigDir()
+
+	// Resolve symlinks in project path (macOS: /tmp -> /private/tmp)
+	resolvedPath := i.ProjectPath
+	if resolved, err := filepath.EvalSymlinks(i.ProjectPath); err == nil {
+		resolvedPath = resolved
+	}
+
+	// Convert project path to Claude's directory format
+	// Claude replaces ALL non-alphanumeric chars (spaces, !, etc.) with hyphens
+	// /Users/master/Code cloud/!Project -> -Users-master-Code-cloud--Project
+	projectDirName := ConvertToClaudeDirName(resolvedPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+
+	// Build the JSONL file path
+	sessionFile := filepath.Join(projectDir, i.ClaudeSessionID+".jsonl")
+
+	// Verify file exists before returning
+	if _, err := os.Stat(sessionFile); os.IsNotExist(err) {
+		return ""
+	}
+
+	return sessionFile
 }
 
 // getClaudeLastResponse extracts the last assistant message from Claude's JSONL file
@@ -709,8 +3208,9 @@ func (i *Instance) getClaudeLastResponse() (*ResponseOutput, error) {
 	}
 
 	// Convert project path to Claude's directory format
-	// /Users/ashesh/claude-deck -> -Users-ashesh-claude-deck
-	projectDirName := strings.ReplaceAll(resolvedPath, "/", "-")
+	// Claude replaces ALL non-alphanumeric chars (spaces, !, etc.) with hyphens
+	// /Users/master/Code cloud/!Project -> -Users-master-Code-cloud--Project
+	projectDirName := ConvertToClaudeDirName(resolvedPath)
 	projectDir := filepath.Join(configDir, "projects", projectDirName)
 
 	// Use stored session ID directly
@@ -827,6 +3327,172 @@ func parseClaudeLastAssistantMessage(data []byte, sessionID string) (*ResponseOu
 	}, nil
 }
 
+// parseClaudeLatestUserPrompt parses a Claude JSONL file to extract the last user message
+func parseClaudeLatestUserPrompt(data []byte) (string, error) {
+	// JSONL record structure
+	type claudeMessage struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	type claudeRecord struct {
+		Message json.RawMessage `json:"message"`
+	}
+
+	var latestPrompt string
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	// Handle large lines
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var record claudeRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			continue // Skip malformed lines
+		}
+
+		// Only care about messages
+		if len(record.Message) == 0 {
+			continue
+		}
+
+		var msg claudeMessage
+		if err := json.Unmarshal(record.Message, &msg); err != nil {
+			continue
+		}
+
+		// Only care about user messages
+		if msg.Role != "user" {
+			continue
+		}
+
+		// Extract content (can be string or array of blocks)
+		var contentStr string
+		var extractedText string
+		if err := json.Unmarshal(msg.Content, &contentStr); err == nil {
+			// Simple string content
+			extractedText = contentStr
+		} else {
+			// Try as array of content blocks
+			var blocks []map[string]interface{}
+			if err := json.Unmarshal(msg.Content, &blocks); err == nil {
+				var sb strings.Builder
+				for _, block := range blocks {
+					if blockType, ok := block["type"].(string); ok && blockType == "text" {
+						if text, ok := block["text"].(string); ok {
+							sb.WriteString(text)
+							sb.WriteString(" ")
+						}
+					}
+				}
+				extractedText = strings.TrimSpace(sb.String())
+			}
+		}
+
+		// Sanitize: strip newlines and extra spaces for single-line display
+		if extractedText != "" {
+			content := strings.ReplaceAll(extractedText, "\n", " ")
+			latestPrompt = strings.Join(strings.Fields(content), " ")
+		}
+	}
+
+	return latestPrompt, nil
+}
+
+// readJSONLTail reads the last user prompt from a JSONL file using tail-read with size caching.
+// Instead of reading the entire file (can be 100-800MB), it:
+// 1. Stats the file to get current size (cheap syscall)
+// 2. Skips reading entirely if size hasn't changed since last check
+// 3. Only reads the last 32KB when the file has grown
+func (i *Instance) readJSONLTail(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	size := info.Size()
+
+	// If same file and same size, return cached prompt
+	if path == i.lastJSONLPath && size == i.lastJSONLSize {
+		return i.cachedPrompt
+	}
+
+	// File changed or new file - read the tail
+	const tailSize int64 = 32 * 1024 // 32KB
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	offset := size - tailSize
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > 0 {
+		if _, err := f.Seek(offset, 0); err != nil {
+			return ""
+		}
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return ""
+	}
+
+	// If we seeked into the middle of the file, skip to the first complete line
+	if offset > 0 {
+		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+			data = data[idx+1:]
+		}
+	}
+
+	prompt, err := parseClaudeLatestUserPrompt(data)
+	if err != nil || prompt == "" {
+		// Update cache even on empty result to avoid re-reading
+		i.lastJSONLPath = path
+		i.lastJSONLSize = size
+		return i.cachedPrompt // Return previous cached value
+	}
+
+	i.lastJSONLPath = path
+	i.lastJSONLSize = size
+	i.cachedPrompt = prompt
+	return prompt
+}
+
+// parseGeminiLatestUserPrompt parses a Gemini JSON file to extract the last user message
+func parseGeminiLatestUserPrompt(data []byte) (string, error) {
+	var session struct {
+		Messages []struct {
+			Type    string `json:"type"` // "user" or "gemini"
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+
+	if err := json.Unmarshal(data, &session); err != nil {
+		return "", fmt.Errorf("failed to parse Gemini session: %w", err)
+	}
+
+	var latestPrompt string
+	// Find last "user" type message
+	for i := len(session.Messages) - 1; i >= 0; i-- {
+		msg := session.Messages[i]
+		if msg.Type == "user" {
+			// Sanitize: strip newlines and extra spaces for single-line display
+			content := strings.ReplaceAll(msg.Content, "\n", " ")
+			latestPrompt = strings.Join(strings.Fields(content), " ")
+			break
+		}
+	}
+
+	return latestPrompt, nil
+}
+
 // getGeminiLastResponse extracts the last assistant message from Gemini's JSON file
 func (i *Instance) getGeminiLastResponse() (*ResponseOutput, error) {
 	// Require stored session ID - no fallback to file scanning
@@ -840,6 +3506,14 @@ func (i *Instance) getGeminiLastResponse() (*ResponseOutput, error) {
 	// Filename format is session-YYYY-MM-DDTHH-MM-<uuid8>.json
 	pattern := filepath.Join(sessionsDir, "session-*-"+i.GeminiSessionID[:8]+".json")
 	files, _ := filepath.Glob(pattern)
+
+	// Fallback: cross-project search if not found in expected location
+	if len(files) == 0 {
+		if fallbackPath := findGeminiSessionInAllProjects(i.GeminiSessionID); fallbackPath != "" {
+			files = []string{fallbackPath}
+		}
+	}
+
 	if len(files) == 0 {
 		return nil, fmt.Errorf("session file not found for ID: %s", i.GeminiSessionID)
 	}
@@ -860,14 +3534,14 @@ func parseGeminiLastAssistantMessage(data []byte) (*ResponseOutput, error) {
 	var session struct {
 		SessionID string `json:"sessionId"` // VERIFIED: camelCase
 		Messages  []struct {
-			ID        string          `json:"id"`
-			Timestamp string          `json:"timestamp"`
-			Type      string          `json:"type"` // VERIFIED: "user" or "gemini"
-			Content   string          `json:"content"`
+			ID        string            `json:"id"`
+			Timestamp string            `json:"timestamp"`
+			Type      string            `json:"type"` // VERIFIED: "user" or "gemini"
+			Content   string            `json:"content"`
 			ToolCalls []json.RawMessage `json:"toolCalls,omitempty"`
 			Thoughts  []json.RawMessage `json:"thoughts,omitempty"`
-			Model     string          `json:"model,omitempty"`
-			Tokens    json.RawMessage `json:"tokens,omitempty"`
+			Model     string            `json:"model,omitempty"`
+			Tokens    json.RawMessage   `json:"tokens,omitempty"`
 		} `json:"messages"`
 	}
 
@@ -918,6 +3592,7 @@ func (i *Instance) getTerminalLastResponse() (*ResponseOutput, error) {
 
 // parseGeminiOutput parses Gemini CLI output to extract the last response
 func parseGeminiOutput(content string) (*ResponseOutput, error) {
+	content = tmux.StripANSI(content)
 	lines := strings.Split(content, "\n")
 
 	// Gemini typically shows responses after "▸" prompt and before the next ">"
@@ -936,7 +3611,7 @@ func parseGeminiOutput(content string) (*ResponseOutput, error) {
 
 		// Detect prompt line (end of response when reading backwards)
 		// Common prompts: "> ", ">>> ", "$", "❯", "➜"
-		isPrompt := regexp.MustCompile(`^(>|>>>|\$|❯|➜|gemini>)\s*$`).MatchString(trimmed)
+		isPrompt := geminiPromptRE.MatchString(trimmed)
 
 		if isPrompt && inResponse {
 			// We've found the start of the response block
@@ -959,9 +3634,6 @@ func parseGeminiOutput(content string) (*ResponseOutput, error) {
 
 	// Clean up the response
 	response := strings.TrimSpace(strings.Join(responseLines, "\n"))
-	// Remove ANSI codes
-	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	response = ansiRegex.ReplaceAllString(response, "")
 
 	return &ResponseOutput{
 		Tool:    "gemini",
@@ -978,13 +3650,14 @@ func parseCodexOutput(content string) (*ResponseOutput, error) {
 
 // parseGenericOutput is a fallback parser for unknown tools
 func parseGenericOutput(content, tool string) (*ResponseOutput, error) {
+	content = tmux.StripANSI(content)
 	lines := strings.Split(content, "\n")
 
 	// Look for the last substantial block of text (more than 2 lines)
 	// before a prompt character
 	var responseLines []string
 	inResponse := false
-	promptPattern := regexp.MustCompile(`^[\s]*(>|>>>|\$|❯|➜|#|%)\s*$`)
+	promptPattern := shellPromptRE
 
 	for idx := len(lines) - 1; idx >= 0; idx-- {
 		line := lines[idx]
@@ -1018,8 +3691,6 @@ func parseGenericOutput(content, tool string) (*ResponseOutput, error) {
 
 	// Clean up
 	response := strings.TrimSpace(strings.Join(responseLines, "\n"))
-	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	response = ansiRegex.ReplaceAllString(response, "")
 
 	return &ResponseOutput{
 		Tool:    tool,
@@ -1028,16 +3699,43 @@ func parseGenericOutput(content, tool string) (*ResponseOutput, error) {
 	}, nil
 }
 
-// Kill terminates the tmux session
+// Kill terminates the tmux session and cleans up sandbox container if present.
 func (i *Instance) Kill() error {
-	if i.tmuxSession == nil {
-		return fmt.Errorf("tmux session not initialized")
+	// Kill tmux session first, but always continue to container cleanup.
+	var tmuxErr error
+	if i.tmuxSession != nil {
+		tmuxErr = i.tmuxSession.Kill()
 	}
 
-	if err := i.tmuxSession.Kill(); err != nil {
-		return fmt.Errorf("failed to kill tmux session: %w", err)
+	// Clean up sandbox container (only if name matches our prefix convention).
+	// Runs regardless of tmux kill result to avoid orphaned containers.
+	if i.SandboxContainer != "" && docker.IsManagedContainer(i.SandboxContainer) {
+		dockerCfg := GetDockerSettings()
+		if dockerCfg.GetAutoCleanup() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			ctr := docker.FromName(i.SandboxContainer)
+			_ = ctr.Remove(ctx, true) // Force remove, ignore errors.
+			i.SandboxContainer = ""
+		} else {
+			sessionLog.Info("sandbox_container_kept", slog.String("container", i.SandboxContainer))
+		}
 	}
-	i.Status = StatusError
+
+	// Remove plaintext keychain credential files extracted during sandbox sync.
+	// Gated on IsSandboxed() (not SandboxContainer) so cleanup runs even if
+	// container creation failed after credential extraction.
+	if i.IsSandboxed() {
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			docker.CleanupKeychainCredentials(homeDir)
+		}
+	}
+
+	i.Status = StatusStopped
+
+	if tmuxErr != nil {
+		return fmt.Errorf("failed to kill tmux session: %w", tmuxErr)
+	}
 	return nil
 }
 
@@ -1045,30 +3743,57 @@ func (i *Instance) Kill() error {
 // For Claude sessions with known ID: sends Ctrl+C twice and resume command to existing session
 // For dead sessions or unknown ID: recreates the tmux session
 func (i *Instance) Restart() error {
-	log.Printf("[MCP-DEBUG] Instance.Restart() called - Tool=%s, ClaudeSessionID=%q, tmuxSession=%v, tmuxExists=%v",
-		i.Tool, i.ClaudeSessionID, i.tmuxSession != nil, i.tmuxSession != nil && i.tmuxSession.Exists())
+	mcpLog.Debug(
+		"restart_called",
+		slog.String("tool", i.Tool),
+		slog.String("claude_session_id", i.ClaudeSessionID),
+		slog.Bool("tmux_session", i.tmuxSession != nil),
+		slog.Bool("tmux_exists", i.tmuxSession != nil && i.tmuxSession.Exists()),
+	)
+
+	// Clear flag immediately to prevent it staying set if restart fails
+	skipRegen := i.SkipMCPRegenerate
+	i.SkipMCPRegenerate = false
 
 	// Regenerate .mcp.json before restart to use socket pool if available
-	// This ensures Claude picks up socket configs instead of stdio
-	if i.Tool == "claude" {
-		i.regenerateMCPConfig()
+	// Skip if MCP dialog just wrote the config (avoids race condition)
+	if IsClaudeCompatible(i.Tool) && !skipRegen {
+		if err := i.regenerateMCPConfig(); err != nil {
+			mcpLog.Warn("mcp_config_regen_failed", slog.String("error", err.Error()))
+			// Continue with restart - Claude will use existing .mcp.json or defaults
+		}
+	} else if skipRegen {
+		mcpLog.Debug("mcp_regen_skipped", slog.String("reason", "flag_set_by_apply"))
 	}
 
-	// If Claude session with known ID AND tmux session exists, use respawn-pane
-	if i.Tool == "claude" && i.ClaudeSessionID != "" && i.tmuxSession != nil && i.tmuxSession.Exists() {
-		// Build the resume command with proper config
-		resumeCmd := i.buildClaudeResumeCommand()
-		log.Printf("[MCP-DEBUG] Using respawn-pane with command: %s", resumeCmd)
+	// Sync Claude session from disk before restart to pick up /clear session changes
+	if IsClaudeCompatible(i.Tool) {
+		i.syncClaudeSessionFromDisk()
+	}
+
+	// If Claude session with known ID AND tmux session exists, use respawn-pane.
+	if IsClaudeCompatible(i.Tool) && i.ClaudeSessionID != "" && i.tmuxSession != nil && i.tmuxSession.Exists() {
+		resumeCmd, containerName, err := i.prepareCommand(i.buildClaudeResumeCommand())
+		if err != nil {
+			return err
+		}
+		if containerName != "" {
+			i.SandboxContainer = containerName
+		}
+		mcpLog.Debug("respawn_pane_claude", slog.String("command", resumeCmd))
 
 		// Use respawn-pane for atomic restart
 		// This is more reliable than Ctrl+C + wait for shell + send command
 		// respawn-pane -k kills the current process and starts the new command atomically
 		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
-			log.Printf("[MCP-DEBUG] RespawnPane failed: %v", err)
+			mcpLog.Debug("respawn_pane_claude_failed", slog.String("error", err.Error()))
 			return fmt.Errorf("failed to restart Claude session: %w", err)
 		}
 
-		log.Printf("[MCP-DEBUG] RespawnPane succeeded")
+		mcpLog.Debug("respawn_pane_claude_succeeded")
+
+		// Persist .sid sidecar so hook events after restart can be correlated
+		WriteHookSessionAnchor(i.ID, i.ClaudeSessionID)
 
 		// Re-capture MCPs after restart (they may have changed since session started)
 		i.CaptureLoadedMCPs()
@@ -1078,41 +3803,280 @@ func (i *Instance) Restart() error {
 		return nil
 	}
 
-	log.Printf("[MCP-DEBUG] Using fallback: recreate tmux session")
+	// For Gemini: ALWAYS update session to get the most recent one
+	// Krudony fix: don't skip when we already have an ID - the user may have started a NEW session
+	if i.Tool == "gemini" {
+		i.UpdateGeminiSession(nil)
+	}
+
+	// If Gemini session with known ID AND tmux session exists, use respawn-pane.
+	if i.Tool == "gemini" && i.GeminiSessionID != "" && i.tmuxSession != nil && i.tmuxSession.Exists() {
+		resumeCmd, containerName, err := i.prepareCommand(i.buildGeminiCommand("gemini"))
+		if err != nil {
+			return err
+		}
+		if containerName != "" {
+			i.SandboxContainer = containerName
+		}
+		sessionLog.Info("restart_gemini_respawn", slog.String("command", resumeCmd))
+
+		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+			sessionLog.Info("restart_gemini_respawn_failed", slog.String("error", err.Error()))
+			return fmt.Errorf("failed to restart Gemini session: %w", err)
+		}
+
+		sessionLog.Info("restart_gemini_respawn_succeeded")
+
+		// Persist .sid sidecar so hook events after restart can be correlated
+		WriteHookSessionAnchor(i.ID, i.GeminiSessionID)
+
+		i.Status = StatusWaiting
+		return nil
+	}
+
+	// If OpenCode session AND tmux session exists, use respawn-pane
+	if i.Tool == "opencode" && i.tmuxSession != nil && i.tmuxSession.Exists() {
+		// Try to get session ID from tmux environment if not already set
+		// (async detection stores it there but Instance might not have been saved)
+		if i.OpenCodeSessionID == "" {
+			if envID, err := i.tmuxSession.GetEnvironment("OPENCODE_SESSION_ID"); err == nil && envID != "" {
+				i.OpenCodeSessionID = envID
+				i.OpenCodeDetectedAt = time.Now()
+				sessionLog.Info("restart_opencode_recovered_id", slog.String("session_id", envID))
+			}
+		}
+
+		var rawCmd string
+		if i.OpenCodeSessionID != "" {
+			// OPENCODE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+			rawCmd = fmt.Sprintf("opencode -s %s", i.OpenCodeSessionID)
+		} else {
+			rawCmd = "opencode"
+			i.OpenCodeStartedAt = time.Now().UnixMilli()
+		}
+		resumeCmd, containerName, err := i.prepareCommand(rawCmd)
+		if err != nil {
+			return err
+		}
+		if containerName != "" {
+			i.SandboxContainer = containerName
+		}
+		sessionLog.Info("restart_opencode_respawn", slog.String("command", resumeCmd))
+
+		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+			sessionLog.Info("restart_opencode_respawn_failed", slog.String("error", err.Error()))
+			return fmt.Errorf("failed to restart OpenCode session: %w", err)
+		}
+
+		// If no session ID, start async detection
+		if i.OpenCodeSessionID == "" {
+			go i.detectOpenCodeSessionAsync()
+		}
+
+		sessionLog.Info("restart_opencode_respawn_succeeded")
+
+		// Persist .sid sidecar so hook events after restart can be correlated
+		if i.OpenCodeSessionID != "" {
+			WriteHookSessionAnchor(i.ID, i.OpenCodeSessionID)
+		}
+
+		i.Status = StatusWaiting
+		return nil
+	}
+
+	// For Codex: ALWAYS update session to get the most recent one
+	// Krudony fix: don't skip when we already have an ID - the user may have started a NEW session
+	if i.Tool == "codex" {
+		i.mu.Lock()
+		i.pendingCodexRestartWarning = ""
+		i.mu.Unlock()
+		if missingDep := i.updateCodexSession(nil, true); missingDep != "" {
+			i.mu.Lock()
+			i.pendingCodexRestartWarning = codexProbeMissingWarning(missingDep)
+			i.mu.Unlock()
+			sessionLog.Warn("codex_probe_dep_missing_for_restart", slog.String("dependency", missingDep))
+		}
+	}
+
+	// If Codex session AND tmux session exists, use respawn-pane
+	if i.Tool == "codex" && i.tmuxSession != nil && i.tmuxSession.Exists() {
+		// Try to get session ID from tmux environment if not already set
+		if i.CodexSessionID == "" {
+			if envID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && envID != "" {
+				i.CodexSessionID = envID
+				i.CodexDetectedAt = time.Now()
+				sessionLog.Info("restart_codex_recovered_id", slog.String("session_id", envID))
+			}
+		}
+
+		if i.CodexSessionID == "" {
+			i.CodexStartedAt = time.Now().UnixMilli()
+		}
+		resumeCmd, containerName, err := i.prepareCommand(i.buildCodexCommand("codex"))
+		if err != nil {
+			return err
+		}
+		if containerName != "" {
+			i.SandboxContainer = containerName
+		}
+		sessionLog.Info("restart_codex_respawn", slog.String("command", resumeCmd))
+
+		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+			sessionLog.Info("restart_codex_respawn_failed", slog.String("error", err.Error()))
+			return fmt.Errorf("failed to restart Codex session: %w", err)
+		}
+
+		// If no session ID, start async detection
+		if i.CodexSessionID == "" {
+			go i.detectCodexSessionAsync()
+		}
+
+		sessionLog.Info("restart_codex_respawn_succeeded")
+
+		// Persist .sid sidecar so hook events after restart can be correlated
+		WriteHookSessionAnchor(i.ID, i.CodexSessionID)
+
+		i.Status = StatusWaiting
+		return nil
+	}
+
+	// If custom tool with session resume support AND tmux session exists, use respawn-pane.
+	if i.CanRestartGeneric() && i.tmuxSession != nil && i.tmuxSession.Exists() {
+		toolDef := GetToolDef(i.Tool)
+		sessionID := i.GetGenericSessionID()
+
+		// The session ID env var is propagated via host-side SetEnvironment after tmux start.
+		var rawCmd string
+		if toolDef.DangerousMode && toolDef.DangerousFlag != "" {
+			rawCmd = fmt.Sprintf("%s %s %s %s",
+				i.Command, toolDef.ResumeFlag, sessionID, toolDef.DangerousFlag)
+		} else {
+			rawCmd = fmt.Sprintf("%s %s %s",
+				i.Command, toolDef.ResumeFlag, sessionID)
+		}
+		resumeCmd, containerName, err := i.prepareCommand(rawCmd)
+		if err != nil {
+			return err
+		}
+		if containerName != "" {
+			i.SandboxContainer = containerName
+		}
+
+		sessionLog.Info("restart_generic_respawn", slog.String("tool", i.Tool), slog.String("command", resumeCmd))
+
+		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+			sessionLog.Info(
+				"restart_generic_respawn_failed",
+				slog.String("tool", i.Tool),
+				slog.String("error", err.Error()),
+			)
+			return fmt.Errorf("failed to restart %s session: %w", i.Tool, err)
+		}
+
+		sessionLog.Info("restart_generic_respawn_succeeded", slog.String("tool", i.Tool))
+		i.loadCustomPatternsFromConfig() // Reload custom patterns
+		i.Status = StatusWaiting
+		return nil
+	}
+
+	mcpLog.Debug("restart_fallback_recreate")
+
+	// Kill old tmux session to prevent orphans before recreating (#138)
+	if i.tmuxSession != nil && i.tmuxSession.Exists() {
+		mcpLog.Debug("restart_killing_old_session", slog.String("session_name", i.tmuxSession.Name))
+		if killErr := i.tmuxSession.Kill(); killErr != nil {
+			mcpLog.Warn("restart_kill_old_session_failed", slog.String("error", killErr.Error()))
+		}
+	}
 
 	// Fallback: recreate tmux session (for dead sessions or unknown ID)
 	i.tmuxSession = tmux.NewSession(i.Title, i.ProjectPath)
+	i.tmuxSession.InstanceID = i.ID // Pass instance ID for activity hooks
+	i.tmuxSession.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
 
 	var command string
-	if i.Tool == "claude" && i.ClaudeSessionID != "" {
+	if IsClaudeCompatible(i.Tool) && i.ClaudeSessionID != "" {
 		command = i.buildClaudeResumeCommand()
 	} else if i.Tool == "gemini" && i.GeminiSessionID != "" {
-		// Set GEMINI_SESSION_ID in tmux env so detection works after restart
-		command = fmt.Sprintf("tmux set-environment GEMINI_SESSION_ID \"%s\" && gemini --resume \"%s\"",
-			i.GeminiSessionID, i.GeminiSessionID)
+		command = i.buildGeminiCommand("gemini")
+	} else if i.Tool == "opencode" && i.OpenCodeSessionID != "" {
+		// OPENCODE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+		command = fmt.Sprintf("opencode -s %s", i.OpenCodeSessionID)
+	} else if i.Tool == "codex" && i.CodexSessionID != "" {
+		command = i.buildCodexCommand("codex")
 	} else {
 		// Route to appropriate command builder based on tool
-		switch i.Tool {
-		case "claude":
+		switch {
+		case IsClaudeCompatible(i.Tool):
 			command = i.buildClaudeCommand(i.Command)
-		case "gemini":
+		case i.Tool == "gemini":
 			command = i.buildGeminiCommand(i.Command)
+		case i.Tool == "opencode":
+			command = i.buildOpenCodeCommand(i.Command)
+			// Record start time for async session ID detection
+			i.OpenCodeStartedAt = time.Now().UnixMilli()
+		case i.Tool == "codex":
+			command = i.buildCodexCommand(i.Command)
+			// Record start time for async session ID detection
+			i.CodexStartedAt = time.Now().UnixMilli()
 		default:
-			command = i.Command
+			// Check if this is a custom tool with session resume config
+			if toolDef := GetToolDef(i.Tool); toolDef != nil {
+				command = i.buildGenericCommand(i.Command)
+			} else {
+				command = i.Command
+			}
 		}
 	}
-	log.Printf("[MCP-DEBUG] Starting new tmux session with command: %s", command)
+	command, containerName, err := i.prepareCommand(command)
+	if err != nil {
+		return err
+	}
+	if containerName != "" {
+		i.SandboxContainer = containerName
+	}
+
+	// Load custom patterns for status detection (for custom tools).
+	i.loadCustomPatternsFromConfig()
+
+	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
+	// Sandbox sessions also get remain-on-exit for dead-pane detection.
+	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
+	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed()
+
+	mcpLog.Debug("restart_starting_new_session", slog.String("command", command))
 
 	if err := i.tmuxSession.Start(command); err != nil {
-		log.Printf("[MCP-DEBUG] tmuxSession.Start() failed: %v", err)
+		mcpLog.Debug("restart_start_failed", slog.String("error", err.Error()))
 		i.Status = StatusError
 		return fmt.Errorf("failed to restart tmux session: %w", err)
 	}
 
-	log.Printf("[MCP-DEBUG] tmuxSession.Start() succeeded")
+	mcpLog.Debug("restart_start_succeeded")
+
+	// Set AGENTDECK_INSTANCE_ID for Claude hooks to identify this session
+	// This enables real-time status updates via Stop/SessionStart hooks
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_INSTANCE_ID", i.ID); err != nil {
+		sessionLog.Warn("set_instance_id_failed", slog.String("error", err.Error()))
+	}
+
+	// Propagate all known tool session IDs to the tmux environment (host-side).
+	// This covers Restart() which uses buildClaudeResumeCommand() and similar
+	// builders that no longer embed "tmux set-environment" in the shell string.
+	i.SyncSessionIDsToTmux()
 
 	// Re-capture MCPs after restart
 	i.CaptureLoadedMCPs()
+
+	// Start async session ID detection for OpenCode (if no ID yet)
+	if i.Tool == "opencode" && i.OpenCodeSessionID == "" {
+		go i.detectOpenCodeSessionAsync()
+	}
+
+	// Start async session ID detection for Codex (if no ID yet)
+	if i.Tool == "codex" && i.CodexSessionID == "" {
+		go i.detectCodexSessionAsync()
+	}
 
 	// Start as WAITING - will go GREEN on next tick if Claude shows busy indicator
 	if command != "" {
@@ -1124,38 +4088,89 @@ func (i *Instance) Restart() error {
 	return nil
 }
 
-// buildClaudeResumeCommand builds the claude resume command with proper config options
-// Respects: CLAUDE_CONFIG_DIR, dangerous_mode from user config
-// IMPORTANT: Also sets CLAUDE_SESSION_ID in tmux environment so detection works after restart
+// buildClaudeResumeCommand builds the Claude resume command with proper config options.
+// Respects: CLAUDE_CONFIG_DIR, use_happy, and dangerous_mode from user/session config.
+// CLAUDE_SESSION_ID is set via host-side SetEnvironment (called by SyncSessionIDsToTmux after restart)
 func (i *Instance) buildClaudeResumeCommand() string {
+	opts := i.GetClaudeOptions()
+	if opts == nil {
+		userConfig, _ := LoadUserConfig()
+		opts = NewClaudeOptions(userConfig)
+	}
+
+	// Get the configured Claude command (e.g., "claude", "cdw", "happy")
+	// If a custom command alias is set, we skip CLAUDE_CONFIG_DIR prefix since the alias handles it.
+	claudeCmd, hasCustomCommand := resolveClaudeLaunchCommand(opts)
+
 	// Check if CLAUDE_CONFIG_DIR is explicitly configured
 	// If NOT explicit, don't set it - let the shell's environment handle it
+	// Also skip if using a custom command (alias handles config dir)
 	configDirPrefix := ""
-	if IsClaudeConfigDirExplicit() {
+	if !hasCustomCommand && IsClaudeConfigDirExplicit() {
 		configDir := GetClaudeConfigDir()
 		configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
 	}
 
-	// Check if dangerous mode is enabled in user config
-	dangerousMode := false
-	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
-		dangerousMode = userConfig.Claude.DangerousMode
+	// AGENTDECK_INSTANCE_ID is set as an inline env var so hook subprocesses
+	// can identify which agent-deck session they belong to.
+	instanceIDPrefix := fmt.Sprintf("AGENTDECK_INSTANCE_ID=%s ", i.ID)
+	configDirPrefix = instanceIDPrefix + configDirPrefix
+	dangerousMode := opts.SkipPermissions
+	allowDangerousMode := opts.AllowSkipPermissions
+
+	// Check if session has actual conversation data
+	// If not, use --session-id instead of --resume to avoid "No conversation found" error
+	useResume := sessionHasConversationData(i.ClaudeSessionID, i.ProjectPath)
+	sessionLog.Debug(
+		"session_data_build_resume",
+		slog.String("session_id", i.ClaudeSessionID),
+		slog.String("path", i.ProjectPath),
+		slog.Bool("use_resume", useResume),
+	)
+
+	// Build dangerous mode flag (--dangerously-skip-permissions wins over --allow-...)
+	dangerousFlag := ""
+	if dangerousMode {
+		dangerousFlag = " --dangerously-skip-permissions"
+	} else if allowDangerousMode {
+		dangerousFlag = " --allow-dangerously-skip-permissions"
 	}
 
-	// Build the command with tmux environment update
-	// This ensures CLAUDE_SESSION_ID is set in tmux env after restart,
-	// so GetSessionIDFromTmux() works correctly and detects the session
-	if dangerousMode {
-		return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID %s && %sclaude --resume %s --dangerously-skip-permissions",
-			i.ClaudeSessionID, configDirPrefix, i.ClaudeSessionID)
+	// CLAUDE_SESSION_ID is propagated via host-side SetEnvironment (SyncSessionIDsToTmux)
+	// after the tmux session is restarted. No inline tmux set-environment in the shell string
+	// (which silently fails inside Docker sandbox containers).
+	if useResume {
+		return fmt.Sprintf("%s%s --resume %s%s",
+			configDirPrefix, claudeCmd, i.ClaudeSessionID, dangerousFlag)
 	}
-	return fmt.Sprintf("tmux set-environment CLAUDE_SESSION_ID %s && %sclaude --resume %s",
-		i.ClaudeSessionID, configDirPrefix, i.ClaudeSessionID)
+	// Session was never interacted with - use --session-id to create fresh session.
+	return fmt.Sprintf("%s%s --session-id %s%s",
+		configDirPrefix, claudeCmd, i.ClaudeSessionID, dangerousFlag)
+}
+
+// SetGeminiModel sets the Gemini model for this session and triggers a restart if running.
+func (i *Instance) SetGeminiModel(model string) error {
+	i.GeminiModel = model
+	sessionLog.Debug(
+		"gemini_model_set",
+		slog.String("model", model),
+		slog.String("session_id", i.ID),
+		slog.String("title", i.Title),
+	)
+
+	// Restart if the session is running so it picks up the new model
+	if i.Exists() {
+		return i.Restart()
+	}
+	return nil
 }
 
 // CanRestart returns true if the session can be restarted
 // For Claude sessions with known ID: can always restart (interrupt and resume)
 // For Gemini sessions with known ID: can always restart (interrupt and resume)
+// For OpenCode sessions with known ID: can always restart (interrupt and resume)
+// For Codex sessions with known ID: can always restart (interrupt and resume)
+// For custom tools with session resume config: can restart if session ID available
 // For other sessions: only if dead/error state
 func (i *Instance) CanRestart() bool {
 	// Gemini sessions with known session ID can always be restarted
@@ -1164,7 +4179,34 @@ func (i *Instance) CanRestart() bool {
 	}
 
 	// Claude sessions with known session ID can always be restarted
-	if i.Tool == "claude" && i.ClaudeSessionID != "" {
+	if IsClaudeCompatible(i.Tool) && i.ClaudeSessionID != "" {
+		return true
+	}
+
+	// OpenCode sessions with known session ID can always be restarted
+	if i.Tool == "opencode" && i.OpenCodeSessionID != "" {
+		return true
+	}
+
+	// OpenCode sessions without ID can still restart (will start fresh)
+	// This allows restart even before session ID is detected
+	if i.Tool == "opencode" {
+		return true
+	}
+
+	// Codex sessions with known session ID can always be restarted
+	if i.Tool == "codex" && i.CodexSessionID != "" {
+		return true
+	}
+
+	// Codex sessions without ID can still restart (will start fresh)
+	// This allows restart even before session ID is detected
+	if i.Tool == "codex" {
+		return true
+	}
+
+	// Custom tools: check if they have session resume support
+	if i.CanRestartGeneric() {
 		return true
 	}
 
@@ -1179,11 +4221,21 @@ func (i *Instance) CanFork() bool {
 		return false
 	}
 
+	// OpenCode sessions can fork if session ID is recent
+	if i.Tool == "opencode" {
+		return i.CanForkOpenCode()
+	}
+
 	// Claude sessions can fork if session ID is recent
 	if i.ClaudeSessionID == "" {
 		return false
 	}
 	return time.Since(i.ClaudeDetectedAt) < 5*time.Minute
+}
+
+// CanForkOpenCode returns true if this OpenCode session can be forked
+func (i *Instance) CanForkOpenCode() bool {
+	return i.Tool == "opencode" && i.OpenCodeSessionID != "" && time.Since(i.OpenCodeDetectedAt) < 5*time.Minute
 }
 
 // Fork returns the command to create a forked Claude session
@@ -1198,19 +4250,41 @@ func (i *Instance) Fork(newTitle, newGroupPath string) (string, error) {
 // Uses capture-resume pattern: starts fork in print mode to get new session ID,
 // stores in tmux environment, then resumes interactively
 func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOptions) (string, error) {
+	projectPath := i.ProjectPath
+	if opts != nil && opts.WorkDir != "" {
+		projectPath = opts.WorkDir
+	}
+	target := NewInstance(newTitle, projectPath)
+	if newGroupPath != "" {
+		target.GroupPath = newGroupPath
+	} else {
+		target.GroupPath = i.GroupPath
+	}
+	target.Tool = "claude"
+
+	return i.buildClaudeForkCommandForTarget(target, opts)
+}
+
+func (i *Instance) buildClaudeForkCommandForTarget(target *Instance, opts *ClaudeOptions) (string, error) {
+	if target == nil {
+		return "", fmt.Errorf("cannot build fork command: target instance is nil")
+	}
+
+	// Sync session from disk to pick up /clear session changes before forking
+	i.syncClaudeSessionFromDisk()
+
 	if !i.CanFork() {
 		return "", fmt.Errorf("cannot fork: no active Claude session")
 	}
 
-	workDir := i.ProjectPath
+	workDir := target.ProjectPath
 
-	// Check if CLAUDE_CONFIG_DIR is explicitly configured
-	// If NOT explicit, don't set it - let the shell's environment handle it
-	configDirPrefix := ""
-	if IsClaudeConfigDirExplicit() {
-		configDir := GetClaudeConfigDir()
-		configDirPrefix = fmt.Sprintf("CLAUDE_CONFIG_DIR=%s ", configDir)
-	}
+	// IMPORTANT: For capture-resume commands (which contain $(...) syntax), we MUST use
+	// the default launch binary ("claude" or "happy") + explicit env exports, NOT a
+	// custom command alias like "cdw".
+	// Reason: Commands with $(...) get wrapped in `bash -c` for fish compatibility (#47),
+	// and shell aliases are not available in non-interactive bash shells.
+	bashExportPrefix := target.buildBashExportPrefix()
 
 	// If no options provided, use defaults from config
 	if opts == nil {
@@ -1218,20 +4292,30 @@ func (i *Instance) ForkWithOptions(newTitle, newGroupPath string, opts *ClaudeOp
 		opts = NewClaudeOptions(userConfig)
 	}
 
+	claudeCmd, hasCustomCommand := resolveClaudeLaunchCommand(opts)
+	if hasCustomCommand {
+		claudeCmd = "claude"
+	}
+
 	// Build extra flags from options (for fork, we use ToArgsForFork which excludes session mode)
 	extraFlags := i.buildClaudeExtraFlags(opts)
 
-	// Use --session-id to specify UUID upfront, avoiding capture-resume with "." prompt
-	// 1. Generate UUID for new forked session
-	// 2. Store in tmux environment
-	// 3. Start fork with --fork-session and --session-id (no intermediate print mode needed)
-	// Note: Path is single-quoted to handle spaces and special characters
-	// Note: Uses uuidgen instead of jq parsing (removes external dependency)
+	// Pre-generate UUID for forked session to avoid shell uuidgen dependency.
+	// CLAUDE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+	// Use `exec` before claude so that when this compound command is wrapped
+	// in `bash -c` (for fish compatibility), claude replaces the bash process,
+	// enabling proper job control (Ctrl+Z suspend / fg resume).
+	forkUUID := generateUUID()
+	target.ClaudeSessionID = forkUUID
 	cmd := fmt.Sprintf(
-		`cd '%s' && session_id=$(uuidgen | tr '[:upper:]' '[:lower:]') && `+
-			`tmux set-environment CLAUDE_SESSION_ID "$session_id" && `+
-			`%sclaude --resume %s --fork-session --session-id "$session_id"%s`,
-		workDir, configDirPrefix, i.ClaudeSessionID, extraFlags)
+		`cd '%s' && `+
+			`%sexec %s --session-id "%s" --resume %s --fork-session%s`,
+		workDir,
+		bashExportPrefix, claudeCmd, forkUUID, i.ClaudeSessionID, extraFlags)
+	cmd, err := i.applyWrapper(cmd)
+	if err != nil {
+		return "", err
+	}
 
 	return cmd, nil
 }
@@ -1253,14 +4337,153 @@ func (i *Instance) CreateForkedInstance(newTitle, newGroupPath string) (*Instanc
 }
 
 // CreateForkedInstanceWithOptions creates a new Instance configured for forking with custom options
-func (i *Instance) CreateForkedInstanceWithOptions(newTitle, newGroupPath string, opts *ClaudeOptions) (*Instance, string, error) {
-	cmd, err := i.ForkWithOptions(newTitle, newGroupPath, opts)
+func (i *Instance) CreateForkedInstanceWithOptions(
+	newTitle, newGroupPath string,
+	opts *ClaudeOptions,
+) (*Instance, string, error) {
+	// Create new instance - use worktree path if provided, otherwise parent's project path
+	projectPath := i.ProjectPath
+	if opts != nil && opts.WorkDir != "" {
+		projectPath = opts.WorkDir
+	}
+	forked := NewInstance(newTitle, projectPath)
+	if newGroupPath != "" {
+		forked.GroupPath = newGroupPath
+	} else {
+		forked.GroupPath = i.GroupPath
+	}
+	forked.Tool = "claude"
+
+	cmd, err := i.buildClaudeForkCommandForTarget(forked, opts)
+	if err != nil {
+		return nil, "", err
+	}
+	forked.Command = cmd
+
+	// Store options in the new instance for persistence
+	if opts != nil {
+		if err := forked.SetClaudeOptions(opts); err != nil {
+			// Log but don't fail - options are not critical for fork
+			sessionLog.Warn("set_claude_options_failed", slog.String("error", err.Error()))
+		}
+		// Copy transient worktree fields to the forked instance
+		if opts.WorktreePath != "" {
+			forked.WorktreePath = opts.WorktreePath
+			forked.WorktreeRepoRoot = opts.WorktreeRepoRoot
+			forked.WorktreeBranch = opts.WorktreeBranch
+		}
+	}
+
+	return forked, cmd, nil
+}
+
+// ForkOpenCode returns the command to create a forked OpenCode session.
+// Uses export/import to clone the session with a new ID, then launches
+// the forked session with opencode -s <new-id>.
+// Deprecated: Use ForkOpenCodeWithOptions instead.
+func (i *Instance) ForkOpenCode(newTitle, newGroupPath string) (string, error) {
+	return i.ForkOpenCodeWithOptions(newTitle, newGroupPath, nil)
+}
+
+// ForkOpenCodeWithOptions returns the command to create a forked OpenCode session with custom options.
+// Uses export/import to clone the session with a new ID, then launches
+// the forked session with opencode -s <new-id> plus any model/agent flags.
+func (i *Instance) ForkOpenCodeWithOptions(newTitle, newGroupPath string, opts *OpenCodeOptions) (string, error) {
+	if !i.CanForkOpenCode() {
+		return "", fmt.Errorf("cannot fork: no active OpenCode session")
+	}
+
+	workDir := i.ProjectPath
+	envPrefix := i.buildEnvSourceCommand()
+
+	// Build extra flags from options (for fork, exclude session mode flags)
+	var extraFlags string
+	if opts != nil {
+		for _, arg := range opts.ToArgsForFork() {
+			extraFlags += " " + arg
+		}
+	} else if config, err := LoadUserConfig(); err == nil && config != nil {
+		defaultOpts := NewOpenCodeOptions(config)
+		for _, arg := range defaultOpts.ToArgsForFork() {
+			extraFlags += " " + arg
+		}
+	}
+
+	scriptPath, err := i.writeOpenCodeForkScript(workDir, envPrefix, extraFlags)
+	if err != nil {
+		return "", fmt.Errorf("failed to create fork script: %w", err)
+	}
+
+	return fmt.Sprintf("bash '%s'", scriptPath), nil
+}
+
+// writeOpenCodeForkScript writes a bash script that forks via export/import.
+// The script self-deletes after execution.
+func (i *Instance) writeOpenCodeForkScript(workDir, envPrefix, extraFlags string) (string, error) {
+	script := fmt.Sprintf(`#!/bin/bash
+cd "%s" || { echo "cd failed to: %s"; exit 1; }
+%s
+tmpfile=$(mktemp -t opencode-fork)
+trap "rm -f \"$tmpfile\" \"$0\"" EXIT
+
+opencode export %s 2>/dev/null > "$tmpfile"
+export_status=$?
+if [ $export_status -ne 0 ]; then
+  echo "Export failed (exit $export_status):"
+  cat "$tmpfile"
+  exit 1
+fi
+
+hash_cmd="md5sum"
+command -v md5sum >/dev/null 2>&1 || hash_cmd="md5"
+new_id="ses_$(date +%%s | $hash_cmd | head -c12)$(openssl rand -base64 20 | tr -dc a-zA-Z0-9 | head -c14)"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  sed -i "" "s/%s/$new_id/g" "$tmpfile" || { echo "Sed failed"; exit 1; }
+else
+  sed -i "s/%s/$new_id/g" "$tmpfile" || { echo "Sed failed"; exit 1; }
+fi
+opencode import "$tmpfile" 2>&1 || { echo "Import failed"; exit 1; }
+# OPENCODE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+echo "Forked to: $new_id"
+opencode -s "$new_id"%s
+`, workDir, workDir, envPrefix, i.OpenCodeSessionID,
+		i.OpenCodeSessionID, i.OpenCodeSessionID, extraFlags)
+
+	f, err := os.CreateTemp("", "opencode-fork-*.sh")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(script); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+
+	if err := f.Chmod(0o755); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+
+	return f.Name(), nil
+}
+
+// CreateForkedOpenCodeInstance creates a new Instance configured for forking an OpenCode session
+// Deprecated: Use CreateForkedOpenCodeInstanceWithOptions instead.
+func (i *Instance) CreateForkedOpenCodeInstance(newTitle, newGroupPath string) (*Instance, string, error) {
+	return i.CreateForkedOpenCodeInstanceWithOptions(newTitle, newGroupPath, nil)
+}
+
+// CreateForkedOpenCodeInstanceWithOptions creates a new Instance configured for forking with custom options
+func (i *Instance) CreateForkedOpenCodeInstanceWithOptions(
+	newTitle, newGroupPath string,
+	opts *OpenCodeOptions,
+) (*Instance, string, error) {
+	cmd, err := i.ForkOpenCodeWithOptions(newTitle, newGroupPath, opts)
 	if err != nil {
 		return nil, "", err
 	}
 
-	// Create new instance with the PARENT's project path
-	// This ensures the forked session is in the same Claude project directory as parent
 	forked := NewInstance(newTitle, i.ProjectPath)
 	if newGroupPath != "" {
 		forked.GroupPath = newGroupPath
@@ -1268,11 +4491,13 @@ func (i *Instance) CreateForkedInstanceWithOptions(newTitle, newGroupPath string
 		forked.GroupPath = i.GroupPath
 	}
 	forked.Command = cmd
-	forked.Tool = "claude"
+	forked.Tool = "opencode"
 
 	// Store options in the new instance for persistence
 	if opts != nil {
-		forked.SetClaudeOptions(opts)
+		if err := forked.SetOpenCodeOptions(opts); err != nil {
+			sessionLog.Warn("set_opencode_options_failed", slog.String("error", err.Error()))
+		}
 	}
 
 	return forked, cmd, nil
@@ -1289,6 +4514,32 @@ func (i *Instance) Exists() bool {
 // GetTmuxSession returns the tmux session object
 func (i *Instance) GetTmuxSession() *tmux.Session {
 	return i.tmuxSession
+}
+
+// SetAcknowledgedFromShared applies an acknowledgment from another TUI instance
+// (read from SQLite). This transitions a YELLOW (waiting) session to GRAY (idle)
+// without requiring the user to interact with this specific TUI instance.
+func (i *Instance) SetAcknowledgedFromShared(ack bool) {
+	if !ack || i.tmuxSession == nil {
+		return
+	}
+
+	// Running/starting is authoritative: don't let stale shared ack force
+	// an active session back to idle.
+	status := i.GetStatusThreadSafe()
+	if status == StatusRunning || status == StatusStarting {
+		return
+	}
+
+	i.tmuxSession.Acknowledge()
+}
+
+// SyncTmuxDisplayName updates the tmux status bar to reflect the current title.
+func (i *Instance) SyncTmuxDisplayName() {
+	if tmuxSess := i.GetTmuxSession(); tmuxSess != nil && tmuxSess.Exists() {
+		tmuxSess.DisplayName = i.Title
+		tmuxSess.ConfigureStatusBar()
+	}
 }
 
 // GetClaudeOptions returns Claude-specific options, or nil if not set
@@ -1317,6 +4568,58 @@ func (i *Instance) SetClaudeOptions(opts *ClaudeOptions) error {
 	return nil
 }
 
+// GetCodexOptions returns Codex-specific options, or nil if not set
+func (i *Instance) GetCodexOptions() *CodexOptions {
+	if len(i.ToolOptionsJSON) == 0 {
+		return nil
+	}
+	opts, err := UnmarshalCodexOptions(i.ToolOptionsJSON)
+	if err != nil {
+		return nil
+	}
+	return opts
+}
+
+// SetCodexOptions stores Codex-specific options
+func (i *Instance) SetCodexOptions(opts *CodexOptions) error {
+	if opts == nil {
+		i.ToolOptionsJSON = nil
+		return nil
+	}
+	data, err := MarshalToolOptions(opts)
+	if err != nil {
+		return err
+	}
+	i.ToolOptionsJSON = data
+	return nil
+}
+
+// GetOpenCodeOptions returns OpenCode-specific options, or nil if not set
+func (i *Instance) GetOpenCodeOptions() *OpenCodeOptions {
+	if len(i.ToolOptionsJSON) == 0 {
+		return nil
+	}
+	opts, err := UnmarshalOpenCodeOptions(i.ToolOptionsJSON)
+	if err != nil {
+		return nil
+	}
+	return opts
+}
+
+// SetOpenCodeOptions stores OpenCode-specific options
+func (i *Instance) SetOpenCodeOptions(opts *OpenCodeOptions) error {
+	if opts == nil {
+		i.ToolOptionsJSON = nil
+		return nil
+	}
+	data, err := MarshalToolOptions(opts)
+	if err != nil {
+		return err
+	}
+	i.ToolOptionsJSON = data
+	return nil
+}
+
 // GetSessionIDFromTmux reads Claude session ID from tmux environment
 // This is the primary method for sessions started with the capture-resume pattern
 func (i *Instance) GetSessionIDFromTmux() string {
@@ -1333,10 +4636,10 @@ func (i *Instance) GetSessionIDFromTmux() string {
 // GetMCPInfo returns MCP server information for this session
 // Returns nil if not a Claude or Gemini session
 func (i *Instance) GetMCPInfo() *MCPInfo {
-	switch i.Tool {
-	case "claude":
+	switch {
+	case IsClaudeCompatible(i.Tool):
 		return GetMCPInfo(i.ProjectPath)
-	case "gemini":
+	case i.Tool == "gemini":
 		return GetGeminiMCPInfo(i.ProjectPath)
 	default:
 		return nil
@@ -1347,7 +4650,7 @@ func (i *Instance) GetMCPInfo() *MCPInfo {
 // This should be called when a session starts or restarts, so we can track
 // which MCPs are actually loaded in the running Claude session vs just configured
 func (i *Instance) CaptureLoadedMCPs() {
-	if i.Tool != "claude" {
+	if !IsClaudeCompatible(i.Tool) {
 		i.LoadedMCPNames = nil
 		return
 	}
@@ -1364,24 +4667,555 @@ func (i *Instance) CaptureLoadedMCPs() {
 // regenerateMCPConfig regenerates .mcp.json with current pool status
 // If socket pool is running, MCPs will use socket configs (nc -U /tmp/...)
 // Otherwise, MCPs will use stdio configs (npx ...)
-func (i *Instance) regenerateMCPConfig() {
+// Returns error if .mcp.json write fails
+func (i *Instance) regenerateMCPConfig() error {
+	ClearMCPCache(i.ProjectPath) // Force fresh read from disk (not stale 30s cache)
 	mcpInfo := GetMCPInfo(i.ProjectPath)
 	if mcpInfo == nil {
-		return
+		return nil // No MCP info, nothing to regenerate
 	}
 
-	localMCPs := mcpInfo.Local()
-	if len(localMCPs) == 0 {
-		return
+	switch GetMCPDefaultScope() {
+	case "global":
+		globalMCPs := mcpInfo.Global
+		if len(globalMCPs) == 0 {
+			return nil
+		}
+		if err := WriteGlobalMCP(globalMCPs); err != nil {
+			mcpLog.Debug("regen_global_mcp_failed", slog.String("error", err.Error()))
+			return fmt.Errorf("failed to regenerate global MCP config: %w", err)
+		}
+		mcpLog.Debug(
+			"regen_global_mcp_succeeded",
+			slog.String("title", i.Title),
+			slog.Int("mcp_count", len(globalMCPs)),
+		)
+	case "user":
+		userMCPs := GetUserMCPNames()
+		if len(userMCPs) == 0 {
+			return nil
+		}
+		if err := WriteUserMCP(userMCPs); err != nil {
+			mcpLog.Debug("regen_user_mcp_failed", slog.String("error", err.Error()))
+			return fmt.Errorf("failed to regenerate user MCP config: %w", err)
+		}
+		mcpLog.Debug("regen_user_mcp_succeeded", slog.String("title", i.Title), slog.Int("mcp_count", len(userMCPs)))
+	default:
+		localMCPs := mcpInfo.Local()
+		if len(localMCPs) == 0 {
+			return nil
+		}
+		// WriteMCPJsonFromConfig checks pool status and writes socket configs if pool is running
+		if err := WriteMCPJsonFromConfig(i.ProjectPath, localMCPs); err != nil {
+			mcpLog.Debug("regen_local_mcp_failed", slog.String("error", err.Error()))
+			return fmt.Errorf("failed to regenerate .mcp.json: %w", err)
+		}
+		mcpLog.Debug("regen_local_mcp_succeeded", slog.String("title", i.Title), slog.Int("mcp_count", len(localMCPs)))
+	}
+	return nil
+}
+
+// geminiSessionHasConversationData checks whether a Gemini session file exists
+// and contains at least one message record.
+//
+// Returns true on read/parse errors as a safe fallback, matching Claude quality-gate
+// behavior (avoid dropping potentially valid sessions due to transient I/O issues).
+func geminiSessionHasConversationData(sessionID, projectPath string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || len(sessionID) < 8 {
+		return false
 	}
 
-	// Regenerate .mcp.json - WriteMCPJsonFromConfig checks pool status
-	// and writes socket configs if pool is running
-	if err := WriteMCPJsonFromConfig(i.ProjectPath, localMCPs); err != nil {
-		log.Printf("[MCP-DEBUG] Failed to regenerate .mcp.json: %v", err)
+	sessionsDir := GetGeminiSessionsDir(projectPath)
+	pattern := filepath.Join(sessionsDir, "session-*-"+sessionID[:8]+".json")
+	filePath, _ := findNewestFile(pattern)
+	if filePath == "" {
+		filePath = findGeminiSessionInAllProjects(sessionID)
+	}
+	if filePath == "" {
+		return false
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return true
+	}
+
+	var payload struct {
+		SessionID string            `json:"sessionId"`
+		Messages  []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return true
+	}
+
+	// If full ID is present in file and mismatches, treat candidate as invalid.
+	if payload.SessionID != "" && payload.SessionID != sessionID {
+		return false
+	}
+	return len(payload.Messages) > 0
+}
+
+// sessionHasConversationData checks if a Claude session file contains actual
+// conversation data (has "sessionId" field in records).
+//
+// Returns true if:
+// - File has any "sessionId" field (user interacted with session)
+// - Error reading file (safe fallback - don't risk losing sessions)
+//
+// Returns false if:
+// - File doesn't exist (nothing to resume, use --session-id)
+// - File exists but has zero "sessionId" occurrences (never interacted)
+func sessionHasConversationData(sessionID string, projectPath string) bool {
+	// Build the session file path
+	// Format: {config_dir}/projects/{encoded_path}/{sessionID}.jsonl
+	configDir := GetClaudeConfigDir()
+	if configDir == "" {
+		configDir = filepath.Join(os.Getenv("HOME"), ".claude")
+	}
+
+	// Resolve symlinks in project path (macOS: /tmp -> /private/tmp)
+	resolvedPath := projectPath
+	if resolved, err := filepath.EvalSymlinks(projectPath); err == nil {
+		resolvedPath = resolved
+	}
+
+	// Encode project path using Claude's directory format
+	encodedPath := ConvertToClaudeDirName(resolvedPath)
+	if encodedPath == "" {
+		encodedPath = "-"
+	}
+
+	sessionFile := filepath.Join(configDir, "projects", encodedPath, sessionID+".jsonl")
+	sessionLog.Debug("session_data_checking_file", slog.String("file", sessionFile))
+
+	// Check if file exists
+	if _, err := os.Stat(sessionFile); os.IsNotExist(err) {
+		// File doesn't exist at expected location - try cross-project search
+		// This handles path hash mismatches (e.g., session created from different directory)
+		if fallbackPath := findSessionFileInAllProjects(sessionID); fallbackPath != "" {
+			sessionLog.Debug("session_data_cross_project_found", slog.String("path", fallbackPath))
+			sessionFile = fallbackPath
+		} else {
+			// File doesn't exist anywhere - use --session-id to create fresh session
+			// (there's nothing to resume if the file doesn't exist)
+			sessionLog.Debug("session_data_file_not_found", slog.String("result", "use_session_id"))
+			return false
+		}
+	}
+
+	sessionLog.Debug("session_data_file_exists", slog.String("file", sessionFile))
+
+	// Read file and search for "sessionId" field
+	file, err := os.Open(sessionFile)
+	if err != nil {
+		// Error opening - safe fallback to --resume
+		sessionLog.Debug(
+			"session_data_open_error",
+			slog.String("error", err.Error()),
+			slog.String("fallback", "use_resume"),
+		)
+		return true
+	}
+	defer file.Close()
+
+	// Use scanner to read line by line (memory efficient for large files)
+	scanner := bufio.NewScanner(file)
+	// Increase buffer size for long lines
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Simple string search - faster than JSON parsing
+		if strings.Contains(line, `"sessionId"`) {
+			sessionLog.Debug("session_data_found_session_id", slog.String("result", "use_resume"))
+			return true // Found conversation data
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		// Error reading - safe fallback to --resume
+		sessionLog.Debug(
+			"session_data_scanner_error",
+			slog.String("error", err.Error()),
+			slog.String("fallback", "use_resume"),
+		)
+		return true
+	}
+
+	// No sessionId found - session was never interacted with
+	sessionLog.Debug("session_data_no_session_id", slog.String("result", "use_session_id"))
+	return false
+}
+
+// findSessionFileInAllProjects searches all Claude project directories for a session file
+// This handles path hash mismatches when agent-deck runs from a different directory
+// than where the Claude session was originally created.
+// Returns the full path to the session file, or empty string if not found.
+func findSessionFileInAllProjects(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+
+	configDir := GetClaudeConfigDir()
+	if configDir == "" {
+		configDir = filepath.Join(os.Getenv("HOME"), ".claude")
+	}
+
+	projectsDir := filepath.Join(configDir, "projects")
+
+	// List all project hash directories
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return ""
+	}
+
+	// Session filename format: {sessionID}.jsonl
+	sessionFile := sessionID + ".jsonl"
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		filePath := filepath.Join(projectsDir, entry.Name(), sessionFile)
+		if _, err := os.Stat(filePath); err == nil {
+			return filePath
+		}
+	}
+
+	return ""
+}
+
+// OpenContainerShell creates a tmux session running an interactive shell inside
+// the sandbox container. Returns the tmux session name for attaching.
+// Uses /bin/sh for portability (not all images have bash).
+func (i *Instance) OpenContainerShell() (string, error) {
+	if !i.IsSandboxed() {
+		return "", fmt.Errorf("session %s is not sandboxed", i.ID)
+	}
+	if i.SandboxContainer == "" || !docker.IsManagedContainer(i.SandboxContainer) {
+		return "", fmt.Errorf("no valid sandbox container for session %s", i.ID)
+	}
+
+	// Verify the container is still running before attempting docker exec.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ctr := docker.FromName(i.SandboxContainer)
+	running, err := ctr.IsRunning(ctx)
+	if err != nil {
+		return "", fmt.Errorf("checking container %s: %w", i.SandboxContainer, err)
+	}
+	if !running {
+		return "", fmt.Errorf("sandbox container %s is not running", i.SandboxContainer)
+	}
+
+	// Reuse the GenerateName prefix logic for consistency.
+	tmuxName := "ad-term-" + docker.GenerateName(i.ID, i.Title)[len("agent-deck-"):]
+
+	// Kill any existing terminal session to prevent orphans from repeated T presses.
+	killCtx, killCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer killCancel()
+	_ = exec.CommandContext(killCtx, "tmux", "kill-session", "-t", tmuxName).Run()
+
+	// Omit -w flag: the container's workdir was set during create (respects worktree path).
+	// Pass the docker exec command as discrete tmux args to avoid shell interpolation of
+	// the container name (defence-in-depth against state file tampering).
+	newCtx, newCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer newCancel()
+	out, err := exec.CommandContext(newCtx,
+		"tmux", "new-session", "-d", "-s", tmuxName,
+		"docker", "exec", "-it", i.SandboxContainer, "/bin/sh",
+	).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("creating terminal session: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return tmuxName, nil
+}
+
+// wrapForSSH wraps the command in an SSH invocation if the instance targets a remote host.
+// Uses ControlMaster for connection multiplexing to avoid repeated handshakes.
+func (i *Instance) wrapForSSH(command string) string {
+	if !i.IsSSH() {
+		return command
+	}
+
+	// Ensure ControlMaster socket directory exists
+	sshDir := "/tmp/agent-deck-ssh"
+	_ = os.MkdirAll(sshDir, 0700)
+
+	remoteCmd := command
+	if i.SSHRemotePath != "" {
+		// Escape single quotes in the remote path and command
+		escapedPath := strings.ReplaceAll(i.SSHRemotePath, "'", "'\\''")
+		escapedCmd := strings.ReplaceAll(command, "'", "'\\''")
+		remoteCmd = fmt.Sprintf("cd '%s' && %s", escapedPath, escapedCmd)
+	}
+
+	return fmt.Sprintf(
+		"ssh -t -o ControlMaster=auto -o ControlPath=/tmp/agent-deck-ssh/%%r@%%h:%%p -o ControlPersist=600 %s %s",
+		shellQuote(i.SSHHost),
+		shellQuote(remoteCmd),
+	)
+}
+
+// shellQuote wraps a string in single quotes, escaping embedded single quotes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// wrapForSandbox wraps command in docker exec if the instance is sandboxed.
+// Returns the wrapped command and the container name. The caller is responsible
+// for persisting the container name to i.SandboxContainer.
+func (i *Instance) wrapForSandbox(command string) (string, string, error) {
+	if !i.IsSandboxed() {
+		return command, "", nil
+	}
+
+	userCfg, cfgErr := LoadUserConfig()
+	if cfgErr != nil {
+		sessionLog.Warn("load_user_config_for_sandbox", slog.String("error", cfgErr.Error()))
+	}
+
+	wrappedCmd, containerName, err := ensureSandboxContainer(i, userCfg, command)
+	if err != nil {
+		return "", "", err
+	}
+	return wrappedCmd, containerName, nil
+}
+
+// prepareCommand applies the full command wrapping chain: user wrapper → sandbox → ignore-suspend.
+// Returns the wrapped command, the sandbox container name (empty if not sandboxed), and an error.
+// All code paths that launch or respawn a tmux pane should use this instead of calling
+// applyWrapper/wrapForSandbox/wrapIgnoreSuspend individually.
+func (i *Instance) prepareCommand(cmd string) (string, string, error) {
+	wrapped, err := i.applyWrapper(cmd)
+	if err != nil {
+		return "", "", err
+	}
+	wrapped = i.wrapForSSH(wrapped)
+	wrapped, containerName, err := i.wrapForSandbox(wrapped)
+	if err != nil {
+		return "", "", err
+	}
+	// Only disable Ctrl+Z suspend for sandboxed sessions where the command
+	// runs as the pane's initial process (no interactive shell for job control).
+	// Non-sandbox sessions use send-keys into an interactive shell, so Ctrl+Z
+	// naturally suspends the process and the user can `fg` to resume.
+	if wrapped != "" && i.IsSandboxed() {
+		wrapped = wrapIgnoreSuspend(wrapped)
+	}
+	return wrapped, containerName, nil
+}
+
+// terminalEnvVars are always passed through to containers for proper UI/theming.
+var terminalEnvVars = []string{"TERM", "COLORTERM", "FORCE_COLOR", "NO_COLOR"}
+
+// collectDockerEnvVars returns host environment variables to forward to containers.
+// Each call reads fresh values from the host environment via os.LookupEnv so that
+// changes between session starts (e.g. updated TERM) are picked up immediately.
+// Terminal-related variables (TERM, COLORTERM, FORCE_COLOR, NO_COLOR) are always
+// included when set. Additional names from DockerSettings.Environment are appended.
+func collectDockerEnvVars(names []string) map[string]string {
+	env := make(map[string]string, len(terminalEnvVars)+len(names))
+	for _, name := range terminalEnvVars {
+		if val, ok := os.LookupEnv(name); ok {
+			env[name] = val
+		}
+	}
+	for _, name := range names {
+		if val, ok := os.LookupEnv(name); ok {
+			env[name] = val
+		}
+	}
+	return env
+}
+
+// ensureSandboxContainer creates and starts the Docker container if needed,
+// then returns the tool command wrapped in "docker exec" and the container name.
+// The userCfg parameter avoids a redundant LoadUserConfig call — the caller
+// (wrapForSandbox) already loaded it.
+func ensureSandboxContainer(inst *Instance, userCfg *UserConfig, toolCommand string) (string, string, error) {
+	// Use a bounded context to prevent indefinite hangs if Docker is unresponsive.
+	// Image pulls may take longer, but CheckAvailability/Exists/Create/Start should be fast.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	if err := docker.CheckAvailability(ctx); err != nil {
+		return "", "", fmt.Errorf("sandbox unavailable: %w", err)
+	}
+
+	if err := docker.EnsureImage(ctx, inst.Sandbox.Image); err != nil {
+		return "", "", fmt.Errorf("ensuring sandbox image: %w", err)
+	}
+
+	containerName := docker.GenerateName(inst.ID, inst.Title)
+	ctr := docker.NewContainer(containerName, inst.Sandbox.Image)
+
+	homeDir, homeErr := os.UserHomeDir()
+	if homeErr != nil {
+		sessionLog.Warn("user_home_dir", slog.String("error", homeErr.Error()))
+	}
+
+	// Skip agent config sync when home directory is unavailable — RefreshAgentConfigs
+	// would produce broken paths rooted at "/" with an empty homeDir.
+	var bindMounts []docker.VolumeMount
+	var homeMounts []docker.VolumeMount
+	if homeDir != "" {
+		bindMounts, homeMounts = docker.RefreshAgentConfigs(homeDir, "")
+	}
+
+	if err := ensureContainerRunning(ctx, inst, ctr, userCfg, homeDir, bindMounts, homeMounts); err != nil {
+		return "", "", err
+	}
+
+	return buildExecCommand(ctr, userCfg, toolCommand), containerName, nil
+}
+
+// ensureContainerRunning creates and starts the container if it doesn't exist or is stopped.
+func ensureContainerRunning(
+	ctx context.Context,
+	inst *Instance,
+	ctr *docker.Container,
+	userCfg *UserConfig,
+	homeDir string,
+	bindMounts []docker.VolumeMount,
+	homeMounts []docker.VolumeMount,
+) error {
+	exists, err := ctr.Exists(ctx)
+	if err != nil {
+		return fmt.Errorf("checking sandbox container: %w", err)
+	}
+
+	if !exists {
+		cfg := buildSandboxConfig(inst, userCfg, homeDir, bindMounts, homeMounts)
+		if _, createErr := ctr.Create(ctx, cfg); createErr != nil {
+			return fmt.Errorf("creating sandbox container: %w", createErr)
+		}
+	}
+
+	running, err := ctr.IsRunning(ctx)
+	if err != nil {
+		return fmt.Errorf("checking sandbox container status: %w", err)
+	}
+	if !running {
+		if startErr := ctr.Start(ctx); startErr != nil {
+			return fmt.Errorf("starting sandbox container: %w", startErr)
+		}
+	}
+
+	return nil
+}
+
+// buildSandboxConfig assembles the ContainerConfig from session and user settings.
+func buildSandboxConfig(
+	inst *Instance,
+	userCfg *UserConfig,
+	homeDir string,
+	bindMounts []docker.VolumeMount,
+	homeMounts []docker.VolumeMount,
+) *docker.ContainerConfig {
+	var cpuLimit, memLimit string
+	if inst.Sandbox.CPULimit != nil {
+		cpuLimit = *inst.Sandbox.CPULimit
+	}
+	if inst.Sandbox.MemoryLimit != nil {
+		memLimit = *inst.Sandbox.MemoryLimit
+	}
+	if cpuLimit == "" && userCfg != nil {
+		cpuLimit = userCfg.Docker.CPULimit
+	}
+	if memLimit == "" && userCfg != nil {
+		memLimit = userCfg.Docker.MemoryLimit
+	}
+
+	configOpts := []docker.ContainerConfigOption{
+		docker.WithCPULimit(cpuLimit),
+		docker.WithMemoryLimit(memLimit),
+		docker.WithAgentConfigs(bindMounts, homeMounts),
+	}
+
+	// Note: Docker.Environment names (e.g. TERM) are NOT forwarded at create time.
+	// They are forwarded at exec time via buildExecCommand with fresh host values.
+	// Only Docker.EnvironmentValues (static key=value pairs) are baked into the container.
+
+	if homeDir != "" {
+		gitconfigPath := filepath.Join(homeDir, ".gitconfig")
+		if _, statErr := os.Stat(gitconfigPath); statErr == nil {
+			configOpts = append(configOpts, docker.WithGitConfig(gitconfigPath))
+		}
+	}
+
+	if userCfg != nil && userCfg.Docker.MountSSH && homeDir != "" {
+		sshPath := filepath.Join(homeDir, ".ssh")
+		if _, statErr := os.Stat(sshPath); statErr == nil {
+			configOpts = append(configOpts, docker.WithSSH(sshPath))
+		}
+	}
+
+	if userCfg != nil && len(userCfg.Docker.VolumeIgnores) > 0 {
+		configOpts = append(configOpts, docker.WithVolumeIgnores(userCfg.Docker.VolumeIgnores))
+	}
+
+	if userCfg != nil && len(userCfg.Docker.ExtraVolumes) > 0 {
+		configOpts = append(configOpts, docker.WithExtraVolumes(userCfg.Docker.ExtraVolumes))
+	}
+
+	if userCfg != nil && len(userCfg.Docker.EnvironmentValues) > 0 {
+		configOpts = append(configOpts, docker.WithEnvironment(userCfg.Docker.EnvironmentValues))
+	}
+
+	// Multi-repo: mount each path under /workspace/<dirname> instead of single project mount.
+	if inst.MultiRepoEnabled {
+		configOpts = append(configOpts, docker.WithMultiRepoPaths(inst.AllProjectPaths()))
+	}
+
+	return docker.NewContainerConfig(inst.ProjectPath, configOpts...)
+}
+
+// buildExecCommand returns a shell-safe "docker exec ... bash -c toolCommand" string.
+// The two-layer bash -c architecture:
+//  1. Inner: docker exec ... bash -c <toolCommand> — runs the agent command inside
+//     the container, properly shell-quoted by ShellJoinArgs.
+//  2. Outer: wrapIgnoreSuspend wraps the entire string in bash -c with stty susp undef,
+//     which tmux then delivers via its implicit /bin/sh -c.
+//
+// This prevents shell injection: toolCommand (which may contain user-controlled text
+// like session IDs) is passed as a single quoted argument to bash -c inside the container.
+func buildExecCommand(ctr *docker.Container, userCfg *UserConfig, toolCommand string) string {
+	// Always collect terminal env vars; append user-configured env var names.
+	var userNames []string
+	if userCfg != nil {
+		userNames = userCfg.Docker.Environment
+	}
+	runtimeEnv := collectDockerEnvVars(userNames)
+
+	var prefix []string
+	if len(runtimeEnv) > 0 {
+		prefix = ctr.ExecPrefixWithEnv(runtimeEnv)
 	} else {
-		log.Printf("[MCP-DEBUG] Regenerated .mcp.json for %s with %d MCPs", i.Title, len(localMCPs))
+		prefix = ctr.ExecPrefix()
 	}
+	// Wrap toolCommand in bash -c inside the container so it is passed as a single
+	// shell-quoted argument, preventing injection of shell metacharacters.
+	return docker.ShellJoinArgs(append(prefix, "bash", "-c", toolCommand))
+}
+
+// generateUUID generates a cryptographically random UUID v4 as a lowercase string.
+// Pre-generating in Go (instead of using shell $(uuidgen)) ensures the ID is immediately
+// known to the Instance and avoids Docker-sandbox failures where uuidgen is unavailable.
+func generateUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback: timestamp-based placeholder; unique but not a valid UUID v4.
+		return fmt.Sprintf("00000000-0000-4000-8000-%012x", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant bits (RFC 4122)
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // generateID generates a unique session ID
@@ -1404,15 +5238,19 @@ func randomString(length int) string {
 // With tmux env being authoritative, duplicates shouldn't occur in normal use,
 // but we handle them defensively for loaded/migrated sessions.
 func UpdateClaudeSessionsWithDedup(instances []*Instance) {
-	// Sort instances by CreatedAt (older first get priority for keeping IDs)
-	sort.Slice(instances, func(i, j int) bool {
-		return instances[i].CreatedAt.Before(instances[j].CreatedAt)
+	// Work on a copy so callers don't observe order mutation as a side effect.
+	ordered := make([]*Instance, len(instances))
+	copy(ordered, instances)
+
+	// Sort instances by CreatedAt (older first get priority for keeping IDs).
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].CreatedAt.Before(ordered[j].CreatedAt)
 	})
 
 	// Find and clear duplicate IDs (keep only the oldest session's claim)
 	idOwner := make(map[string]*Instance)
-	for _, inst := range instances {
-		if inst.Tool != "claude" || inst.ClaudeSessionID == "" {
+	for _, inst := range ordered {
+		if !IsClaudeCompatible(inst.Tool) || inst.ClaudeSessionID == "" {
 			continue
 		}
 		if owner, exists := idOwner[inst.ClaudeSessionID]; exists {
@@ -1427,4 +5265,20 @@ func UpdateClaudeSessionsWithDedup(instances []*Instance) {
 	}
 	// No re-detection step - tmux env is the authoritative source
 	// Sessions will get their IDs from UpdateClaudeSession() during normal status updates
+}
+
+// wrapIgnoreSuspend wraps cmd in a bash -c invocation that disables CTRL+Z
+// suspension before running the command. This is the sole bash -c layer
+// in the command chain — ensureSandboxContainer returns a plain docker exec
+// string, matching AoE's single-wrapper pattern.
+//
+// No `exec` is used: compound commands (&&, ||, pipes) must remain valid
+// when passed through Restart() resume paths. The extra shell process is
+// negligible overhead.
+func wrapIgnoreSuspend(cmd string) string {
+	// Escape single quotes for safe embedding inside a single-quoted string.
+	// Pattern: end quote, add double-quoted literal quote, restart quote.
+	// Example: it's -> it'"'"'s -> bash sees: it's.
+	escaped := strings.ReplaceAll(cmd, `'`, `'"'"'`)
+	return "bash -c 'stty susp undef; " + escaped + "'"
 }

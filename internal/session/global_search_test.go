@@ -13,7 +13,7 @@ func TestParseClaudeJSONL(t *testing.T) {
 	jsonl := `{"sessionId":"abc-123","type":"user","message":{"role":"user","content":"Hello world"},"timestamp":"2025-01-15T10:00:00Z","cwd":"/Users/test/project"}
 {"sessionId":"abc-123","type":"assistant","message":{"role":"assistant","content":"Hi there!"},"timestamp":"2025-01-15T10:00:01Z"}`
 
-	entry, err := parseClaudeJSONL("test.jsonl", []byte(jsonl))
+	entry, err := parseClaudeJSONL("test.jsonl", []byte(jsonl), true)
 	if err != nil {
 		t.Fatalf("Failed to parse JSONL: %v", err)
 	}
@@ -24,10 +24,10 @@ func TestParseClaudeJSONL(t *testing.T) {
 	if entry.CWD != "/Users/test/project" {
 		t.Errorf("Expected CWD '/Users/test/project', got %q", entry.CWD)
 	}
-	if !strings.Contains(entry.Content, "Hello world") {
+	if !strings.Contains(entry.ContentString(), "Hello world") {
 		t.Error("Content should contain 'Hello world'")
 	}
-	if !strings.Contains(entry.Content, "Hi there!") {
+	if !strings.Contains(entry.ContentString(), "Hi there!") {
 		t.Error("Content should contain 'Hi there!'")
 	}
 }
@@ -36,7 +36,7 @@ func TestParseClaudeJSONLWithContentBlocks(t *testing.T) {
 	// Test parsing content that is an array of blocks (common in Claude responses)
 	jsonl := `{"sessionId":"block-test","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"First block"},{"type":"text","text":"Second block"}]}}`
 
-	entry, err := parseClaudeJSONL("test.jsonl", []byte(jsonl))
+	entry, err := parseClaudeJSONL("test.jsonl", []byte(jsonl), true)
 	if err != nil {
 		t.Fatalf("Failed to parse JSONL: %v", err)
 	}
@@ -44,20 +44,19 @@ func TestParseClaudeJSONLWithContentBlocks(t *testing.T) {
 	if entry.SessionID != "block-test" {
 		t.Errorf("Expected sessionId 'block-test', got %q", entry.SessionID)
 	}
-	if !strings.Contains(entry.Content, "First block") {
+	if !strings.Contains(entry.ContentString(), "First block") {
 		t.Error("Content should contain 'First block'")
 	}
-	if !strings.Contains(entry.Content, "Second block") {
+	if !strings.Contains(entry.ContentString(), "Second block") {
 		t.Error("Content should contain 'Second block'")
 	}
 }
 
 func TestSearchEntryMatch(t *testing.T) {
 	entry := &SearchEntry{
-		SessionID:    "abc-123",
-		Content:      "discussing react hooks implementation",
-		ContentLower: "discussing react hooks implementation",
+		SessionID: "abc-123",
 	}
+	entry.setContent([]byte("discussing react hooks implementation"))
 
 	matches := entry.Match("react")
 	if len(matches) == 0 {
@@ -70,10 +69,9 @@ func TestSearchEntryMatch(t *testing.T) {
 
 func TestSearchEntryMatchMultiple(t *testing.T) {
 	entry := &SearchEntry{
-		SessionID:    "abc-123",
-		Content:      "react react react",
-		ContentLower: "react react react",
+		SessionID: "abc-123",
 	}
+	entry.setContent([]byte("react react react"))
 
 	matches := entry.Match("react")
 	if len(matches) != 3 {
@@ -83,10 +81,9 @@ func TestSearchEntryMatchMultiple(t *testing.T) {
 
 func TestSearchEntryMatchCaseInsensitive(t *testing.T) {
 	entry := &SearchEntry{
-		SessionID:    "abc-123",
-		Content:      "React REACT react",
-		ContentLower: "react react react",
+		SessionID: "abc-123",
 	}
+	entry.setContent([]byte("React REACT react"))
 
 	matches := entry.Match("REACT")
 	if len(matches) != 3 {
@@ -97,10 +94,9 @@ func TestSearchEntryMatchCaseInsensitive(t *testing.T) {
 func TestSearchEntryGetSnippet(t *testing.T) {
 	content := "This is a long piece of content where we are discussing react hooks and how they work in modern web applications."
 	entry := &SearchEntry{
-		SessionID:    "abc-123",
-		Content:      content,
-		ContentLower: strings.ToLower(content),
+		SessionID: "abc-123",
 	}
+	entry.setContent([]byte(content))
 
 	snippet := entry.GetSnippet("react", 20)
 	if !strings.Contains(snippet, "react") {
@@ -115,10 +111,9 @@ func TestSearchEntryGetSnippet(t *testing.T) {
 func TestSearchEntryGetSnippetNoMatch(t *testing.T) {
 	content := "This is some content without the search term"
 	entry := &SearchEntry{
-		SessionID:    "abc-123",
-		Content:      content,
-		ContentLower: strings.ToLower(content),
+		SessionID: "abc-123",
 	}
+	entry.setContent([]byte(content))
 
 	snippet := entry.GetSnippet("nonexistent", 20)
 	// Should return beginning of content when no match

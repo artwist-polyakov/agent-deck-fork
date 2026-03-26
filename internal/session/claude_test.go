@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestGetClaudeConfigDir_Default(t *testing.T) {
@@ -37,6 +38,111 @@ func TestGetClaudeConfigDir_EnvOverride(t *testing.T) {
 	dir := GetClaudeConfigDir()
 	if dir != "/custom/path" {
 		t.Errorf("GetClaudeConfigDir() = %s, want /custom/path", dir)
+	}
+}
+
+func TestGetClaudeConfigDir_ProfileOverride(t *testing.T) {
+	tmpHome := t.TempDir()
+	origHome := os.Getenv("HOME")
+	origProfile := os.Getenv("AGENTDECK_PROFILE")
+	origClaudeDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	defer func() {
+		_ = os.Setenv("HOME", origHome)
+		if origProfile != "" {
+			_ = os.Setenv("AGENTDECK_PROFILE", origProfile)
+		} else {
+			_ = os.Unsetenv("AGENTDECK_PROFILE")
+		}
+		if origClaudeDir != "" {
+			_ = os.Setenv("CLAUDE_CONFIG_DIR", origClaudeDir)
+		} else {
+			_ = os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+		ClearUserConfigCache()
+	}()
+
+	_ = os.Setenv("HOME", tmpHome)
+	_ = os.Unsetenv("CLAUDE_CONFIG_DIR")
+	_ = os.Setenv("AGENTDECK_PROFILE", "work")
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tmpHome, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0700); err != nil {
+		t.Fatalf("failed to create agent-deck dir: %v", err)
+	}
+	configContent := `
+[claude]
+config_dir = "~/.claude-global"
+
+[profiles.work.claude]
+config_dir = "~/.claude-work"
+`
+	if err := os.WriteFile(filepath.Join(agentDeckDir, "config.toml"), []byte(configContent), 0600); err != nil {
+		t.Fatalf("failed to write config.toml: %v", err)
+	}
+
+	got := GetClaudeConfigDir()
+	want := filepath.Join(tmpHome, ".claude-work")
+	if got != want {
+		t.Errorf("GetClaudeConfigDir() = %s, want %s", got, want)
+	}
+
+	// Unknown profile should fall back to global [claude].config_dir
+	_ = os.Setenv("AGENTDECK_PROFILE", "unknown")
+	ClearUserConfigCache()
+	got = GetClaudeConfigDir()
+	want = filepath.Join(tmpHome, ".claude-global")
+	if got != want {
+		t.Errorf("GetClaudeConfigDir() fallback = %s, want %s", got, want)
+	}
+
+	// Explicit CLAUDE_CONFIG_DIR should always win
+	_ = os.Setenv("CLAUDE_CONFIG_DIR", "/override")
+	got = GetClaudeConfigDir()
+	if got != "/override" {
+		t.Errorf("GetClaudeConfigDir() env override = %s, want /override", got)
+	}
+}
+
+func TestIsClaudeConfigDirExplicit_ProfileOverride(t *testing.T) {
+	tmpHome := t.TempDir()
+	origHome := os.Getenv("HOME")
+	origProfile := os.Getenv("AGENTDECK_PROFILE")
+	origClaudeDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	defer func() {
+		_ = os.Setenv("HOME", origHome)
+		if origProfile != "" {
+			_ = os.Setenv("AGENTDECK_PROFILE", origProfile)
+		} else {
+			_ = os.Unsetenv("AGENTDECK_PROFILE")
+		}
+		if origClaudeDir != "" {
+			_ = os.Setenv("CLAUDE_CONFIG_DIR", origClaudeDir)
+		} else {
+			_ = os.Unsetenv("CLAUDE_CONFIG_DIR")
+		}
+		ClearUserConfigCache()
+	}()
+
+	_ = os.Setenv("HOME", tmpHome)
+	_ = os.Unsetenv("CLAUDE_CONFIG_DIR")
+	_ = os.Setenv("AGENTDECK_PROFILE", "work")
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tmpHome, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0700); err != nil {
+		t.Fatalf("failed to create agent-deck dir: %v", err)
+	}
+	configContent := `
+[profiles.work.claude]
+config_dir = "~/.claude-work"
+`
+	if err := os.WriteFile(filepath.Join(agentDeckDir, "config.toml"), []byte(configContent), 0600); err != nil {
+		t.Fatalf("failed to write config.toml: %v", err)
+	}
+
+	if !IsClaudeConfigDirExplicit() {
+		t.Fatal("IsClaudeConfigDirExplicit() = false, want true for profile override")
 	}
 }
 
@@ -398,6 +504,187 @@ func TestGetMCPMode(t *testing.T) {
 			mode := GetMCPMode(tmpDir)
 			if mode != tt.expected {
 				t.Errorf("GetMCPMode() = %v, want %v", mode, tt.expected)
+			}
+		})
+	}
+}
+
+func TestClearMCPCache_ClearsParentDirectories(t *testing.T) {
+	// Setup: Create nested directory structure
+	baseDir := t.TempDir()
+	childDir := filepath.Join(baseDir, "child", "grandchild")
+	if err := os.MkdirAll(childDir, 0755); err != nil {
+		t.Fatalf("failed to create dirs: %v", err)
+	}
+
+	// Populate cache for parent directory by calling GetMCPInfo
+	// (This will cache the parent path)
+	_ = GetMCPInfo(baseDir)
+
+	// Now clear cache for child directory
+	ClearMCPCache(childDir)
+
+	// The parent cache should also be cleared
+	// We verify by checking internal cache state
+	mcpInfoCacheMu.RLock()
+	_, parentCached := mcpInfoCache[baseDir]
+	mcpInfoCacheMu.RUnlock()
+
+	if parentCached {
+		t.Error("parent directory cache should be cleared but wasn't")
+	}
+}
+
+func TestFindActiveSessionIDExcluding(t *testing.T) {
+	configDir := t.TempDir()
+	projectPath := "/Users/test/my-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionA := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	sessionB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	fileA := filepath.Join(projectDir, sessionA+".jsonl")
+	fileB := filepath.Join(projectDir, sessionB+".jsonl")
+	if err := os.WriteFile(fileA, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileB, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	older := time.Now().Add(-2 * time.Second)
+	newer := time.Now().Add(-1 * time.Second)
+	if err := os.Chtimes(fileA, older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(fileB, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("no exclude returns most recent", func(t *testing.T) {
+		got := findActiveSessionIDExcluding(configDir, projectPath, nil)
+		if got != sessionB {
+			t.Errorf("got %q, want %q (most recent)", got, sessionB)
+		}
+	})
+
+	t.Run("excluding most recent returns older", func(t *testing.T) {
+		exclude := map[string]bool{sessionB: true}
+		got := findActiveSessionIDExcluding(configDir, projectPath, exclude)
+		if got != sessionA {
+			t.Errorf("got %q, want %q (after excluding %s)", got, sessionA, sessionB)
+		}
+	})
+
+	t.Run("excluding all returns empty", func(t *testing.T) {
+		exclude := map[string]bool{sessionA: true, sessionB: true}
+		got := findActiveSessionIDExcluding(configDir, projectPath, exclude)
+		if got != "" {
+			t.Errorf("got %q, want empty (all excluded)", got)
+		}
+	})
+
+	t.Run("skips agent files", func(t *testing.T) {
+		agentFile := filepath.Join(projectDir, "agent-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl")
+		if err := os.WriteFile(agentFile, []byte("{}"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		exclude := map[string]bool{sessionB: true}
+		got := findActiveSessionIDExcluding(configDir, projectPath, exclude)
+		if got != sessionA {
+			t.Errorf("got %q, want %q (agent file should be skipped)", got, sessionA)
+		}
+	})
+
+	t.Run("nonexistent project returns empty", func(t *testing.T) {
+		got := findActiveSessionIDExcluding(configDir, "/no/such/project", nil)
+		if got != "" {
+			t.Errorf("got %q, want empty for nonexistent project", got)
+		}
+	})
+}
+
+func TestFindActiveSessionIDExcluding_StaleFile(t *testing.T) {
+	configDir := t.TempDir()
+	projectPath := "/Users/test/stale-project"
+	projectDirName := ConvertToClaudeDirName(projectPath)
+	projectDir := filepath.Join(configDir, "projects", projectDirName)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	filePath := filepath.Join(projectDir, sessionID+".jsonl")
+	if err := os.WriteFile(filePath, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(filePath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findActiveSessionIDExcluding(configDir, projectPath, nil)
+	if got != "" {
+		t.Errorf("got %q, want empty (file is stale >5min)", got)
+	}
+}
+
+func TestConvertToClaudeDirName(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "simple path",
+			input:    "/Users/test/project",
+			expected: "-Users-test-project",
+		},
+		{
+			name:     "path with space",
+			input:    "/Users/test/My Project",
+			expected: "-Users-test-My-Project",
+		},
+		{
+			name:     "path with exclamation mark",
+			input:    "/Users/test/!Contributions",
+			expected: "-Users-test--Contributions",
+		},
+		{
+			name:     "path with multiple special chars",
+			input:    "/Users/test/Code cloud/!Dir",
+			expected: "-Users-test-Code-cloud--Dir",
+		},
+		{
+			name:     "real world example",
+			input:    "/Users/master/Dropbox/LLM x AWST/project",
+			expected: "-Users-master-Dropbox-LLM-x-AWST-project",
+		},
+		{
+			name:     "path with dots",
+			input:    "/Users/test/.hidden/file.txt",
+			expected: "-Users-test--hidden-file-txt",
+		},
+		{
+			name:     "path with parentheses",
+			input:    "/Users/test/(backup)/data",
+			expected: "-Users-test--backup--data",
+		},
+		{
+			name:     "preserves existing hyphens",
+			input:    "/Users/test/my-project-name",
+			expected: "-Users-test-my-project-name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ConvertToClaudeDirName(tt.input)
+			if got != tt.expected {
+				t.Errorf("ConvertToClaudeDirName(%q) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
 	}

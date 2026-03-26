@@ -1,13 +1,20 @@
 package session
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/BurntSushi/toml"
+
+	dark "github.com/thiagokokada/dark-mode-go"
+
+	"github.com/asheshgoplani/agent-deck/internal/platform"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // UserConfigFileName is the TOML config file for user preferences
@@ -16,12 +23,30 @@ const UserConfigFileName = "config.toml"
 // UserConfig represents user-facing configuration in TOML format
 type UserConfig struct {
 	// DefaultTool is the pre-selected AI tool when creating new sessions
-	// Valid values: "claude", "gemini", "opencode", "codex", or any custom tool name
+	// Valid values: "claude", "gemini", "opencode", "codex", "pi", or any custom tool name
 	// If empty or invalid, defaults to "shell" (no pre-selection)
 	DefaultTool string `toml:"default_tool"`
 
+	// Hotkeys overrides default keyboard shortcuts in the TUI.
+	// Keys are action names, values are key bindings (e.g., "delete" = "backspace").
+	// Set an action to "" to explicitly unbind it.
+	Hotkeys map[string]string `toml:"hotkeys"`
+
+	// Theme sets the color scheme: "dark" (default), "light", or "system"
+	Theme string `toml:"theme"`
+
 	// Tools defines custom AI tool configurations
 	Tools map[string]ToolDef `toml:"tools"`
+
+	// MCPDefaultScope sets the default scope for MCP operations
+	// Valid values: "local" (default), "global", "user"
+	MCPDefaultScope string `toml:"mcp_default_scope"`
+
+	// ManageMCPJson controls whether agent-deck writes to .mcp.json in project directories.
+	// Set to false to prevent agent-deck from touching any .mcp.json files, which is useful
+	// when you manage that file manually or via another tool.
+	// Default: true (nil = true)
+	ManageMCPJson *bool `toml:"manage_mcp_json"`
 
 	// MCPs defines available MCP servers for the MCP Manager
 	// These can be attached/detached per-project via the MCP Manager (M key)
@@ -29,6 +54,24 @@ type UserConfig struct {
 
 	// Claude defines Claude Code integration settings
 	Claude ClaudeSettings `toml:"claude"`
+
+	// Profiles defines optional per-profile overrides.
+	// Example:
+	// [profiles.work.claude]
+	// config_dir = "~/.claude-work"
+	Profiles map[string]ProfileSettings `toml:"profiles"`
+
+	// Gemini defines Gemini CLI integration settings
+	Gemini GeminiSettings `toml:"gemini"`
+
+	// OpenCode defines OpenCode CLI integration settings
+	OpenCode OpenCodeSettings `toml:"opencode"`
+
+	// Codex defines Codex CLI integration settings
+	Codex CodexSettings `toml:"codex"`
+
+	// Worktree defines git worktree preferences
+	Worktree WorktreeSettings `toml:"worktree"`
 
 	// GlobalSearch defines global conversation search settings
 	GlobalSearch GlobalSearchSettings `toml:"global_search"`
@@ -41,6 +84,105 @@ type UserConfig struct {
 
 	// Updates defines auto-update settings
 	Updates UpdateSettings `toml:"updates"`
+
+	// Preview defines preview pane display settings
+	Preview PreviewSettings `toml:"preview"`
+
+	// Experiments defines experiment folder settings for 'try' command
+	Experiments ExperimentsSettings `toml:"experiments"`
+
+	// Notifications defines waiting session notification bar settings
+	Notifications NotificationsConfig `toml:"notifications"`
+
+	// Instances defines multiple instance behavior settings
+	Instances InstanceSettings `toml:"instances"`
+
+	// Shell defines global shell environment settings for sessions
+	Shell ShellSettings `toml:"shell"`
+
+	// Maintenance defines automatic maintenance worker settings
+	Maintenance MaintenanceSettings `toml:"maintenance"`
+
+	// Status defines session status detection settings
+	Status StatusSettings `toml:"status"`
+
+	// Conductor defines conductor (meta-agent orchestration) settings
+	Conductor ConductorSettings `toml:"conductor"`
+
+	// Tmux defines tmux option overrides applied to every session
+	Tmux TmuxSettings `toml:"tmux"`
+
+	// Docker defines Docker sandbox settings for containerized sessions
+	Docker DockerSettings `toml:"docker"`
+
+	// Remotes defines named SSH remote agent-deck instances
+	Remotes map[string]RemoteConfig `toml:"remotes"`
+
+	// OpenClaw defines OpenClaw gateway integration settings
+	OpenClaw OpenClawSettings `toml:"openclaw"`
+
+	// Display defines rendering and display settings
+	Display DisplaySettings `toml:"display"`
+
+	// Costs defines cost tracking and budget settings
+	Costs CostsSettings `toml:"costs"`
+}
+
+// OpenClawSettings configures the OpenClaw gateway connection.
+type OpenClawSettings struct {
+	// GatewayURL is the WebSocket URL of the OpenClaw gateway (default: "ws://127.0.0.1:31337")
+	GatewayURL string `toml:"gateway_url"`
+
+	// Password is the gateway authentication password.
+	// Supports env var references (e.g. "$OPENCLAW_PASSWORD" or "${OPENCLAW_PASSWORD}").
+	// Falls back to OPENCLAW_PASSWORD env var if not set.
+	Password string `toml:"password"`
+
+	// AutoSync syncs OpenClaw agents as agent-deck sessions on TUI startup
+	AutoSync bool `toml:"auto_sync"`
+
+	// GroupName is the agent-deck group name for OpenClaw sessions (default: "openclaw")
+	GroupName string `toml:"group_name"`
+}
+
+// RemoteConfig defines a remote agent-deck instance accessible via SSH.
+type RemoteConfig struct {
+	// Host is the SSH destination (e.g., "user@host" or "user@host:port")
+	Host string `toml:"host"`
+
+	// AgentDeckPath is the path to agent-deck binary on the remote (default: "agent-deck")
+	AgentDeckPath string `toml:"agent_deck_path"`
+
+	// Profile is the remote profile to use (default: "default")
+	Profile string `toml:"profile"`
+}
+
+// GetAgentDeckPath returns the agent-deck binary path, defaulting to "agent-deck".
+func (rc RemoteConfig) GetAgentDeckPath() string {
+	if rc.AgentDeckPath != "" {
+		return rc.AgentDeckPath
+	}
+	return "agent-deck"
+}
+
+// GetProfile returns the remote profile, defaulting to "default".
+func (rc RemoteConfig) GetProfile() string {
+	if rc.Profile != "" {
+		return rc.Profile
+	}
+	return "default"
+}
+
+// ProfileSettings defines per-profile configuration overrides.
+type ProfileSettings struct {
+	// Claude defines Claude Code overrides for a specific profile.
+	Claude ProfileClaudeSettings `toml:"claude"`
+}
+
+// ProfileClaudeSettings defines profile-specific Claude overrides.
+type ProfileClaudeSettings struct {
+	// ConfigDir overrides [claude].config_dir for this profile only.
+	ConfigDir string `toml:"config_dir"`
 }
 
 // MCPPoolSettings defines HTTP MCP pool configuration
@@ -78,6 +220,9 @@ type MCPPoolSettings struct {
 
 	// ExcludeMCPs excludes specific MCPs from pool when pool_all = true
 	ExcludeMCPs []string `toml:"exclude_mcps"`
+
+	// SocketWaitTimeout is seconds to wait for socket to become ready (default: 5)
+	SocketWaitTimeout int `toml:"socket_wait_timeout"`
 }
 
 // LogSettings defines log file management configuration
@@ -94,6 +239,41 @@ type LogSettings struct {
 	// RemoveOrphans removes log files for sessions that no longer exist
 	// Default: true
 	RemoveOrphans bool `toml:"remove_orphans"`
+
+	// DebugLevel sets the minimum log level: "debug", "info", "warn", "error"
+	// Default: "info"
+	DebugLevel string `toml:"debug_level"`
+
+	// DebugFormat sets the log format: "json" (default) or "text"
+	DebugFormat string `toml:"debug_format"`
+
+	// DebugMaxMB is the max size in MB for debug.log before rotation
+	// Default: 10
+	DebugMaxMB int `toml:"debug_max_mb"`
+
+	// DebugBackups is the number of rotated debug.log files to keep
+	// Default: 5
+	DebugBackups int `toml:"debug_backups"`
+
+	// DebugRetentionDays is the number of days to keep rotated debug logs
+	// Default: 10
+	DebugRetentionDays int `toml:"debug_retention_days"`
+
+	// DebugCompress enables gzip compression for rotated debug logs
+	// Default: true
+	DebugCompress bool `toml:"debug_compress"`
+
+	// RingBufferMB is the in-memory ring buffer size in MB for crash dumps
+	// Default: 10
+	RingBufferMB int `toml:"ring_buffer_mb"`
+
+	// PprofEnabled starts a pprof server on localhost:6060 when debug mode is active
+	// Default: false
+	PprofEnabled bool `toml:"pprof_enabled"`
+
+	// AggregateIntervalS is the event aggregation flush interval in seconds
+	// Default: 30
+	AggregateIntervalS int `toml:"aggregate_interval_secs"`
 }
 
 // UpdateSettings defines auto-update configuration
@@ -115,15 +295,383 @@ type UpdateSettings struct {
 	NotifyInCLI bool `toml:"notify_in_cli"`
 }
 
+// PreviewSettings defines preview pane configuration
+type PreviewSettings struct {
+	// ShowOutput shows terminal output in preview pane (including launch animation)
+	// Default: true (pointer to distinguish "not set" from "explicitly false")
+	ShowOutput *bool `toml:"show_output"`
+
+	// ShowAnalytics shows session analytics panel for Claude sessions
+	// Default: false (pointer to distinguish "not set" from "explicitly false")
+	ShowAnalytics *bool `toml:"show_analytics"`
+
+	// ShowNotes shows session notes section in preview pane
+	// Default: true (pointer to distinguish "not set" from "explicitly false")
+	ShowNotes *bool `toml:"show_notes"`
+
+	// Analytics configures which sections to show in the analytics panel
+	Analytics AnalyticsDisplaySettings `toml:"analytics"`
+
+	// NotesOutputSplit controls vertical space allocation between notes and output
+	// in the preview pane when output is visible.
+	// Range: 0.1 - 0.9 (fraction reserved for notes). Default: 0.33
+	NotesOutputSplit float64 `toml:"notes_output_split"`
+}
+
+// AnalyticsDisplaySettings configures which analytics sections to display
+// All settings use pointers to distinguish "not set" from "explicitly false"
+type AnalyticsDisplaySettings struct {
+	// ShowContextBar shows the context window usage bar (default: true)
+	ShowContextBar *bool `toml:"show_context_bar"`
+
+	// ShowTokens shows the token breakdown (In/Out/Cache/Total) (default: false)
+	ShowTokens *bool `toml:"show_tokens"`
+
+	// ShowSessionInfo shows duration, turns, start time (default: false)
+	ShowSessionInfo *bool `toml:"show_session_info"`
+
+	// ShowTools shows the top tool calls (default: true)
+	ShowTools *bool `toml:"show_tools"`
+
+	// ShowCost shows the estimated cost (default: false)
+	ShowCost *bool `toml:"show_cost"`
+}
+
+// ExperimentsSettings defines experiment folder configuration
+type ExperimentsSettings struct {
+	// Directory is the base directory for experiments
+	// Default: ~/src/tries
+	Directory string `toml:"directory"`
+
+	// DatePrefix adds YYYY-MM-DD- prefix to new experiment folders
+	// Default: true
+	DatePrefix bool `toml:"date_prefix"`
+
+	// DefaultTool is the AI tool to use for experiment sessions
+	// Default: "claude"
+	DefaultTool string `toml:"default_tool"`
+}
+
+// NotificationsConfig configures the waiting session notification bar
+type NotificationsConfig struct {
+	// Enabled shows notification bar in tmux status (default: true)
+	Enabled bool `toml:"enabled"`
+
+	// MaxShown is the maximum number of sessions shown in the bar (default: 6)
+	MaxShown int `toml:"max_shown"`
+
+	// ShowAll displays all sessions (with status icons) instead of only waiting sessions (default: false)
+	ShowAll bool `toml:"show_all"`
+
+	// Minimal shows a compact icon+count summary instead of session names: ● 2 │ ◐ 3 │ ○ 1
+	// When true, key bindings (Ctrl+b 1-6) are disabled. ShowAll is ignored. (default: false)
+	Minimal bool `toml:"minimal"`
+}
+
+// InstanceSettings configures multiple agent-deck instance behavior
+type InstanceSettings struct {
+	// AllowMultiple allows running multiple agent-deck TUI instances for the same profile
+	// When true (default), multiple instances can run, but only the first (primary) manages the notification bar
+	// When false, only one instance can run per profile
+	AllowMultiple *bool `toml:"allow_multiple"`
+
+	// FollowCwdOnAttach updates the session's ProjectPath from tmux pane_current_path
+	// after returning from attach, and persists the new path.
+	// Default: false
+	FollowCwdOnAttach *bool `toml:"follow_cwd_on_attach"`
+}
+
+// GetAllowMultiple returns whether multiple instances are allowed, defaulting to true
+func (i *InstanceSettings) GetAllowMultiple() bool {
+	if i.AllowMultiple == nil {
+		return true // Default: allow multiple instances (better UX for multi-pane workflows)
+	}
+	return *i.AllowMultiple
+}
+
+// GetFollowCwdOnAttach returns whether attach-return CWD follow is enabled.
+func (i *InstanceSettings) GetFollowCwdOnAttach() bool {
+	if i.FollowCwdOnAttach == nil {
+		return false
+	}
+	return *i.FollowCwdOnAttach
+}
+
+// ShellSettings defines shell environment configuration for sessions
+type ShellSettings struct {
+	// EnvFiles is a list of .env files to source for ALL sessions
+	// Paths can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
+	// Files are sourced in order; later files override earlier ones
+	EnvFiles []string `toml:"env_files"`
+
+	// InitScript is an optional shell script or command to run before each session
+	// Useful for direnv, nvm, pyenv, etc.
+	// Can be a file path (e.g., "~/.agent-deck/init.sh") or inline command
+	// (e.g., 'eval "$(direnv hook bash)"')
+	InitScript string `toml:"init_script"`
+
+	// IgnoreMissingEnvFiles silently ignores missing .env files (default: true)
+	// When false, sessions will error if an env_file doesn't exist
+	IgnoreMissingEnvFiles *bool `toml:"ignore_missing_env_files"`
+}
+
+// GetIgnoreMissingEnvFiles returns whether to ignore missing env files, defaulting to true
+func (s *ShellSettings) GetIgnoreMissingEnvFiles() bool {
+	if s.IgnoreMissingEnvFiles == nil {
+		return true // Default: ignore missing files (fail-safe)
+	}
+	return *s.IgnoreMissingEnvFiles
+}
+
+// GetShowAnalytics returns whether to show analytics, defaulting to false
+func (p *PreviewSettings) GetShowAnalytics() bool {
+	if p.ShowAnalytics == nil {
+		return false // Default: analytics OFF (opt-in)
+	}
+	return *p.ShowAnalytics
+}
+
+// GetShowOutput returns whether to show terminal output, defaulting to true
+func (p *PreviewSettings) GetShowOutput() bool {
+	if p.ShowOutput == nil {
+		return true // Default: output ON (shows launch animation)
+	}
+	return *p.ShowOutput
+}
+
+// GetAnalyticsSettings returns the analytics display settings with defaults applied
+func (p *PreviewSettings) GetAnalyticsSettings() AnalyticsDisplaySettings {
+	return p.Analytics
+}
+
+// GetShowNotes returns whether to show notes section, defaulting to true
+func (p *PreviewSettings) GetShowNotes() bool {
+	if p.ShowNotes == nil {
+		return true // Default: notes ON
+	}
+	return *p.ShowNotes
+}
+
+// GetNotesOutputSplit returns notes/output split ratio, clamped to sane bounds.
+func (p *PreviewSettings) GetNotesOutputSplit() float64 {
+	if p.NotesOutputSplit <= 0 {
+		return 0.33
+	}
+	if p.NotesOutputSplit < 0.1 {
+		return 0.1
+	}
+	if p.NotesOutputSplit > 0.9 {
+		return 0.9
+	}
+	return p.NotesOutputSplit
+}
+
+// GetShowContextBar returns whether to show context bar, defaulting to true
+func (a *AnalyticsDisplaySettings) GetShowContextBar() bool {
+	if a.ShowContextBar == nil {
+		return true // Default: ON - useful visual indicator
+	}
+	return *a.ShowContextBar
+}
+
+// GetShowTokens returns whether to show token breakdown, defaulting to false
+func (a *AnalyticsDisplaySettings) GetShowTokens() bool {
+	if a.ShowTokens == nil {
+		return false // Default: OFF - can be noisy
+	}
+	return *a.ShowTokens
+}
+
+// GetShowSessionInfo returns whether to show session info, defaulting to false
+func (a *AnalyticsDisplaySettings) GetShowSessionInfo() bool {
+	if a.ShowSessionInfo == nil {
+		return false // Default: OFF - less useful info
+	}
+	return *a.ShowSessionInfo
+}
+
+// GetShowTools returns whether to show tool calls, defaulting to false
+func (a *AnalyticsDisplaySettings) GetShowTools() bool {
+	if a.ShowTools == nil {
+		return false // Default: OFF - keeps display minimal
+	}
+	return *a.ShowTools
+}
+
+// GetShowCost returns whether to show cost estimate, defaulting to false
+func (a *AnalyticsDisplaySettings) GetShowCost() bool {
+	if a.ShowCost == nil {
+		return false // Default: OFF - can be noisy
+	}
+	return *a.ShowCost
+}
+
+// GetShowOutput returns whether to show terminal output in preview
+func (c *UserConfig) GetShowOutput() bool {
+	return c.Preview.GetShowOutput()
+}
+
+// GetShowAnalytics returns whether to show analytics panel, defaulting to false
+func (c *UserConfig) GetShowAnalytics() bool {
+	return c.Preview.GetShowAnalytics()
+}
+
+// GetShowNotes returns whether to show notes section, defaulting to true
+func (c *UserConfig) GetShowNotes() bool {
+	return c.Preview.GetShowNotes()
+}
+
 // ClaudeSettings defines Claude Code configuration
 type ClaudeSettings struct {
+	// Command is the Claude CLI command or alias to use (e.g., "claude", "cdw", "cdp")
+	// Default: "claude"
+	// This allows using shell aliases that set CLAUDE_CONFIG_DIR automatically
+	Command string `toml:"command"`
+
+	// UseHappy launches Claude via the happy wrapper by default.
+	// Ignored when Command is set to a custom alias or command.
+	// Default: false
+	UseHappy bool `toml:"use_happy"`
+
 	// ConfigDir is the path to Claude's config directory
 	// Default: ~/.claude (or CLAUDE_CONFIG_DIR env var)
 	ConfigDir string `toml:"config_dir"`
 
 	// DangerousMode enables --dangerously-skip-permissions flag for Claude sessions
+	// Default: true (nil = use default true, explicitly set false to disable)
+	// Power users typically want this enabled for faster iteration
+	DangerousMode *bool `toml:"dangerous_mode"`
+
+	// AllowDangerousMode enables --allow-dangerously-skip-permissions flag
+	// This unlocks bypass as an option without activating it by default.
+	// Ignored when dangerous_mode is true (the stronger flag takes precedence).
 	// Default: false
-	DangerousMode bool `toml:"dangerous_mode"`
+	AllowDangerousMode bool `toml:"allow_dangerous_mode"`
+
+	// EnvFile is a .env file specific to Claude sessions
+	// Sourced AFTER global [shell].env_files
+	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
+	EnvFile string `toml:"env_file"`
+
+	// HooksEnabled enables Claude Code hooks for real-time status detection.
+	// When enabled, agent-deck uses lifecycle hooks (SessionStart, Stop, etc.)
+	// for instant, deterministic status updates instead of polling tmux content.
+	// Default: true (nil = use default true, set false to disable)
+	HooksEnabled *bool `toml:"hooks_enabled"`
+}
+
+// GetProfileClaudeConfigDir returns the profile-specific Claude config directory, if configured.
+func (c *UserConfig) GetProfileClaudeConfigDir(profile string) string {
+	if c == nil || profile == "" || c.Profiles == nil {
+		return ""
+	}
+	profileCfg, ok := c.Profiles[profile]
+	if !ok || profileCfg.Claude.ConfigDir == "" {
+		return ""
+	}
+	return ExpandPath(profileCfg.Claude.ConfigDir)
+}
+
+// GetDangerousMode returns whether dangerous mode is enabled, defaulting to true
+// Power users (the primary audience) typically want this enabled for faster iteration
+func (c *ClaudeSettings) GetDangerousMode() bool {
+	if c.DangerousMode == nil {
+		return true
+	}
+	return *c.DangerousMode
+}
+
+// GetHooksEnabled returns whether Claude Code hooks are enabled, defaulting to true
+func (c *ClaudeSettings) GetHooksEnabled() bool {
+	if c.HooksEnabled == nil {
+		return true
+	}
+	return *c.HooksEnabled
+}
+
+// GeminiSettings defines Gemini CLI configuration
+type GeminiSettings struct {
+	// YoloMode enables --yolo flag for Gemini sessions (auto-approve all actions)
+	// Default: false
+	YoloMode bool `toml:"yolo_mode"`
+
+	// DefaultModel is the model to use for new Gemini sessions (e.g., "gemini-2.5-flash")
+	// If empty, Gemini CLI uses its own default
+	DefaultModel string `toml:"default_model"`
+
+	// EnvFile is a .env file specific to Gemini sessions
+	// Sourced AFTER global [shell].env_files
+	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
+	EnvFile string `toml:"env_file"`
+}
+
+// OpenCodeSettings defines OpenCode CLI configuration
+type OpenCodeSettings struct {
+	// DefaultModel is the model to use for new OpenCode sessions
+	// Format: "provider/model" (e.g., "anthropic/claude-sonnet-4-5-20250929")
+	// If empty, OpenCode uses its own default
+	DefaultModel string `toml:"default_model"`
+
+	// DefaultAgent is the agent to use for new OpenCode sessions
+	// If empty, OpenCode uses its own default
+	DefaultAgent string `toml:"default_agent"`
+
+	// EnvFile is a .env file specific to OpenCode sessions
+	// Sourced AFTER global [shell].env_files
+	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
+	EnvFile string `toml:"env_file"`
+}
+
+// CodexSettings defines Codex CLI configuration
+type CodexSettings struct {
+	// YoloMode enables --yolo flag for Codex sessions (bypass approvals and sandbox)
+	// Default: false
+	YoloMode bool `toml:"yolo_mode"`
+
+	// UseHappy launches Codex via "happy codex" by default.
+	// Default: false
+	UseHappy bool `toml:"use_happy"`
+}
+
+// WorktreeSettings contains git worktree preferences.
+type WorktreeSettings struct {
+	// AutoCleanup: remove worktree when session is deleted
+	AutoCleanup bool `toml:"auto_cleanup"`
+
+	// DefaultLocation: "sibling" (next to repo), "subdirectory" (inside .worktrees/),
+	// or a custom path (e.g., "~/worktrees") creating <path>/<repo_name>/<branch>
+	DefaultLocation string `toml:"default_location"`
+
+	// PathTemplate: custom path template for worktree location.
+	// Variables:
+	//   {repo-name}, {repo-root}, {session-id}
+	//   {branch}         -> sanitized (human-friendly, may collide)
+	//   {branch-escaped} -> URL-escaped (collision-resistant, reversible)
+	// Unknown variables like {foo} are left as-is in the path.
+	// If set, overrides DefaultLocation.
+	PathTemplate *string `toml:"path_template"`
+
+	// BranchPrefix is the prefix for auto-generated branch names when creating
+	// worktree sessions. For example, "feature/" produces "feature/my-session".
+	// Set to "" to disable auto-prefixing (just the session name).
+	// Default: "feature/" when not set.
+	BranchPrefix *string `toml:"branch_prefix"`
+}
+
+// Template returns the path template if set, or empty string if nil.
+func (w *WorktreeSettings) Template() string {
+	if w.PathTemplate == nil {
+		return ""
+	}
+	return *w.PathTemplate
+}
+
+// Prefix returns the branch prefix if set, or "feature/" if nil.
+func (w *WorktreeSettings) Prefix() string {
+	if w.BranchPrefix == nil {
+		return "feature/"
+	}
+	return *w.BranchPrefix
 }
 
 // GlobalSearchSettings defines global conversation search configuration
@@ -156,11 +704,84 @@ type ToolDef struct {
 	// Command is the shell command to run
 	Command string `toml:"command"`
 
+	// Wrapper is an optional command that wraps the tool command.
+	// Use {command} placeholder to include the tool command, or omit it to replace the command.
+	// Example: wrapper = "nvim +'terminal {command}' +'startinsert'"
+	Wrapper string `toml:"wrapper"`
+
 	// Icon is the emoji/symbol to display
 	Icon string `toml:"icon"`
 
 	// BusyPatterns are strings that indicate the tool is busy
 	BusyPatterns []string `toml:"busy_patterns"`
+
+	// PromptPatterns are strings that indicate the tool is waiting for input
+	PromptPatterns []string `toml:"prompt_patterns"`
+
+	// DetectPatterns are regex patterns to auto-detect this tool from terminal content
+	DetectPatterns []string `toml:"detect_patterns"`
+
+	// ResumeFlag is the CLI flag to resume a session (e.g., "--resume")
+	ResumeFlag string `toml:"resume_flag"`
+
+	// SessionIDEnv is the tmux environment variable name storing the session ID
+	SessionIDEnv string `toml:"session_id_env"`
+
+	// DangerousMode enables dangerous mode flag for this tool
+	DangerousMode bool `toml:"dangerous_mode"`
+
+	// DangerousFlag is the CLI flag for dangerous mode (e.g., "--dangerously-skip-permissions")
+	DangerousFlag string `toml:"dangerous_flag"`
+
+	// OutputFormatFlag is the CLI flag for JSON output format (e.g., "--output-format json")
+	OutputFormatFlag string `toml:"output_format_flag"`
+
+	// SessionIDJsonPath is the jq path to extract session ID from JSON output
+	SessionIDJsonPath string `toml:"session_id_json_path"`
+
+	// EnvFile is a .env file specific to this tool
+	// Sourced AFTER global [shell].env_files
+	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
+	EnvFile string `toml:"env_file"`
+
+	// Env is inline environment variables for this tool
+	// These are exported AFTER env_file (highest priority)
+	// Example: env = { ANTHROPIC_BASE_URL = "https://...", API_KEY = "token" }
+	Env map[string]string `toml:"env"`
+
+	// Pattern override fields (extend built-in defaults for claude/gemini/opencode/codex/pi)
+	// Patterns prefixed with "re:" are compiled as regex; everything else uses strings.Contains.
+
+	// BusyPatternsExtra appends additional busy patterns to the built-in defaults
+	BusyPatternsExtra []string `toml:"busy_patterns_extra"`
+
+	// PromptPatternsExtra appends additional prompt patterns to the built-in defaults
+	PromptPatternsExtra []string `toml:"prompt_patterns_extra"`
+
+	// SpinnerChars replaces the default spinner characters entirely (use with caution)
+	SpinnerChars []string `toml:"spinner_chars"`
+
+	// SpinnerCharsExtra appends additional spinner characters to the built-in defaults
+	SpinnerCharsExtra []string `toml:"spinner_chars_extra"`
+}
+
+// HTTPServerConfig defines how to auto-start an HTTP MCP server
+type HTTPServerConfig struct {
+	// Command is the executable to run (e.g., "uvx", "python", "node")
+	Command string `toml:"command"`
+
+	// Args are command-line arguments for the server
+	Args []string `toml:"args"`
+
+	// Env is environment variables for the server process
+	Env map[string]string `toml:"env"`
+
+	// StartupTimeout is milliseconds to wait for server to become ready (default: 5000)
+	StartupTimeout int `toml:"startup_timeout"`
+
+	// HealthCheck is an optional health endpoint URL to poll (e.g., "http://localhost:30000/health")
+	// If not set, the main URL is used for health checking
+	HealthCheck string `toml:"health_check"`
 }
 
 // MCPDef defines an MCP server configuration for the MCP Manager
@@ -185,6 +806,151 @@ type MCPDef struct {
 	// Transport specifies the MCP transport type: "stdio" (default), "http", or "sse"
 	// Only needed when URL is set; defaults to "http" if URL is present
 	Transport string `toml:"transport"`
+
+	// Headers is optional HTTP headers for HTTP/SSE MCPs (e.g., for authentication)
+	// Example: { Authorization = "Bearer token123" }
+	Headers map[string]string `toml:"headers"`
+
+	// Server defines how to auto-start an HTTP MCP server process
+	// When set, agent-deck will start the server before connecting via HTTP
+	// This is optional - you can also connect to externally managed servers
+	Server *HTTPServerConfig `toml:"server"`
+}
+
+// GetStartupTimeout returns the startup timeout in milliseconds, defaulting to 5000ms
+func (c *HTTPServerConfig) GetStartupTimeout() int {
+	if c.StartupTimeout <= 0 {
+		return 5000 // Default: 5 seconds
+	}
+	return c.StartupTimeout
+}
+
+// IsHTTP returns true if this MCP uses HTTP or SSE transport
+func (m *MCPDef) IsHTTP() bool {
+	return m.URL != ""
+}
+
+// GetTransport returns the transport type, defaulting to "http" if URL is set
+func (m *MCPDef) GetTransport() string {
+	if m.URL == "" {
+		return "stdio"
+	}
+	if m.Transport == "" {
+		return "http"
+	}
+	return m.Transport
+}
+
+// HasAutoStartServer returns true if this HTTP MCP has server auto-start configured
+func (m *MCPDef) HasAutoStartServer() bool {
+	return m.IsHTTP() && m.Server != nil && m.Server.Command != ""
+}
+
+// TmuxSettings allows users to override tmux options applied to every session.
+// Options are applied AFTER agent-deck's defaults, so they take precedence.
+//
+// Example config.toml:
+//
+//	[tmux]
+//	inject_status_line = false
+//	options = { "allow-passthrough" = "all", "history-limit" = "50000" }
+type TmuxSettings struct {
+	// InjectStatusLine controls whether agent-deck injects a custom status line
+	// into new tmux sessions. When false, the tmux status bar is not modified,
+	// allowing users to use their own tmux status line configuration. This also
+	// disables Agent Deck's global tmux notification bar and key bindings so the
+	// runtime stops mutating global tmux options.
+	// Default: true (nil = use default true)
+	InjectStatusLine *bool `toml:"inject_status_line"`
+
+	// Options is a map of tmux option names to values.
+	// These are passed to `tmux set-option -t <session>` after defaults.
+	Options map[string]string `toml:"options"`
+}
+
+// GetInjectStatusLine returns whether to inject status line, defaulting to true.
+func (t TmuxSettings) GetInjectStatusLine() bool {
+	if t.InjectStatusLine == nil {
+		return true
+	}
+	return *t.InjectStatusLine
+}
+
+// DockerSettings defines Docker sandbox configuration.
+type DockerSettings struct {
+	// DefaultImage is the sandbox image to use when not specified per-session.
+	DefaultImage string `toml:"default_image"`
+
+	// DefaultEnabled enables sandbox by default for new sessions.
+	DefaultEnabled bool `toml:"default_enabled"`
+
+	// CPULimit is the default CPU limit for sandboxed containers (e.g. "2.0").
+	CPULimit string `toml:"cpu_limit"`
+
+	// MemoryLimit is the default memory limit for sandboxed containers (e.g. "4g").
+	MemoryLimit string `toml:"memory_limit"`
+
+	// VolumeIgnores is a list of directories to exclude from the project mount.
+	VolumeIgnores []string `toml:"volume_ignores"`
+
+	// Environment lists host environment variable names whose values are forwarded to the
+	// container at runtime via docker exec -e. The actual values are read from the host
+	// on each command invocation, so changes take effect without recreating the container.
+	Environment []string `toml:"environment"`
+
+	// ExtraVolumes maps host paths to container paths for additional bind mounts.
+	ExtraVolumes map[string]string `toml:"extra_volumes"`
+
+	// EnvironmentValues are static key=value pairs baked into the container at creation
+	// time via docker create -e. Unlike Environment (which forwards by name at runtime),
+	// these are fixed when the container is created.
+	EnvironmentValues map[string]string `toml:"environment_values"`
+
+	// MountSSH mounts ~/.ssh read-only inside the container.
+	MountSSH bool `toml:"mount_ssh"`
+
+	// AutoCleanup removes sandbox containers on session kill (default: true).
+	AutoCleanup *bool `toml:"auto_cleanup"`
+}
+
+// GetAutoCleanup returns whether to auto-remove sandbox containers, defaulting to true.
+func (d DockerSettings) GetAutoCleanup() bool {
+	if d.AutoCleanup == nil {
+		return true
+	}
+	return *d.AutoCleanup
+}
+
+type StatusSettings struct {
+	// Reserved for future status detection settings.
+	// Control mode pipes are always enabled (no longer configurable).
+}
+
+// MaintenanceSettings controls the automatic maintenance worker
+type MaintenanceSettings struct {
+	// Enabled enables the maintenance worker (default: false)
+	// Prunes Gemini logs, cleans old backups, archives bloated sessions
+	Enabled bool `toml:"enabled"`
+}
+
+// DisplaySettings controls TUI rendering behavior.
+type DisplaySettings struct {
+	// FullRepaint forces a full screen clear on every render cycle instead of
+	// incremental redraws. Enable this if you see vertical drift or rendering
+	// artifacts in terminals that use unicode grapheme-cluster widths (e.g.
+	// Ghostty 1.3+ with grapheme-width-method=unicode).
+	// Can also be enabled via AGENTDECK_REPAINT=full env var.
+	// Default: false
+	FullRepaint bool `toml:"full_repaint"`
+}
+
+// GetFullRepaint returns whether full-repaint mode is active, checking
+// the env var AGENTDECK_REPAINT=full as an override.
+func (d DisplaySettings) GetFullRepaint() bool {
+	if strings.EqualFold(os.Getenv("AGENTDECK_REPAINT"), "full") {
+		return true
+	}
+	return d.FullRepaint
 }
 
 // Default user config (empty maps)
@@ -268,12 +1034,149 @@ func ReloadUserConfig() (*UserConfig, error) {
 	return LoadUserConfig()
 }
 
+// SaveUserConfig writes the config to config.toml using atomic write pattern
+// This clears the cache so next LoadUserConfig() reads fresh values
+func SaveUserConfig(config *UserConfig) error {
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		return fmt.Errorf("failed to get config path: %w", err)
+	}
+
+	// Ensure directory exists
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	// Build config content in memory first
+	var buf bytes.Buffer
+
+	// Write header comment
+	if _, err := buf.WriteString("# Agent Deck Configuration\n"); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+	if _, err := buf.WriteString("# Edit this file or use Settings (press S) in the TUI\n\n"); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+
+	// Encode to TOML
+	encoder := toml.NewEncoder(&buf)
+	if err := encoder.Encode(config); err != nil {
+		return fmt.Errorf("failed to encode config: %w", err)
+	}
+
+	// ═══════════════════════════════════════════════════════════════════
+	// ATOMIC WRITE PATTERN: Prevents data corruption on crash/power loss
+	// 1. Write to temporary file with 0600 permissions
+	// 2. fsync the temp file (ensures data reaches disk)
+	// 3. Atomic rename temp to final
+	// ═══════════════════════════════════════════════════════════════════
+
+	tmpPath := configPath + ".tmp"
+
+	// Step 1: Write to temporary file (0600 = owner read/write only for security)
+	if err := os.WriteFile(tmpPath, buf.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+
+	// Step 2: fsync the temp file to ensure data reaches disk before rename
+	if err := syncConfigFile(tmpPath); err != nil {
+		// Log but don't fail - atomic rename still provides some safety
+		// Note: We don't have access to log package here, so we just continue
+		_ = err
+	}
+
+	// Step 3: Atomic rename (this is atomic on POSIX systems)
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		// Clean up temp file on failure
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to finalize config save: %w", err)
+	}
+
+	// Clear cache so next load picks up changes
+	ClearUserConfigCache()
+
+	return nil
+}
+
+// syncConfigFile calls fsync on a file to ensure data is written to disk
+func syncConfigFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // ClearUserConfigCache clears the cached user config, allowing tests to reset state
 // This does NOT reload - the next LoadUserConfig() call will read fresh from disk
 func ClearUserConfigCache() {
 	userConfigCacheMu.Lock()
 	userConfigCache = nil
 	userConfigCacheMu.Unlock()
+}
+
+// IsClaudeCompatible returns true if the tool is "claude" or a custom tool
+// whose underlying command is "claude". Use this for capability gates
+// (session tracking, MCP, skills, hooks, etc.) where custom tools wrapping
+// Claude should get full Claude functionality.
+func IsClaudeCompatible(toolName string) bool {
+	if toolName == "claude" {
+		return true
+	}
+	if def := GetToolDef(toolName); def != nil {
+		return isClaudeCommand(def.Command)
+	}
+	return false
+}
+
+func isClaudeCommand(command string) bool {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) == 0 {
+		return false
+	}
+
+	cmdToken := ""
+	for _, field := range fields {
+		if isShellEnvAssignment(field) {
+			continue
+		}
+		cmdToken = strings.Trim(field, `"'`)
+		break
+	}
+	if cmdToken == "" {
+		return false
+	}
+
+	base := filepath.Base(cmdToken)
+	base = strings.TrimSuffix(base, ".exe")
+	base = strings.TrimSuffix(base, ".EXE")
+	return strings.EqualFold(base, "claude")
+}
+
+func isShellEnvAssignment(token string) bool {
+	if token == "" {
+		return false
+	}
+	idx := strings.IndexByte(token, '=')
+	if idx <= 0 {
+		return false
+	}
+
+	key := token[:idx]
+	for i, r := range key {
+		if i == 0 {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_') {
+				return false
+			}
+			continue
+		}
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 // GetToolDef returns a tool definition from user config
@@ -288,6 +1191,33 @@ func GetToolDef(toolName string) *ToolDef {
 		return &def
 	}
 	return nil
+}
+
+// GetCustomToolNames returns sorted custom tool names from config.toml,
+// excluding names that shadow built-in tools (claude, gemini, opencode, codex, pi, shell, cursor, aider).
+// Returns nil if no custom tools are configured.
+func GetCustomToolNames() []string {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil || len(config.Tools) == 0 {
+		return nil
+	}
+
+	builtins := map[string]bool{
+		"claude": true, "gemini": true, "opencode": true,
+		"codex": true, "pi": true, "shell": true, "cursor": true, "aider": true,
+	}
+
+	var names []string
+	for name := range config.Tools {
+		if !builtins[name] {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	sort.Strings(names)
+	return names
 }
 
 // GetToolIcon returns the icon for a tool (custom or built-in)
@@ -307,6 +1237,8 @@ func GetToolIcon(toolName string) string {
 		return "🌐"
 	case "codex":
 		return "💻"
+	case "pi":
+		return "π"
 	case "cursor":
 		return "📝"
 	case "shell":
@@ -329,6 +1261,43 @@ func GetToolBusyPatterns(toolName string) []string {
 	return patterns
 }
 
+// MergeToolPatterns returns merged RawPatterns for a tool, combining built-in
+// defaults with any user overrides/extras from config.toml.
+// Works for ALL tools: built-in (claude, gemini, etc.) and custom.
+// Returns nil only if there are no defaults AND no config entry.
+func MergeToolPatterns(toolName string) *tmux.RawPatterns {
+	defaults := tmux.DefaultRawPatterns(toolName)
+	toolDef := GetToolDef(toolName)
+
+	// No defaults and no config entry: nothing to do
+	if defaults == nil && toolDef == nil {
+		return nil
+	}
+
+	// Build overrides from ToolDef's replace fields (BusyPatterns, PromptPatterns, SpinnerChars)
+	var overrides *tmux.RawPatterns
+	if toolDef != nil && (toolDef.BusyPatterns != nil || toolDef.PromptPatterns != nil || toolDef.SpinnerChars != nil) {
+		overrides = &tmux.RawPatterns{
+			BusyPatterns:   toolDef.BusyPatterns,
+			PromptPatterns: toolDef.PromptPatterns,
+			SpinnerChars:   toolDef.SpinnerChars,
+		}
+	}
+
+	// Build extras from ToolDef's *Extra fields
+	var extras *tmux.RawPatterns
+	if toolDef != nil &&
+		(len(toolDef.BusyPatternsExtra) > 0 || len(toolDef.PromptPatternsExtra) > 0 || len(toolDef.SpinnerCharsExtra) > 0) {
+		extras = &tmux.RawPatterns{
+			BusyPatterns:   toolDef.BusyPatternsExtra,
+			PromptPatterns: toolDef.PromptPatternsExtra,
+			SpinnerChars:   toolDef.SpinnerCharsExtra,
+		}
+	}
+
+	return tmux.MergeRawPatterns(defaults, overrides, extras)
+}
+
 // GetDefaultTool returns the user's preferred default tool for new sessions
 // Returns empty string if not configured (defaults to shell)
 func GetDefaultTool() string {
@@ -337,6 +1306,52 @@ func GetDefaultTool() string {
 		return ""
 	}
 	return config.DefaultTool
+}
+
+// GetHotkeyOverrides returns user-configured hotkey overrides from config.toml.
+// Returns nil when unset.
+func GetHotkeyOverrides() map[string]string {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil || len(config.Hotkeys) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(config.Hotkeys))
+	for action, key := range config.Hotkeys {
+		out[action] = key
+	}
+	return out
+}
+
+// GetTheme returns the current theme, defaulting to "dark"
+func GetTheme() string {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return "dark"
+	}
+	switch config.Theme {
+	case "dark", "light", "system":
+		return config.Theme
+	default:
+		return "dark"
+	}
+}
+
+// ResolveTheme resolves the configured theme to "dark" or "light".
+// If theme is "system", detects the OS dark mode setting.
+// Falls back to "dark" on detection failure.
+func ResolveTheme() string {
+	theme := GetTheme()
+	if theme != "system" {
+		return theme
+	}
+	isDark, err := dark.IsDarkMode()
+	if err != nil {
+		return "dark"
+	}
+	if isDark {
+		return "dark"
+	}
+	return "light"
 }
 
 // GetLogSettings returns log management settings with defaults applied
@@ -364,6 +1379,30 @@ func GetLogSettings() LogSettings {
 	// We detect this by checking if the entire Logs section is empty
 	if config.Logs.MaxSizeMB == 0 && config.Logs.MaxLines == 0 {
 		settings.RemoveOrphans = true
+	}
+
+	return settings
+}
+
+// GetWorktreeSettings returns worktree settings with defaults applied
+func GetWorktreeSettings() WorktreeSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return WorktreeSettings{
+			DefaultLocation: "subdirectory",
+			AutoCleanup:     true,
+		}
+	}
+
+	settings := config.Worktree
+
+	if settings.DefaultLocation == "" {
+		settings.DefaultLocation = "subdirectory"
+	}
+	// AutoCleanup defaults to true (Go zero value is false)
+	// We detect if section was not present by checking if DefaultLocation is empty
+	if config.Worktree.DefaultLocation == "" {
+		settings.AutoCleanup = true
 	}
 
 	return settings
@@ -397,6 +1436,179 @@ func GetUpdateSettings() UpdateSettings {
 	return settings
 }
 
+// GetPreviewSettings returns preview settings with defaults applied
+func GetPreviewSettings() PreviewSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return PreviewSettings{
+			ShowOutput:    nil, // nil means "default to true"
+			ShowAnalytics: nil, // nil means "default to true"
+		}
+	}
+
+	return config.Preview
+}
+
+// GetExperimentsSettings returns experiments settings with defaults applied
+func GetExperimentsSettings() ExperimentsSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		homeDir, _ := os.UserHomeDir()
+		return ExperimentsSettings{
+			Directory:   filepath.Join(homeDir, "src", "tries"),
+			DatePrefix:  true,
+			DefaultTool: "claude",
+		}
+	}
+
+	settings := config.Experiments
+
+	// Apply defaults for unset values
+	if settings.Directory == "" {
+		homeDir, _ := os.UserHomeDir()
+		settings.Directory = filepath.Join(homeDir, "src", "tries")
+	} else {
+		settings.Directory = ExpandPath(settings.Directory)
+	}
+
+	// DatePrefix defaults to true (Go zero value is false, need explicit check)
+	// If directory is default, assume DatePrefix should be true
+	if config.Experiments.Directory == "" {
+		settings.DatePrefix = true
+	}
+
+	if settings.DefaultTool == "" {
+		settings.DefaultTool = "claude"
+	}
+
+	return settings
+}
+
+// GetNotificationsSettings returns notification bar settings with defaults applied
+func GetNotificationsSettings() NotificationsConfig {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return NotificationsConfig{
+			Enabled:  true,
+			MaxShown: 6,
+			ShowAll:  false,
+		}
+	}
+
+	settings := config.Notifications
+
+	// Apply defaults for unset values
+	// Enabled defaults to true for better UX (users expect to see waiting sessions)
+	// Users who have a config file but no [notifications] section get enabled=true
+	if !settings.Enabled && settings.MaxShown == 0 {
+		// Section not explicitly configured, apply default
+		settings.Enabled = true
+	}
+	if settings.MaxShown <= 0 {
+		settings.MaxShown = 6
+	}
+	// ShowAll defaults to false (backward compatible) - bool zero value handles this
+
+	return settings
+}
+
+// GetMaintenanceSettings returns maintenance settings from config
+func GetMaintenanceSettings() MaintenanceSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return MaintenanceSettings{Enabled: false}
+	}
+	return config.Maintenance
+}
+
+// GetStatusSettings returns status detection settings with defaults applied.
+func GetStatusSettings() StatusSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return StatusSettings{}
+	}
+	return config.Status
+}
+
+// GetDockerSettings returns docker sandbox settings with defaults applied.
+func GetDockerSettings() DockerSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return DockerSettings{}
+	}
+	return config.Docker
+}
+
+// GetTmuxSettings returns tmux option overrides from config
+func GetTmuxSettings() TmuxSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return TmuxSettings{}
+	}
+	return config.Tmux
+}
+
+// GetInstanceSettings returns instance behavior settings
+func GetInstanceSettings() InstanceSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return InstanceSettings{} // Defaults applied via GetAllowMultiple()
+	}
+	return config.Instances
+}
+
+// getMCPPoolConfigSection returns the MCP pool config section based on platform
+// On unsupported platforms (WSL1, Windows), it's commented out with explanation
+func getMCPPoolConfigSection() string {
+	header := `
+# ============================================================================
+# MCP Socket Pool (Advanced)
+# ============================================================================
+# The MCP pool shares MCP processes across multiple Claude sessions via Unix
+# domain sockets. This reduces memory usage when running many sessions.
+#
+# PLATFORM SUPPORT:
+#   macOS/Linux: Full support
+#   WSL2: Full support
+#   WSL1: NOT SUPPORTED (Unix sockets unreliable)
+#   Windows: NOT SUPPORTED
+#
+# When pooling is disabled or unsupported, MCPs use stdio mode (default).
+# Both modes work identically - pooling is just a memory optimization.
+
+`
+	if platform.SupportsUnixSockets() {
+		// Platform supports pooling - show enabled example
+		return header + `# Uncomment to enable MCP socket pooling:
+# [mcp_pool]
+# enabled = true
+# pool_all = true           # Pool all MCPs defined above
+# fallback_to_stdio = true  # Fall back to stdio if socket fails
+# exclude_mcps = []         # MCPs to exclude from pooling
+`
+	}
+
+	// Platform doesn't support pooling - explain why it's disabled
+	p := platform.Detect()
+	reason := "Unix sockets not supported"
+	tip := ""
+
+	switch p {
+	case platform.PlatformWSL1:
+		reason = "WSL1 detected - Unix sockets unreliable"
+		tip = "\n# TIP: Upgrade to WSL2 for socket pooling support:\n#      wsl --set-version <distro> 2\n"
+	case platform.PlatformWindows:
+		reason = "Windows detected - Unix sockets not available"
+	}
+
+	return header + fmt.Sprintf(`# MCP pool is DISABLED on this platform: %s
+# MCPs will use stdio mode (works fine, just uses more memory with many sessions).
+%s
+# [mcp_pool]
+# enabled = false  # Cannot be enabled on this platform
+`, reason, tip)
+}
+
 // CreateExampleConfig creates an example config file if none exists
 func CreateExampleConfig() error {
 	configPath, err := GetUserConfigPath()
@@ -414,15 +1626,58 @@ func CreateExampleConfig() error {
 
 # Default AI tool for new sessions
 # When creating a new session (pressing 'n'), this tool will be pre-selected
-# Valid values: "claude", "gemini", "opencode", "codex", or any custom tool name
+# Valid values: "claude", "gemini", "opencode", "codex", "pi", or any custom tool name
 # Leave commented out or empty to default to shell (no pre-selection)
 # default_tool = "claude"
 
+# Hotkey overrides (optional)
+# Action names are defined by agent-deck. Value is the key string.
+# Set value to "" to unbind an action.
+# [hotkeys]
+# delete = "d"
+# close_session = "D"
+# restart = "R"
+
+# Attach-return project path sync (optional)
+# [instances]
+# follow_cwd_on_attach = true
+
+# Preview settings (optional)
+# [preview]
+# show_notes = true
+# notes_output_split = 0.33
+
 # Claude Code integration
-# Set this if you use a custom Claude profile (e.g., dual account setup)
-# Default: ~/.claude (or CLAUDE_CONFIG_DIR env var takes priority)
 # [claude]
+# Custom config directory (for dual account setups)
+# Default: ~/.claude (or CLAUDE_CONFIG_DIR env var takes priority)
 # config_dir = "~/.claude-work"
+# Optional per-profile override (takes precedence over [claude] when profile matches)
+# [profiles.work.claude]
+# config_dir = "~/.claude-work"
+# Enable --dangerously-skip-permissions by default (default: false)
+# dangerous_mode = true
+# Launch Claude via happy by default (default: false)
+# use_happy = true
+
+# Gemini CLI integration
+# [gemini]
+# Enable --yolo (auto-approve all actions) by default (default: false)
+# yolo_mode = true
+
+# OpenCode CLI integration
+# [opencode]
+# Default model for new sessions (format: "provider/model")
+# default_model = "anthropic/claude-sonnet-4-5-20250929"
+# Default agent for new sessions
+# default_agent = ""
+
+# Codex CLI integration
+# [codex]
+# Enable --yolo (bypass approvals and sandbox) by default (default: false)
+# yolo_mode = true
+# Launch Codex via happy by default (default: false)
+# use_happy = true
 
 # Log file management
 # Agent-deck logs session output to ~/.agent-deck/logs/ for status detection
@@ -446,6 +1701,57 @@ check_enabled = true
 check_interval_hours = 24
 # Show update notification in CLI commands, not just TUI (default: true)
 notify_in_cli = true
+
+# Experiments (for 'agent-deck try' command)
+# Quick experiment folder management with auto-dated directories
+[experiments]
+# Base directory for experiments (default: ~/src/tries)
+directory = "~/src/tries"
+# Add YYYY-MM-DD- prefix to new experiment folders (default: true)
+date_prefix = true
+# Default AI tool for experiment sessions (default: "claude")
+default_tool = "claude"
+
+# Git worktree settings
+# Worktrees allow creating isolated working directories for branches
+[worktree]
+# Where to create worktrees: "sibling" (next to repo) or "subdirectory" (inside repo)
+default_location = "sibling"
+# Automatically remove worktree when session is deleted
+auto_cleanup = true
+# Custom path template (overrides default_location if set)
+# Variables:
+#   {repo-name}, {repo-root}, {session-id}
+#   {branch}         -> sanitized (human-friendly, may collide)
+#   {branch-escaped} -> URL-escaped (collision-resistant, reversible)
+# path_template = "../worktrees/{repo-name}/{branch}"
+
+# Default scope for MCP operations: "local", "global", or "user"
+# "local" writes to .mcp.json (project-only, default)
+# "global" writes to Claude profile config (profile-wide)
+# "user" writes to ~/.claude.json (all profiles)
+# mcp_default_scope = "local"
+
+# Disable ALL .mcp.json management (default: true)
+# Set to false if you manage .mcp.json manually or via another tool and don't
+# want agent-deck to touch it. LOCAL-scope MCP changes will be silently skipped.
+# manage_mcp_json = false
+
+# Tmux session settings
+# Controls how agent-deck configures tmux sessions
+# [tmux]
+# inject_status_line controls whether agent-deck sets up a custom tmux status bar
+# When false, your existing tmux status line configuration is preserved and
+# agent-deck stops mutating the global tmux notification bar / number key bindings
+# Default: true (agent-deck injects its own status bar with session info)
+# inject_status_line = false
+# Override tmux options applied to every session (applied after defaults)
+# Options matching agent-deck's managed keys (status, status-style,
+# status-left-length, status-right, status-right-length) will cause agent-deck
+# to skip its default for that key, letting your value take full effect.
+# options = { "allow-passthrough" = "all", "history-limit" = "50000" }
+# Example: keep agent-deck notifications but use a 2-line status bar
+# options = { "status" = "2" }
 
 # ============================================================================
 # MCP Server Definitions
@@ -501,11 +1807,37 @@ notify_in_cli = true
 # transport = "http"
 # description = "My custom HTTP MCP server"
 
+# Example: HTTP MCP with authentication headers
+# [mcps.authenticated-api]
+# url = "https://api.example.com/mcp"
+# transport = "http"
+# headers = { Authorization = "Bearer your-token-here", "X-API-Key" = "your-api-key" }
+# description = "HTTP MCP with auth headers"
+
 # Example: SSE MCP server
 # [mcps.remote-sse]
 # url = "https://api.example.com/mcp/sse"
 # transport = "sse"
 # description = "Remote SSE-based MCP"
+
+# ---------- HTTP MCP with Auto-Start Server ----------
+# For MCPs that need a local server process (e.g., piekstra/slack-mcp-server),
+# add a [mcps.NAME.server] block to have agent-deck auto-start the server.
+
+# Example: Slack MCP with auto-start server
+# [mcps.slack]
+# url = "http://localhost:30000/mcp/"
+# transport = "http"
+# description = "Slack 23+ tools (piekstra)"
+# [mcps.slack.headers]
+#   Authorization = "Bearer xoxb-your-token"
+# [mcps.slack.server]
+#   command = "uvx"
+#   args = ["--python", "3.12", "slack-mcp-server", "--port", "30000"]
+#   startup_timeout = 5000
+#   health_check = "http://localhost:30000/health"
+#   [mcps.slack.server.env]
+#     SLACK_API_TOKEN = "xoxb-your-token"
 
 # ============================================================================
 # Custom Tool Definitions
@@ -526,15 +1858,44 @@ notify_in_cli = true
 # command = "gh copilot"
 # icon = "🤖"
 # busy_patterns = ["Generating..."]
+
+# Example: Custom tool with inline env vars (appears in command picker)
+# [tools.glm]
+# command = "claude"
+# icon = "🧠"
+# dangerous_mode = true
+# dangerous_flag = "--dangerously-skip-permissions"
+# env = { ANTHROPIC_BASE_URL = "https://api.example.com/v4", API_KEY = "your-key" }
+
+# ============================================================================
+# Status Detection Pattern Overrides (Advanced)
+# ============================================================================
+# Built-in tools (claude, gemini, opencode, codex, pi) have default detection
+# patterns that work out of the box. You can extend them with *_extra fields
+# (appended to defaults) or replace them entirely with the base fields.
+# Patterns prefixed with "re:" are compiled as regex.
+#
+# Extend defaults (recommended):
+# [tools.claude]
+# busy_patterns_extra = ["my custom busy text", "re:custom.*regex"]
+# prompt_patterns_extra = ["Custom>"]
+# spinner_chars_extra = ["@"]
+#
+# Replace all defaults (use with caution):
+# [tools.claude]
+# busy_patterns = ["only-this-pattern"]
 `
+
+	// Add platform-aware MCP pool section
+	exampleConfig += getMCPPoolConfigSection()
 
 	// Ensure directory exists
 	dir := filepath.Dir(configPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 
-	return os.WriteFile(configPath, []byte(exampleConfig), 0600)
+	return os.WriteFile(configPath, []byte(exampleConfig), 0o600)
 }
 
 // GetAvailableMCPs returns MCPs from config.toml as a map
@@ -558,6 +1919,34 @@ func GetAvailableMCPNames() []string {
 	return names
 }
 
+// GetMCPDefaultScope returns the configured default MCP scope.
+// Returns "local", "global", or "user". Defaults to "local" if unset or invalid.
+func GetMCPDefaultScope() string {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return "local"
+	}
+	switch config.MCPDefaultScope {
+	case "global", "user":
+		return config.MCPDefaultScope
+	default:
+		return "local"
+	}
+}
+
+// GetManageMCPJson returns whether agent-deck should write to .mcp.json files.
+// Defaults to true when unset.
+func GetManageMCPJson() bool {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return true
+	}
+	if config.ManageMCPJson == nil {
+		return true
+	}
+	return *config.ManageMCPJson
+}
+
 // GetMCPDef returns a specific MCP definition by name
 // Returns nil if not found
 func GetMCPDef(name string) *MCPDef {
@@ -566,4 +1955,54 @@ func GetMCPDef(name string) *MCPDef {
 		return &def
 	}
 	return nil
+}
+
+// CostsSettings configures cost tracking, budgets, and pricing overrides.
+type CostsSettings struct {
+	Currency      string          `toml:"currency"`
+	Timezone      string          `toml:"timezone"`
+	RetentionDays int             `toml:"retention_days"`
+	Budgets       BudgetSettings  `toml:"budgets"`
+	Pricing       PricingSettings `toml:"pricing"`
+}
+
+type BudgetSettings struct {
+	DailyLimit   float64                  `toml:"daily_limit"`
+	WeeklyLimit  float64                  `toml:"weekly_limit"`
+	MonthlyLimit float64                  `toml:"monthly_limit"`
+	Groups       map[string]GroupBudget   `toml:"groups"`
+	Sessions     map[string]SessionBudget `toml:"sessions"`
+}
+
+type GroupBudget struct {
+	DailyLimit float64 `toml:"daily_limit"`
+}
+
+type SessionBudget struct {
+	TotalLimit float64 `toml:"total_limit"`
+}
+
+type PricingSettings struct {
+	Overrides map[string]PricingOverride `toml:"overrides"`
+}
+
+type PricingOverride struct {
+	InputPerMtok      float64 `toml:"input_per_mtok"`
+	OutputPerMtok     float64 `toml:"output_per_mtok"`
+	CacheReadPerMtok  float64 `toml:"cache_read_per_mtok"`
+	CacheWritePerMtok float64 `toml:"cache_write_per_mtok"`
+}
+
+func (c CostsSettings) GetRetentionDays() int {
+	if c.RetentionDays > 0 {
+		return c.RetentionDays
+	}
+	return 90
+}
+
+func (c CostsSettings) GetTimezone() string {
+	if c.Timezone != "" {
+		return c.Timezone
+	}
+	return "Local"
 }

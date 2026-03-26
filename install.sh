@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Agent Deck Installer
 # https://github.com/asheshgoplani/agent-deck
@@ -12,6 +12,7 @@
 #   --version <ver>     Specific version (default: latest)
 #   --skip-tmux-config  Skip tmux configuration prompt
 #   --non-interactive   Skip all prompts (for CI/automated installs)
+#   --pkg-manager <mgr> macOS package manager: 'brew' or 'port' (default: auto-detect)
 #
 # The installer will:
 #   1. Download and install the agent-deck binary
@@ -42,6 +43,10 @@ REPO="asheshgoplani/agent-deck"
 SKIP_TMUX_CONFIG=false
 SKIP_OPTIONAL_DEPS=false
 
+# macOS package manager configuration
+MACOS_SUPPORTED_PKG_MGRS=("brew" "port")  # Order matters for preference
+MACOS_PKG_MANAGER=""  # Will be auto-detected or set by user
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -66,6 +71,26 @@ while [[ $# -gt 0 ]]; do
             SKIP_OPTIONAL_DEPS=true
             shift
             ;;
+        --pkg-manager)
+            if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                echo -e "${RED}Error: --pkg-manager requires a value (${MACOS_SUPPORTED_PKG_MGRS[*]})${NC}"
+                exit 1
+            fi
+            MACOS_PKG_MANAGER="$2"
+            # Validate against supported package managers
+            valid=false
+            for mgr in "${MACOS_SUPPORTED_PKG_MGRS[@]}"; do
+                if [[ "$MACOS_PKG_MANAGER" == "$mgr" ]]; then
+                    valid=true
+                    break
+                fi
+            done
+            if [[ "$valid" != "true" ]]; then
+                echo -e "${RED}Error: --pkg-manager must be one of: ${MACOS_SUPPORTED_PKG_MGRS[*]}${NC}"
+                exit 1
+            fi
+            shift 2
+            ;;
         -h|--help)
             echo "Agent Deck Installer"
             echo ""
@@ -77,6 +102,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --version <ver>     Specific version (default: latest)"
             echo "  --skip-tmux-config  Skip tmux configuration prompt"
             echo "  --non-interactive   Skip all prompts (for CI/automated installs)"
+            echo "  --pkg-manager <mgr> macOS package manager: ${MACOS_SUPPORTED_PKG_MGRS[*]} (default: auto-detect)"
             echo "  -h, --help          Show this help message"
             exit 0
             ;;
@@ -128,6 +154,148 @@ else
     echo -e "Detected: ${GREEN}${OS}/${ARCH}${NC}"
 fi
 
+# macOS-specific package manager configuration
+if [[ "$OS" == "darwin" ]]; then
+    # Bash 3.2 compatibility: use case-based helpers instead of associative arrays.
+    macos_pkg_mgr_name() {
+        case "$1" in
+            brew) echo "Homebrew" ;;
+            port) echo "MacPorts" ;;
+            *) return 1 ;;
+        esac
+    }
+
+    macos_pkg_mgr_command() {
+        case "$1" in
+            brew) echo "brew" ;;
+            port) echo "port" ;;
+            *) return 1 ;;
+        esac
+    }
+
+    macos_pkg_mgr_install_cmd() {
+        case "$1" in
+            brew) echo "brew install" ;;
+            port) echo "sudo port install" ;;
+            *) return 1 ;;
+        esac
+    }
+
+    macos_pkg_mgr_link() {
+        case "$1" in
+            brew) echo "https://brew.sh" ;;
+            port) echo "https://www.macports.org/install.php" ;;
+            *) return 1 ;;
+        esac
+    }
+fi
+
+# Detect or select macOS package manager
+detect_macos_package_manager() {
+    # If user specified a package manager, verify it's available
+    if [[ -n "$MACOS_PKG_MANAGER" ]]; then
+        local cmd
+        cmd="$(macos_pkg_mgr_command "$MACOS_PKG_MANAGER")"
+        local name
+        name="$(macos_pkg_mgr_name "$MACOS_PKG_MANAGER")"
+        local link
+        link="$(macos_pkg_mgr_link "$MACOS_PKG_MANAGER")"
+
+        if ! command -v "$cmd" &> /dev/null; then
+            echo -e "${RED}Error: $name not found but --pkg-manager=$MACOS_PKG_MANAGER was specified${NC}"
+            echo "Install $name: $link"
+            exit 1
+        fi
+        echo -e "Package manager: ${GREEN}${name}${NC} (user specified)"
+        return
+    fi
+
+    # Auto-detect: check for available package managers
+    local available_mgrs=()
+    for mgr in "${MACOS_SUPPORTED_PKG_MGRS[@]}"; do
+        if command -v "$(macos_pkg_mgr_command "$mgr")" &> /dev/null; then
+            available_mgrs+=("$mgr")
+        fi
+    done
+
+    # Handle based on how many are available
+    if [[ ${#available_mgrs[@]} -eq 0 ]]; then
+        # None available
+        MACOS_PKG_MANAGER=""
+        echo -e "${YELLOW}No package manager detected (Homebrew or MacPorts)${NC}"
+        echo "You'll need to install dependencies manually or install a package manager first:"
+        for mgr in "${MACOS_SUPPORTED_PKG_MGRS[@]}"; do
+            echo "  • $(macos_pkg_mgr_name "$mgr"): $(macos_pkg_mgr_link "$mgr")"
+        done
+    elif [[ ${#available_mgrs[@]} -eq 1 ]]; then
+        # Only one available
+        MACOS_PKG_MANAGER="${available_mgrs[0]}"
+        echo -e "Package manager: ${GREEN}$(macos_pkg_mgr_name "$MACOS_PKG_MANAGER")${NC} (auto-detected)"
+    else
+        # Multiple available - ask user to choose
+        echo -e "${YELLOW}Multiple package managers are installed.${NC}"
+        if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+            # Non-interactive mode: use first in preference order
+            MACOS_PKG_MANAGER="${available_mgrs[0]}"
+            echo -e "Package manager: ${GREEN}$(macos_pkg_mgr_name "$MACOS_PKG_MANAGER")${NC} (auto-selected in non-interactive mode)"
+        else
+            echo "Which package manager would you like to use?"
+            local i=1
+            for mgr in "${available_mgrs[@]}"; do
+                echo "  $i) $(macos_pkg_mgr_name "$mgr") ($mgr)"
+                ((i++))
+            done
+            read -p "Enter choice [1-${#available_mgrs[@]}]: " -n 1 -r
+            echo
+
+            local choice=$((REPLY - 1))
+            if [[ $choice -ge 0 && $choice -lt ${#available_mgrs[@]} ]]; then
+                MACOS_PKG_MANAGER="${available_mgrs[$choice]}"
+                echo -e "Package manager: ${GREEN}$(macos_pkg_mgr_name "$MACOS_PKG_MANAGER")${NC}"
+            else
+                echo -e "${YELLOW}Invalid choice, defaulting to $(macos_pkg_mgr_name "${available_mgrs[0]}")${NC}"
+                MACOS_PKG_MANAGER="${available_mgrs[0]}"
+            fi
+        fi
+    fi
+}
+
+# Detect package manager on macOS
+if [[ "$OS" == "darwin" ]]; then
+    detect_macos_package_manager
+fi
+
+# Helper function to install packages on macOS
+# Usage: install_macos_package <package_name>
+# Note: Assumes package has same name across all package managers
+# Prerequisite: MACOS_PKG_MANAGER must be set (validated by detect_macos_package_manager)
+install_macos_package() {
+    local PACKAGE_NAME="$1"
+    local mgr_name
+    mgr_name="$(macos_pkg_mgr_name "$MACOS_PKG_MANAGER")"
+
+    echo -e "Installing $PACKAGE_NAME via $mgr_name..."
+    case "$MACOS_PKG_MANAGER" in
+        brew) brew install "$PACKAGE_NAME" ;;
+        port)
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                sudo -n port install "$PACKAGE_NAME"
+            else
+                sudo port install "$PACKAGE_NAME"
+            fi
+            ;;
+    esac
+}
+
+# Helper function to print manual install commands on macOS
+print_macos_manual_install_help() {
+    local package_name="$1"
+    echo "Install $package_name manually with one of:"
+    for mgr in "${MACOS_SUPPORTED_PKG_MGRS[@]}"; do
+        echo "  $(macos_pkg_mgr_install_cmd "$mgr") $package_name"
+    done
+}
+
 # Check for tmux and offer to install
 if ! command -v tmux &> /dev/null; then
     echo -e "${YELLOW}tmux is not installed.${NC}"
@@ -136,39 +304,66 @@ if ! command -v tmux &> /dev/null; then
 
     # Try to auto-install tmux
     if [[ "$OS" == "darwin" ]]; then
-        if command -v brew &> /dev/null; then
-            read -p "Install tmux via Homebrew? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "Installing tmux..."
-                brew install tmux
+        if [[ -n "$MACOS_PKG_MANAGER" ]]; then
+            mgr_name="$(macos_pkg_mgr_name "$MACOS_PKG_MANAGER")"
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                echo -e "Installing tmux via $mgr_name (non-interactive)..."
+                if ! install_macos_package "tmux"; then
+                    echo -e "${YELLOW}Warning: automatic tmux install failed in non-interactive mode.${NC}"
+                fi
+            else
+                read -p "Install tmux via $mgr_name? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    install_macos_package "tmux"
+                fi
             fi
         else
-            echo "Install tmux with: brew install tmux"
-            echo "(Install Homebrew first: https://brew.sh)"
+            print_macos_manual_install_help "tmux"
         fi
     else
         # Linux - try apt, dnf, or pacman
         if command -v apt-get &> /dev/null; then
-            read -p "Install tmux via apt? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "Installing tmux..."
-                sudo apt-get update && sudo apt-get install -y tmux
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                echo -e "Installing tmux via apt (non-interactive)..."
+                if ! { sudo -n apt-get update && sudo -n apt-get install -y tmux; }; then
+                    echo -e "${YELLOW}Warning: automatic tmux install via apt failed in non-interactive mode.${NC}"
+                fi
+            else
+                read -p "Install tmux via apt? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    echo -e "Installing tmux..."
+                    sudo apt-get update && sudo apt-get install -y tmux
+                fi
             fi
         elif command -v dnf &> /dev/null; then
-            read -p "Install tmux via dnf? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "Installing tmux..."
-                sudo dnf install -y tmux
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                echo -e "Installing tmux via dnf (non-interactive)..."
+                if ! sudo -n dnf install -y tmux; then
+                    echo -e "${YELLOW}Warning: automatic tmux install via dnf failed in non-interactive mode.${NC}"
+                fi
+            else
+                read -p "Install tmux via dnf? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    echo -e "Installing tmux..."
+                    sudo dnf install -y tmux
+                fi
             fi
         elif command -v pacman &> /dev/null; then
-            read -p "Install tmux via pacman? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "Installing tmux..."
-                sudo pacman -S --noconfirm tmux
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                echo -e "Installing tmux via pacman (non-interactive)..."
+                if ! sudo -n pacman -S --noconfirm tmux; then
+                    echo -e "${YELLOW}Warning: automatic tmux install via pacman failed in non-interactive mode.${NC}"
+                fi
+            else
+                read -p "Install tmux via pacman? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    echo -e "Installing tmux..."
+                    sudo pacman -S --noconfirm tmux
+                fi
             fi
         else
             echo "Please install tmux manually:"
@@ -180,11 +375,15 @@ if ! command -v tmux &> /dev/null; then
 
     # Check again after attempted install
     if ! command -v tmux &> /dev/null; then
-        echo ""
-        read -p "tmux not found. Continue anyway? [y/N] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
+        if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+            echo -e "${YELLOW}Warning: tmux not found. Continuing without tmux (non-interactive).${NC}"
+        else
+            echo ""
+            read -p "tmux not found. Continue anyway? [y/N] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
         fi
     else
         echo -e "${GREEN}tmux installed successfully!${NC}"
@@ -199,15 +398,15 @@ if ! command -v jq &> /dev/null && [[ "$SKIP_OPTIONAL_DEPS" != "true" ]]; then
 
     # Try to auto-install jq
     if [[ "$OS" == "darwin" ]]; then
-        if command -v brew &> /dev/null; then
-            read -p "Install jq via Homebrew? [Y/n] " -n 1 -r
+        if [[ -n "$MACOS_PKG_MANAGER" ]]; then
+            mgr_name="$(macos_pkg_mgr_name "$MACOS_PKG_MANAGER")"
+            read -p "Install jq via $mgr_name? [Y/n] " -n 1 -r
             echo
             if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "Installing jq..."
-                brew install jq
+                install_macos_package "jq"
             fi
         else
-            echo "Install jq with: brew install jq"
+            print_macos_manual_install_help "jq"
         fi
     else
         if command -v apt-get &> /dev/null; then
@@ -270,12 +469,48 @@ if ! curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/agent-deck.tar.gz"; then
     echo -e "${RED}Error: Download failed${NC}"
     echo "URL: $DOWNLOAD_URL"
     echo ""
-    echo "This could mean:"
-    echo "  - The version doesn't exist"
-    echo "  - The release hasn't been published yet"
-    echo "  - Network issues"
+
+    # Check if the release exists but has no assets (common when GoReleaser hasn't completed yet)
+    RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}" 2>/dev/null || true)
+
+    # Parse asset list: prefer jq for reliability, fall back to grep
+    if command -v jq &> /dev/null && [[ -n "$RELEASE_JSON" ]]; then
+        ASSET_NAMES=$(echo "$RELEASE_JSON" | jq -r '.assets[].name // empty' 2>/dev/null || true)
+        ASSET_COUNT=$(echo "$RELEASE_JSON" | jq '.assets | length' 2>/dev/null || echo "0")
+    else
+        ASSET_NAMES=$(echo "$RELEASE_JSON" | grep '"name"' | sed 's/.*"name": *"\([^"]*\)".*/\1/' | grep '\.tar\.gz\|checksums' || true)
+        ASSET_COUNT=$(echo "$RELEASE_JSON" | grep -c '"browser_download_url"' || echo "0")
+    fi
+
+    if [[ "$ASSET_COUNT" -eq 0 ]]; then
+        echo "The release ${VERSION} exists but has no downloadable binaries."
+        echo "This usually means the release CI workflow hasn't completed yet."
+        echo "Wait a few minutes and try again, or check: https://github.com/${REPO}/actions"
+    else
+        # Release has assets, but not for this platform
+        echo "The release ${VERSION} has ${ASSET_COUNT} assets, but not for ${OS}/${ARCH}."
+        if [[ -n "$ASSET_NAMES" ]]; then
+            echo ""
+            echo "Available assets:"
+            echo "$ASSET_NAMES" | while IFS= read -r name; do
+                [[ -n "$name" ]] && echo "  - $name"
+            done
+        fi
+        echo ""
+        echo "This could mean:"
+        echo "  - The version doesn't exist for your platform"
+        echo "  - Network issues"
+    fi
     echo ""
-    echo "Try building from source instead:"
+
+    # Suggest Homebrew first if available (most reliable)
+    if [[ "$OS" == "darwin" ]] && command -v brew &> /dev/null; then
+        echo "Install via Homebrew instead (recommended):"
+        echo "  brew install asheshgoplani/tap/agent-deck"
+        echo ""
+    fi
+
+    echo "Or build from source:"
     echo "  git clone https://github.com/${REPO}.git"
     echo "  cd agent-deck && make install"
     exit 1
@@ -315,11 +550,50 @@ fi
 configure_tmux() {
     local TMUX_CONF="$HOME/.tmux.conf"
     local MARKER="# agent-deck configuration"
+    local VERSION_MARKER="# agent-deck-tmux-config-version:"
+    local CURRENT_VERSION="3"  # Bump this when config changes
+    local NEEDS_UPDATE=false
+    local HAS_CONFIG=false
 
-    # Check if already configured
+    # Check if already configured and if update is needed
     if [[ -f "$TMUX_CONF" ]] && grep -q "$MARKER" "$TMUX_CONF" 2>/dev/null; then
-        echo -e "${GREEN}tmux already configured for agent-deck${NC}"
-        return 0
+        HAS_CONFIG=true
+        # Check version
+        local INSTALLED_VERSION=$(grep "$VERSION_MARKER" "$TMUX_CONF" 2>/dev/null | sed "s/.*$VERSION_MARKER//" | tr -d ' ')
+        if [[ -z "$INSTALLED_VERSION" || "$INSTALLED_VERSION" -lt "$CURRENT_VERSION" ]]; then
+            NEEDS_UPDATE=true
+            echo ""
+            echo -e "${YELLOW}tmux config update available!${NC}"
+            if [[ -z "$INSTALLED_VERSION" ]]; then
+                echo "Your current agent-deck tmux config is from an older version."
+            else
+                echo "Installed version: $INSTALLED_VERSION, Available: $CURRENT_VERSION"
+            fi
+            echo ""
+            echo -e "${BLUE}What's new in this update:${NC}"
+            echo "  • Added extended-keys for Shift+Enter support (tmux 3.2+)"
+            echo "  • Fixed mouse scrolling issues on WSL"
+            echo "  • Added auto-enter copy-mode on scroll up"
+            echo "  • Added explicit scroll bindings for copy-mode"
+            echo "  • Improved terminal compatibility"
+            echo ""
+            read -p "Update tmux configuration? [Y/n] " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Nn]$ ]]; then
+                echo "Skipping tmux config update."
+                return 0
+            fi
+            # Remove old config block
+            echo "Removing old configuration..."
+            # Use temp file for compatibility (BSD sed vs GNU sed)
+            local TEMP_CONF=$(mktemp)
+            sed "/$MARKER/,/# End agent-deck configuration/d" "$TMUX_CONF" > "$TEMP_CONF"
+            mv "$TEMP_CONF" "$TMUX_CONF"
+            echo -e "${GREEN}Old config removed${NC}"
+        else
+            echo -e "${GREEN}tmux already configured for agent-deck (v$INSTALLED_VERSION)${NC}"
+            return 0
+        fi
     fi
 
     echo ""
@@ -327,26 +601,32 @@ configure_tmux() {
     echo "Agent Deck works best with mouse scroll and clipboard support."
     echo ""
 
-    if [[ -f "$TMUX_CONF" ]]; then
+    if [[ -f "$TMUX_CONF" ]] && [[ "$NEEDS_UPDATE" != "true" ]]; then
         echo -e "Found existing config: ${YELLOW}~/.tmux.conf${NC}"
         echo "The following settings will be APPENDED (your existing config is preserved):"
+    elif [[ "$NEEDS_UPDATE" == "true" ]]; then
+        echo "Installing updated configuration..."
     else
         echo "No ~/.tmux.conf found. The following settings will be created:"
     fi
 
     echo ""
-    echo -e "${BLUE}  • Mouse scrolling & drag-to-copy${NC}"
+    echo -e "${BLUE}  • Mouse scrolling & drag-to-copy (WSL compatible)${NC}"
+    echo -e "${BLUE}  • Auto copy-mode on scroll up${NC}"
     echo -e "${BLUE}  • Clipboard integration (copy to system clipboard)${NC}"
     echo -e "${BLUE}  • 256-color terminal support${NC}"
     echo -e "${BLUE}  • 10,000 line history${NC}"
     echo ""
 
-    read -p "Configure tmux for agent-deck? [Y/n] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Nn]$ ]]; then
-        echo "Skipping tmux configuration."
-        echo "You can manually add the config later (see: agent-deck docs)"
-        return 0
+    # Skip prompt if we're updating (user already confirmed)
+    if [[ "$NEEDS_UPDATE" != "true" ]]; then
+        read -p "Configure tmux for agent-deck? [Y/n] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+            echo "Skipping tmux configuration."
+            echo "You can manually add the config later (see: agent-deck docs)"
+            return 0
+        fi
     fi
 
     # Determine clipboard command based on OS
@@ -373,24 +653,40 @@ configure_tmux() {
     fi
 
     # Create the config block
+    # Note: WSL requires explicit scroll bindings; set-clipboard external doesn't work with clip.exe
     local CONFIG_BLOCK="
 $MARKER
+$VERSION_MARKER $CURRENT_VERSION
 # Added by agent-deck installer - $(date +%Y-%m-%d)
 # https://github.com/asheshgoplani/agent-deck
 
 # Terminal with true color support
 set -g default-terminal \"tmux-256color\"
+set -ag terminal-overrides \",xterm*:Tc:smcup@:rmcup@\"
 set -ag terminal-overrides \",*256col*:Tc\"
 
 # Performance
 set -sg escape-time 0
-set -g history-limit 10000
+set -g history-limit 50000
+
+# Extended keys: forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+set -s extended-keys on
+set -as terminal-features 'tmux-256color:extkeys'
 
 # Mouse support (scroll + drag-to-copy)
 set -g mouse on
 
-# Clipboard integration
-set -s set-clipboard external
+# Auto-enter copy-mode when scrolling up (critical for WSL compatibility)
+# This handles: 1) apps with mouse support, 2) already in copy-mode, 3) normal pane
+bind-key -n WheelUpPane if-shell -F -t = \"#{mouse_any_flag}\" \"send-keys -M\" \"if -Ft= '#{pane_in_mode}' 'send-keys -M' 'copy-mode -e'\"
+
+# Scroll bindings in copy-mode (both vi and emacs modes)
+bind-key -T copy-mode-vi WheelUpPane send-keys -X scroll-up
+bind-key -T copy-mode-vi WheelDownPane send-keys -X scroll-down
+bind-key -T copy-mode WheelUpPane send-keys -X scroll-up
+bind-key -T copy-mode WheelDownPane send-keys -X scroll-down
+
+# Clipboard integration (drag-to-copy)
 bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel \"$CLIPBOARD_CMD\"
 bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel \"$CLIPBOARD_CMD\"
 # End agent-deck configuration
@@ -465,6 +761,15 @@ if "$INSTALL_DIR/$BINARY_NAME" version &> /dev/null; then
         echo "  • Clipboard works with Windows (via clip.exe)"
         echo "  • Run in Windows Terminal for best experience"
         echo "  • Mouse scrolling works out of the box"
+        echo ""
+        # Check WSL version for socket pooling info
+        if grep -qi "microsoft-standard" /proc/version 2>/dev/null; then
+            echo -e "  ${GREEN}•${NC} WSL2 detected: MCP socket pooling supported"
+        else
+            echo -e "  ${YELLOW}•${NC} WSL1 detected: MCP socket pooling disabled"
+            echo "    MCPs work fine in stdio mode (just uses more memory)"
+            echo "    Upgrade to WSL2 for socket pooling: wsl --set-version <distro> 2"
+        fi
     fi
 else
     echo -e "${RED}Warning: Installation completed but verification failed${NC}"

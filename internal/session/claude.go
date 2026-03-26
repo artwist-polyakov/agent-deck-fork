@@ -12,6 +12,20 @@ import (
 	"time"
 )
 
+// claudeDirNameRegex matches any character that's not alphanumeric or hyphen
+// Claude Code replaces all such characters with hyphens in project directory names
+var claudeDirNameRegex = regexp.MustCompile(`[^a-zA-Z0-9-]`)
+
+// uuidSessionFileRegex matches UUID-format JSONL session filenames.
+var uuidSessionFileRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$`)
+
+// ConvertToClaudeDirName converts a filesystem path to Claude's directory naming format.
+// Claude Code replaces all non-alphanumeric characters (except hyphens) with hyphens.
+// Example: /Users/master/Code cloud/!Project → -Users-master-Code-cloud--Project
+func ConvertToClaudeDirName(path string) string {
+	return claudeDirNameRegex.ReplaceAllString(path, "-")
+}
+
 // ClaudeProject represents a project entry in Claude's config
 type ClaudeProject struct {
 	LastSessionId string `json:"lastSessionId"`
@@ -209,18 +223,28 @@ func getMCPInfoUncached(projectPath string) *MCPInfo {
 	return info
 }
 
-// GetClaudeConfigDir returns the Claude config directory
-// Priority: 1) CLAUDE_CONFIG_DIR env, 2) UserConfig setting, 3) ~/.claude
+// GetClaudeConfigDir returns the Claude config directory for the active profile.
+// Priority:
+// 1. CLAUDE_CONFIG_DIR env var
+// 2. profile-specific override: [profiles.<profile>.claude].config_dir
+// 3. global setting: [claude].config_dir
+// 4. default: ~/.claude
 func GetClaudeConfigDir() string {
 	// 1. Check env var (highest priority)
 	if envDir := os.Getenv("CLAUDE_CONFIG_DIR"); envDir != "" {
-		return expandTilde(envDir)
+		return ExpandPath(envDir)
 	}
 
-	// 2. Check user config
+	// 2. Check user config (profile-specific first, then global)
 	userConfig, _ := LoadUserConfig()
-	if userConfig != nil && userConfig.Claude.ConfigDir != "" {
-		return expandTilde(userConfig.Claude.ConfigDir)
+	if userConfig != nil {
+		profile := GetEffectiveProfile("")
+		if profileDir := userConfig.GetProfileClaudeConfigDir(profile); profileDir != "" {
+			return profileDir
+		}
+		if userConfig.Claude.ConfigDir != "" {
+			return ExpandPath(userConfig.Claude.ConfigDir)
+		}
 	}
 
 	// 3. Default to ~/.claude
@@ -229,7 +253,7 @@ func GetClaudeConfigDir() string {
 }
 
 // IsClaudeConfigDirExplicit returns true if the Claude config directory is
-// explicitly configured (via CLAUDE_CONFIG_DIR env var or config.toml setting).
+// explicitly configured (via CLAUDE_CONFIG_DIR env var, profile override, or global config.toml setting).
 // When false, the user is using the default path and we should NOT override
 // CLAUDE_CONFIG_DIR in commands, allowing the shell's environment to be respected.
 //
@@ -242,13 +266,31 @@ func IsClaudeConfigDirExplicit() bool {
 		return true
 	}
 
-	// Check user config
+	// Check user config (profile-specific first, then global)
 	userConfig, _ := LoadUserConfig()
-	if userConfig != nil && userConfig.Claude.ConfigDir != "" {
-		return true
+	if userConfig != nil {
+		profile := GetEffectiveProfile("")
+		if userConfig.GetProfileClaudeConfigDir(profile) != "" {
+			return true
+		}
+		if userConfig.Claude.ConfigDir != "" {
+			return true
+		}
 	}
 
 	return false
+}
+
+// GetClaudeCommand returns the configured Claude command/alias
+// Priority: 1) UserConfig setting, 2) Default "claude"
+// This allows users to configure an alias like "cdw" or "cdp" that sets
+// CLAUDE_CONFIG_DIR automatically, avoiding the need for config_dir setting
+func GetClaudeCommand() string {
+	userConfig, _ := LoadUserConfig()
+	if userConfig != nil && userConfig.Claude.Command != "" {
+		return userConfig.Claude.Command
+	}
+	return "claude"
 }
 
 // GetClaudeSessionID returns the ACTIVE session ID for a project path
@@ -288,9 +330,17 @@ func GetClaudeSessionID(projectPath string) (string, error) {
 // findActiveSessionID looks for the most recently modified session file
 // This finds the CURRENTLY RUNNING session, not the last completed one
 func findActiveSessionID(configDir, projectPath string) string {
+	return findActiveSessionIDExcluding(configDir, projectPath, nil)
+}
+
+// findActiveSessionIDExcluding looks for the most recently modified session file,
+// skipping any session IDs in the exclude set. This prevents picking up a .jsonl
+// owned by another agent-deck instance when multiple sessions share the same project.
+func findActiveSessionIDExcluding(configDir, projectPath string, excludeIDs map[string]bool) string {
 	// Convert project path to Claude's directory format
-	// /Users/ashesh/claude-deck -> -Users-ashesh-claude-deck
-	projectDirName := strings.ReplaceAll(projectPath, "/", "-")
+	// Claude replaces ALL non-alphanumeric chars (spaces, !, etc.) with hyphens
+	// /Users/master/Code cloud/!Project -> -Users-master-Code-cloud--Project
+	projectDirName := ConvertToClaudeDirName(projectPath)
 	projectDir := filepath.Join(configDir, "projects", projectDirName)
 
 	// Check if project directory exists
@@ -304,8 +354,8 @@ func findActiveSessionID(configDir, projectPath string) string {
 		return ""
 	}
 
-	// UUID pattern for session files
-	uuidPattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$`)
+	// UUID pattern for session files (compiled once at package level)
+	uuidPattern := uuidSessionFileRegex
 
 	var mostRecent string
 	var mostRecentTime time.Time
@@ -323,6 +373,13 @@ func findActiveSessionID(configDir, projectPath string) string {
 			continue
 		}
 
+		sessionID := strings.TrimSuffix(base, ".jsonl")
+
+		// Skip IDs owned by other agent-deck instances
+		if excludeIDs[sessionID] {
+			continue
+		}
+
 		info, err := os.Stat(file)
 		if err != nil {
 			continue
@@ -331,7 +388,7 @@ func findActiveSessionID(configDir, projectPath string) string {
 		// Find the most recently modified file
 		if info.ModTime().After(mostRecentTime) {
 			mostRecentTime = info.ModTime()
-			mostRecent = strings.TrimSuffix(base, ".jsonl")
+			mostRecent = sessionID
 		}
 	}
 
@@ -463,12 +520,41 @@ func isMCPEnabled(name string, settings *ProjectMCPSettings, mode MCPMode) bool 
 	}
 }
 
-// ClearMCPCache invalidates the MCP cache for a project path
+// PruneMCPCache removes cache entries older than maxAge to prevent unbounded growth.
+// Called periodically from the TUI tick handler.
+func PruneMCPCache(maxAge time.Duration) {
+	mcpInfoCacheMu.Lock()
+	defer mcpInfoCacheMu.Unlock()
+	now := time.Now()
+	for path, t := range mcpCacheTimes {
+		if now.Sub(t) > maxAge {
+			delete(mcpInfoCache, path)
+			delete(mcpCacheTimes, path)
+		}
+	}
+}
+
+// ClearMCPCache invalidates the MCP cache for a project path and all parent directories
+// This is important because getMCPInfoUncached walks up parent directories to find .mcp.json
 func ClearMCPCache(projectPath string) {
 	mcpInfoCacheMu.Lock()
+	defer mcpInfoCacheMu.Unlock()
+
+	// Clear the exact path
 	delete(mcpInfoCache, projectPath)
 	delete(mcpCacheTimes, projectPath)
-	mcpInfoCacheMu.Unlock()
+
+	// Also clear all parent directories (MCP lookup walks up the tree)
+	currentPath := projectPath
+	for {
+		parent := filepath.Dir(currentPath)
+		if parent == currentPath || parent == "/" || parent == "." {
+			break
+		}
+		delete(mcpInfoCache, parent)
+		delete(mcpCacheTimes, parent)
+		currentPath = parent
+	}
 }
 
 // ToggleLocalMCP toggles a Local MCP on/off

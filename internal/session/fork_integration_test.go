@@ -37,23 +37,44 @@ func TestForkFlow_Integration(t *testing.T) {
 		t.Fatalf("CreateForkedInstance failed: %v", err)
 	}
 
-	// Verify fork command structure - uses --session-id to avoid capture-resume with "." prompt
-	if !strings.Contains(cmd, "--session-id") {
-		t.Errorf("Fork command should have --session-id: %s", cmd)
+	// Verify fork command structure - uses Go-side UUID (no shell uuidgen dependency)
+	// Must NOT use shell uuidgen (replaced with generateUUID() in Go)
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command should NOT use shell uuidgen (replaced with Go-side UUID): %s", cmd)
 	}
+	// CLAUDE_SESSION_ID must NOT be in the shell command string; it is set via host-side SetEnvironment.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("Fork command should NOT embed tmux set-environment (use host-side SetEnvironment): %s", cmd)
+	}
+	if !strings.Contains(cmd, "AGENTDECK_INSTANCE_ID="+forked.ID) {
+		t.Errorf("Fork command should export AGENTDECK_INSTANCE_ID for the forked session: %s", cmd)
+	}
+	// Should use --session-id with a literal Go-generated UUID (not shell variable)
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("Fork command should use --session-id flag: %s", cmd)
+	}
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork command should NOT use shell variable for session ID: %s", cmd)
+	}
+	// Should still use --resume for parent session and --fork-session
 	if !strings.Contains(cmd, "--resume "+parentID) {
 		t.Errorf("Fork command should have --resume %s: %s", parentID, cmd)
 	}
 	if !strings.Contains(cmd, "--fork-session") {
 		t.Errorf("Fork command should have --fork-session: %s", cmd)
 	}
-	if !strings.Contains(cmd, "uuidgen") {
-		t.Errorf("Fork command should generate UUID with uuidgen: %s", cmd)
+	// Should NOT use capture-resume pattern
+	if strings.Contains(cmd, `-p "."`) {
+		t.Errorf("Fork command should NOT use -p \".\" capture: %s", cmd)
+	}
+	if strings.Contains(cmd, "jq") {
+		t.Errorf("Fork command should NOT use jq: %s", cmd)
 	}
 
-	// Verify forked instance state
-	if forked.ClaudeSessionID != "" {
-		t.Errorf("Forked instance should have empty session ID initially: %s", forked.ClaudeSessionID)
+	// Verify forked instance state: ClaudeSessionID should be pre-populated with the Go-generated UUID
+	// (the UUID is generated in Go and assigned to the Instance immediately for tracking).
+	if forked.ClaudeSessionID == "" {
+		t.Errorf("Forked instance should have ClaudeSessionID pre-set by generateUUID()")
 	}
 	if forked.Tool != "claude" {
 		t.Errorf("Forked tool = %s, want claude", forked.Tool)

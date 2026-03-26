@@ -228,3 +228,180 @@ func TestGetProjectMCPNames(t *testing.T) {
 		t.Errorf("Expected nil for non-existent project, got %v", names2)
 	}
 }
+
+func TestMCPServerConfigSocketProxy(t *testing.T) {
+	// Verify that socket-proxied MCPs use agent-deck mcp-proxy, not nc
+	config := MCPServerConfig{
+		Command: "agent-deck",
+		Args:    []string{"mcp-proxy", "/tmp/agentdeck-mcp-test.sock"},
+	}
+
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+
+	var parsed MCPServerConfig
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	if parsed.Command != "agent-deck" {
+		t.Errorf("Expected command 'agent-deck', got %q", parsed.Command)
+	}
+	if len(parsed.Args) != 2 || parsed.Args[0] != "mcp-proxy" {
+		t.Errorf("Expected args ['mcp-proxy', socket-path], got %v", parsed.Args)
+	}
+}
+
+func TestGetUserMCPRootPath(t *testing.T) {
+	// GetUserMCPRootPath should return ~/.claude.json
+	path := GetUserMCPRootPath()
+	if path == "" {
+		t.Fatal("GetUserMCPRootPath returned empty string")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("Failed to get home dir: %v", err)
+	}
+
+	expected := filepath.Join(home, ".claude.json")
+	if path != expected {
+		t.Errorf("Expected %q, got %q", expected, path)
+	}
+}
+
+func TestGetUserMCPNames(t *testing.T) {
+	// Create temp home dir
+	tmpHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", originalHome)
+
+	// Create ~/.claude.json with test MCPs
+	claudeJSON := filepath.Join(tmpHome, ".claude.json")
+	content := `{
+		"mcpServers": {
+			"exa": {"command": "npx", "args": ["-y", "exa-mcp-server"]},
+			"reddit": {"command": "npx", "args": ["-y", "reddit-mcp-buddy"]}
+		}
+	}`
+	if err := os.WriteFile(claudeJSON, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+
+	// Test
+	names := GetUserMCPNames()
+	if len(names) != 2 {
+		t.Errorf("expected 2 MCPs, got %d", len(names))
+	}
+	if len(names) >= 2 && (names[0] != "exa" || names[1] != "reddit") {
+		t.Errorf("expected [exa, reddit], got %v", names)
+	}
+}
+
+func TestGetUserMCPNamesNoFile(t *testing.T) {
+	// Create temp home dir with no .claude.json
+	tmpHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", originalHome)
+
+	// Test - should return nil when file doesn't exist
+	names := GetUserMCPNames()
+	if names != nil {
+		t.Errorf("expected nil when file doesn't exist, got %v", names)
+	}
+}
+
+func TestGetUserMCPNamesEmptyServers(t *testing.T) {
+	// Create temp home dir
+	tmpHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", originalHome)
+
+	// Create ~/.claude.json with empty mcpServers
+	claudeJSON := filepath.Join(tmpHome, ".claude.json")
+	content := `{"mcpServers": {}}`
+	if err := os.WriteFile(claudeJSON, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+
+	// Test - should return empty slice (not nil)
+	names := GetUserMCPNames()
+	if names == nil {
+		t.Errorf("expected empty slice, got nil")
+	}
+	if len(names) != 0 {
+		t.Errorf("expected 0 MCPs, got %d", len(names))
+	}
+}
+
+func TestWriteUserMCP(t *testing.T) {
+	// Create temp home dir
+	tmpHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", originalHome)
+
+	// Create initial ~/.claude.json with other fields to preserve
+	claudeJSON := filepath.Join(tmpHome, ".claude.json")
+	content := `{"numStartups": 100, "mcpServers": {}}`
+	_ = os.WriteFile(claudeJSON, []byte(content), 0644)
+
+	// Test writing empty list (clears MCPs)
+	err := WriteUserMCP([]string{})
+	if err != nil {
+		t.Errorf("WriteUserMCP failed: %v", err)
+	}
+
+	// Verify mcpServers is empty but other fields preserved
+	data, _ := os.ReadFile(claudeJSON)
+	var result map[string]interface{}
+	_ = json.Unmarshal(data, &result)
+
+	if result["numStartups"] != float64(100) {
+		t.Errorf("expected numStartups=100, got %v", result["numStartups"])
+	}
+
+	mcpServers, ok := result["mcpServers"].(map[string]interface{})
+	if !ok || len(mcpServers) != 0 {
+		t.Errorf("expected empty mcpServers, got %v", mcpServers)
+	}
+}
+
+func TestWriteUserMCPCreatesFile(t *testing.T) {
+	// Create temp home dir (no .claude.json exists)
+	tmpHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", originalHome)
+
+	// Test writing to non-existent file
+	err := WriteUserMCP([]string{})
+	if err != nil {
+		t.Errorf("WriteUserMCP failed: %v", err)
+	}
+
+	// Verify file was created
+	claudeJSON := filepath.Join(tmpHome, ".claude.json")
+	data, err := os.ReadFile(claudeJSON)
+	if err != nil {
+		t.Fatalf("Failed to read created file: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("Failed to parse created file: %v", err)
+	}
+
+	mcpServers, ok := result["mcpServers"].(map[string]interface{})
+	if !ok {
+		t.Error("expected mcpServers field")
+	}
+	if len(mcpServers) != 0 {
+		t.Errorf("expected empty mcpServers, got %v", mcpServers)
+	}
+}

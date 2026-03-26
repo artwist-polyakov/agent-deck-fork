@@ -1,10 +1,51 @@
 package main
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
+
+func TestApplyCLIYoloOverride(t *testing.T) {
+	t.Run("enabled for gemini sets override", func(t *testing.T) {
+		inst := session.NewInstanceWithTool("gemini-test", "/tmp/test", "gemini")
+		if err := applyCLIYoloOverride(inst, true); err != nil {
+			t.Fatalf("applyCLIYoloOverride() error = %v", err)
+		}
+		if inst.GeminiYoloMode == nil || !*inst.GeminiYoloMode {
+			t.Fatalf("GeminiYoloMode = %v, want true override", inst.GeminiYoloMode)
+		}
+	})
+
+	t.Run("enabled for codex sets override", func(t *testing.T) {
+		inst := session.NewInstanceWithTool("codex-test", "/tmp/test", "codex")
+		if err := applyCLIYoloOverride(inst, true); err != nil {
+			t.Fatalf("applyCLIYoloOverride() error = %v", err)
+		}
+		opts := inst.GetCodexOptions()
+		if opts == nil || opts.YoloMode == nil || !*opts.YoloMode {
+			t.Fatalf("CodexOptions.YoloMode = %v, want true override", opts)
+		}
+	})
+
+	t.Run("disabled is a no-op", func(t *testing.T) {
+		inst := session.NewInstanceWithTool("gemini-test", "/tmp/test", "gemini")
+		if err := applyCLIYoloOverride(inst, false); err != nil {
+			t.Fatalf("applyCLIYoloOverride() error = %v", err)
+		}
+		if inst.GeminiYoloMode != nil {
+			t.Fatalf("GeminiYoloMode = %v, want nil when flag is not set", inst.GeminiYoloMode)
+		}
+	})
+
+	t.Run("non-gemini-codex returns error", func(t *testing.T) {
+		inst := session.NewInstanceWithTool("claude-test", "/tmp/test", "claude")
+		if err := applyCLIYoloOverride(inst, true); err == nil {
+			t.Fatal("applyCLIYoloOverride() error = nil, want non-nil")
+		}
+	})
+}
 
 // TestMain is in testmain_test.go - sets AGENTDECK_PROFILE=_test
 
@@ -189,6 +230,44 @@ func TestIsDuplicateSession_MultipleExistingSessions(t *testing.T) {
 	}
 	if existing != nil {
 		t.Errorf("Expected nil existing instance for non-duplicate")
+	}
+}
+
+func TestIsWorktreeAlreadyExistsError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "git path exists error",
+			err:  errors.New("failed to create worktree: fatal: '/tmp/repo-feature' already exists"),
+			want: true,
+		},
+		{
+			name: "case insensitive match",
+			err:  errors.New("FAILED: ALREADY EXISTS"),
+			want: true,
+		},
+		{
+			name: "different git failure",
+			err:  errors.New("failed to create worktree: fatal: invalid reference: bad-branch"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isWorktreeAlreadyExistsError(tt.err)
+			if got != tt.want {
+				t.Errorf("isWorktreeAlreadyExistsError() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -418,5 +497,31 @@ func TestGenerateUniqueTitle_MixedPathsMultipleTitles(t *testing.T) {
 	title = generateUniqueTitle(instances, "Work", "/home/user/project-c")
 	if title != "Work" {
 		t.Errorf("Expected 'Work' for project-c (no conflict), got '%s'", title)
+	}
+}
+
+func TestResolveGroupPathForAdd_ByExactPath(t *testing.T) {
+	tree := session.NewGroupTree([]*session.Instance{
+		{ID: "1", GroupPath: "platform/backend"},
+	})
+
+	got := resolveGroupPathForAdd(tree, "platform/backend")
+	if got != "platform/backend" {
+		t.Fatalf("Expected exact group path match, got %q", got)
+	}
+}
+
+func TestResolveGroupPathForAdd_ByNameAndNormalizedPath(t *testing.T) {
+	stored := []*session.GroupData{
+		{Name: "My Team", Path: "my-team", Expanded: true, Order: 0},
+	}
+	tree := session.NewGroupTreeWithGroups(nil, stored)
+
+	if got := resolveGroupPathForAdd(tree, "My Team"); got != "my-team" {
+		t.Fatalf("Expected name selector to resolve to my-team, got %q", got)
+	}
+
+	if got := resolveGroupPathForAdd(tree, "my team"); got != "my-team" {
+		t.Fatalf("Expected normalized selector to resolve to my-team, got %q", got)
 	}
 }

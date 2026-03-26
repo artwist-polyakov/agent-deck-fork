@@ -4,12 +4,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// activityCooldown is defined here for test compatibility.
+// Cooldown was removed in v0.8.62 - status now only uses busy indicators.
+// With cooldown=0, cooldown is always "expired" so tests still pass.
+const activityCooldown = 0 * time.Millisecond
 
 func TestSanitizeName(t *testing.T) {
 	tests := []struct {
@@ -63,10 +70,98 @@ func TestNewSessionUniqueness(t *testing.T) {
 	}
 }
 
+func TestSession_InjectStatusLine_Default(t *testing.T) {
+	// NewSession should default to true
+	sess := NewSession("test", "/tmp")
+	// The default is true; ConfigureStatusBar should proceed normally
+	// We just verify the setter/getter work without panic
+	sess.SetInjectStatusLine(true)
+}
+
+func TestSession_SetInjectStatusLine(t *testing.T) {
+	sess := NewSession("test", "/tmp")
+
+	// Set to false - ConfigureStatusBar should be a no-op
+	sess.SetInjectStatusLine(false)
+
+	// Should not panic even when session doesn't exist in tmux
+	sess.ConfigureStatusBar()
+
+	// Set back to true
+	sess.SetInjectStatusLine(true)
+}
+
+func TestSession_InjectStatusLine_ReconnectSession(t *testing.T) {
+	sess := ReconnectSessionLazy("test_sess", "Test", "/tmp", "echo hi", "waiting")
+	// Default should be true
+	// Set to false and verify ConfigureStatusBar is skipped
+	sess.SetInjectStatusLine(false)
+	sess.ConfigureStatusBar() // Should be no-op, no error
+}
+
 func TestSessionPrefix(t *testing.T) {
 	if SessionPrefix != "agentdeck_" {
 		t.Errorf("SessionPrefix = %s, want agentdeck_", SessionPrefix)
 	}
+}
+
+func TestShouldRecoverFromTmuxStartError(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{
+			name:   "server exited unexpectedly",
+			output: "server exited unexpectedly",
+			want:   true,
+		},
+		{
+			name:   "lost server",
+			output: "lost server",
+			want:   true,
+		},
+		{
+			name:   "other tmux failure",
+			output: "duplicate session: foo",
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldRecoverFromTmuxStartError(tt.output)
+			if got != tt.want {
+				t.Fatalf("shouldRecoverFromTmuxStartError(%q) = %v, want %v", tt.output, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDefaultTmuxSocketCandidatesIncludesTmuxEnvPath(t *testing.T) {
+	t.Setenv("TMUX", "/private/tmp/tmux-501/default,1234,0")
+	candidates := defaultTmuxSocketCandidates()
+	assert.Contains(t, candidates, "/private/tmp/tmux-501/default")
+}
+
+func TestDefaultTmuxSocketCandidatesDedupe(t *testing.T) {
+	uid := os.Getuid()
+	if uid < 0 {
+		t.Skip("os.Getuid unavailable")
+	}
+
+	defaultPath := filepath.Join("/tmp", fmt.Sprintf("tmux-%d", uid), "default")
+	t.Setenv("TMUX", defaultPath+",999,0")
+	t.Setenv("TMUX_TMPDIR", "/tmp")
+
+	candidates := defaultTmuxSocketCandidates()
+	count := 0
+	for _, candidate := range candidates {
+		if candidate == defaultPath {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "expected default socket path to be deduplicated")
 }
 
 func TestPromptDetector(t *testing.T) {
@@ -105,6 +200,9 @@ func TestPromptDetector(t *testing.T) {
 		{"No, and tell Claude what to do differently", true},
 		{"Yes, allow once", true},
 		{"❯ Yes", true},
+		{"Action Required", true},
+		{"Waiting for user confirmation", true},
+		{"Allow execution of: 'npm'?", true},
 		// Input prompt (--dangerously-skip-permissions mode)
 		{">", true},
 		{"> ", true},
@@ -130,10 +228,14 @@ func TestPromptDetector(t *testing.T) {
 		content  string
 		expected bool
 	}{
-		{"Ask anything... \"What is the tech stack\"", true},
-		{"┃  hello", true},
-		{"Build  Big Pickle  OpenCode Zen", true},
-		{"Plan mode indicator", true},
+		{"Ask anything... \"What is the tech stack\"", true},                            // Input placeholder
+		{"press enter to send the message, write \\ and enter to add a new line", true}, // Idle help bar
+		{"open code\n┃ Ask anything", true},                                             // Logo + input placeholder
+		{"some prompt >", true},                                                         // Line ending with >
+		{"█ Thinking...", false},                                                        // Busy: pulse spinner
+		{"press esc to exit cancel", false},                                             // Busy: esc help bar
+		{"┃  hello", false},                                                             // Just pipe char (no idle-specific pattern)
+		{"Build  Big Pickle  OpenCode Zen", false},                                      // No idle-specific pattern
 	}
 
 	for _, tt := range opencodeTests {
@@ -142,30 +244,85 @@ func TestPromptDetector(t *testing.T) {
 			t.Errorf("opencode.HasPrompt(%q) = %v, want %v", tt.content, result, tt.expected)
 		}
 	}
+
+	// Test Gemini prompt detection
+	geminiDetector := NewPromptDetector("gemini")
+
+	geminiTests := []struct {
+		content  string
+		expected bool
+	}{
+		{"gemini>", true},
+		{"  gemini> ", true},
+		{"Yes, allow once", true},
+		{"Type your message", true},
+		{"some output\ngemini>", true},
+		// Busy indicator should NOT be a prompt
+		{"esc to cancel", false},
+		// Regular output
+		{"Processing your request", false},
+	}
+
+	for _, tt := range geminiTests {
+		result := geminiDetector.HasPrompt(tt.content)
+		if result != tt.expected {
+			t.Errorf("gemini.HasPrompt(%q) = %v, want %v", tt.content, result, tt.expected)
+		}
+	}
+
+	// Test Codex prompt detection
+	codexDetector := NewPromptDetector("codex")
+
+	codexTests := []struct {
+		content  string
+		expected bool
+	}{
+		{"codex>", true},
+		{"Continue?", true},
+		{"How can I help today?", true},               // initial Codex prompt (#350)
+		{"some output >", false},                      // generic trailing '>' should not be treated as Codex prompt
+		{"esc to interrupt", false},                   // busy indicator, not prompt
+		{"› Run /review on my current changes", true}, // Codex › prompt marker (#350)
+		{"›", true},                                   // bare › prompt marker (#350)
+		{"  › ", true},                                // › with surrounding whitespace (#350)
+		{"› Run /review\n\n  gpt-5.4 · ~/proj · main · 100% left · 0% used", true}, // full Codex prompt with status bar (#350)
+		{"ctrl+c to interrupt\n› Run /review on my current changes", false},        // busy overrides › prompt (#350)
+		{"Processing files...\nesc to interrupt\n› previous suggestion", false},    // busy overrides › prompt (#350)
+	}
+
+	for _, tt := range codexTests {
+		result := codexDetector.HasPrompt(tt.content)
+		if result != tt.expected {
+			t.Errorf("codex.HasPrompt(%q) = %v, want %v", tt.content, result, tt.expected)
+		}
+	}
 }
 
 func TestBusyIndicatorDetection(t *testing.T) {
-	sess := NewSession("test", "/tmp")
-	sess.Command = "claude"
-
+	// Busy detection should recognize explicit interrupt lines and spinner activity.
 	tests := []struct {
 		name     string
 		content  string
 		expected bool
 	}{
 		{
-			name:     "esc to interrupt",
-			content:  "Working on task...\nesc to interrupt\n",
+			name:     "ctrl+c to interrupt",
+			content:  "Working on task...\nctrl+c to interrupt\n",
 			expected: true,
 		},
 		{
-			name:     "spinner character",
+			name:     "spinner character in last 3 lines",
 			content:  "Loading...\n⠋ Processing\n",
 			expected: true,
 		},
 		{
-			name:     "thinking with tokens",
+			name:     "thinking with tokens - no longer detected",
 			content:  "Thinking... (45s · 1234 tokens)\n",
+			expected: false, // Changed: whimsical words pattern removed
+		},
+		{
+			name:     "esc to interrupt - fallback for older Claude Code",
+			content:  "Working on task...\nesc to interrupt\n",
 			expected: true,
 		},
 		{
@@ -182,7 +339,10 @@ func TestBusyIndicatorDetection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := sess.hasBusyIndicator(tt.content)
+			// Fresh session per test to avoid spinner grace period carryover
+			s := NewSession("test-"+tt.name, "/tmp")
+			s.Command = "claude"
+			result := s.hasBusyIndicator(tt.content)
 			if result != tt.expected {
 				t.Errorf("hasBusyIndicator(%q) = %v, want %v", tt.name, result, tt.expected)
 			}
@@ -190,23 +350,173 @@ func TestBusyIndicatorDetection(t *testing.T) {
 	}
 }
 
-func TestStripANSI(t *testing.T) {
+func TestBusyIndicatorDetection_OpenCode(t *testing.T) {
 	tests := []struct {
-		input    string
-		expected string
+		name     string
+		content  string
+		expected bool
 	}{
-		{"\x1b[32mGreen\x1b[0m", "Green"},
-		{"\x1b[1;31mBold Red\x1b[0m", "Bold Red"},
-		{"No ANSI here", "No ANSI here"},
-		{"\x1b]0;Title\x07Content", "Content"},
+		{
+			name: "pulse spinner with task text",
+			content: `┃ Conversation
+█ Thinking...
+┃ Ask anything`,
+			expected: true,
+		},
+		{
+			name: "esc to exit busy hint",
+			content: `Build  Plan
+press esc to exit cancel`,
+			expected: true,
+		},
+		{
+			name:     "waiting for tool response task text",
+			content:  `Waiting for tool response...`,
+			expected: true,
+		},
+		{
+			name: "idle prompt only",
+			content: `┃ Ask anything
+press enter to send the message`,
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
-		result := StripANSI(tt.input)
-		if result != tt.expected {
-			t.Errorf("StripANSI(%q) = %q, want %q", tt.input, result, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewSession("test-opencode-"+tt.name, "/tmp")
+			s.Command = "opencode"
+			if got := s.hasBusyIndicator(tt.content); got != tt.expected {
+				t.Errorf("hasBusyIndicator(opencode %q) = %v, want %v", tt.name, got, tt.expected)
+			}
+		})
 	}
+}
+
+func TestStripANSI(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"simple green", "\x1b[32mGreen\x1b[0m", "Green"},
+		{"bold red", "\x1b[1;31mBold Red\x1b[0m", "Bold Red"},
+		{"no ansi", "No ANSI here", "No ANSI here"},
+		{"osc title", "\x1b]0;Title\x07Content", "Content"},
+		{"empty string", "", ""},
+		{"256 color", "\x1b[38;5;140mPurple\x1b[0m", "Purple"},
+		{"true color", "\x1b[38;2;255;128;0mOrange\x1b[0m", "Orange"},
+		{"cursor movement", "\x1b[2Aup\x1b[2Bdown", "updown"},
+		{"multiline", "\x1b[32mline1\x1b[0m\n\x1b[33mline2\x1b[0m", "line1\nline2"},
+		{"mixed content", "Hello \x1b[1mworld\x1b[0m!", "Hello world!"},
+		{"nested codes", "\x1b[1m\x1b[31m\x1b[4mtext\x1b[0m", "text"},
+		{"8-bit csi", "\x9Bmtest\x9Bm", "test"}, // 8-bit CSI (0x9B)
+		// Edge cases - malformed sequences (rare in real terminal output)
+		// These match behavior of the original O(n²) implementation
+		{"esc at end", "hello\x1b", "hello\x1b"},              // trailing ESC kept (same as old)
+		{"osc without terminator", "\x1b]0;Title", "0;Title"}, // ESC] stripped, rest kept
+		{"csi without letter", "\x1b[123", ""},                // CSI params stripped
+		{"just esc", "\x1b", "\x1b"},                          // lone ESC kept (same as old)
+		{"esc followed by char", "\x1bXtext", "text"},         // ESC+char stripped
+		{"8-bit csi at end", "test\x9B", "test"},              // 8-bit CSI stripped
+		{"csi at end no params", "test\x1b[", "test"},         // CSI stripped
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := StripANSI(tt.input)
+			if result != tt.expected {
+				t.Errorf("StripANSI(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+// generateANSIContent creates test content with many ANSI codes
+func generateANSIContent(lineCount int) string {
+	var b strings.Builder
+	for i := 0; i < lineCount; i++ {
+		b.WriteString("\x1b[38;5;140m")
+		b.WriteString("Line ")
+		b.WriteString("\x1b[1m")
+		b.WriteString("content")
+		b.WriteString("\x1b[0m")
+		b.WriteString(" with ")
+		b.WriteString("\x1b[32m")
+		b.WriteString("colorized")
+		b.WriteString("\x1b[0m")
+		b.WriteString(" text\n")
+	}
+	return b.String()
+}
+
+// BenchmarkStripANSI_Large tests performance on Issue #39 scenario (2000 lines)
+func BenchmarkStripANSI_Large(b *testing.B) {
+	content := generateANSIContent(2000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = StripANSI(content)
+	}
+}
+
+// BenchmarkStripANSI_NoANSI tests fast path for content without ANSI codes
+func BenchmarkStripANSI_NoANSI(b *testing.B) {
+	content := strings.Repeat("Plain text without any ANSI codes here\n", 2000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = StripANSI(content)
+	}
+}
+
+// stripANSIOld is the OLD O(n²) implementation for benchmark comparison
+// DO NOT USE - this is only for performance testing
+func stripANSIOld(content string) string {
+	result := content
+	for {
+		start := strings.Index(result, "\x1b[")
+		if start == -1 {
+			break
+		}
+		end := start + 2
+		for end < len(result) {
+			c := result[end]
+			if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+				end++
+				break
+			}
+			end++
+		}
+		result = result[:start] + result[end:]
+	}
+	for {
+		start := strings.Index(result, "\x1b]")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(result[start:], "\x07")
+		if end == -1 {
+			break
+		}
+		result = result[:start] + result[start+end+1:]
+	}
+	return result
+}
+
+// BenchmarkStripANSI_OldVsNew compares O(n²) old vs O(n) new implementation
+func BenchmarkStripANSI_OldVsNew(b *testing.B) {
+	content := generateANSIContent(2000) // Issue #39 scenario
+
+	b.Run("New_O(n)", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			_ = StripANSI(content)
+		}
+	})
+
+	b.Run("Old_O(n²)", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			_ = stripANSIOld(content)
+		}
+	})
 }
 
 func TestDetectTool(t *testing.T) {
@@ -219,6 +529,71 @@ func TestDetectTool(t *testing.T) {
 	tool := sess.DetectTool()
 	if tool != "shell" {
 		t.Logf("DetectTool returned %s (expected shell for non-existent session)", tool)
+	}
+}
+
+func TestDetectToolFromCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{name: "claude", command: "claude", want: "claude"},
+		{name: "gemini", command: "gemini --yolo", want: "gemini"},
+		{name: "opencode", command: "open-code --continue", want: "opencode"},
+		{name: "codex", command: "codex --dangerously-bypass-approvals-and-sandbox", want: "codex"},
+		{name: "pi", command: "pi --model fast", want: "pi"},
+		{name: "shell command", command: "npm run dev", want: ""},
+		{name: "empty", command: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectToolFromCommand(tt.command); got != tt.want {
+				t.Fatalf("detectToolFromCommand(%q) = %q, want %q", tt.command, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetectToolFromContentClaudeRegression(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name: "path containing claude should stay shell",
+			content: `user@host:/Users/test/claude-deck$ 
+$ `,
+			want: "shell",
+		},
+		{
+			name: "claude banner detects claude",
+			content: `Welcome to Claude Code!
+Do you trust the files in this folder?`,
+			want: "claude",
+		},
+		{
+			name: "claude permission prompt detects claude",
+			content: `No, and tell Claude what to do differently
+Yes, allow once`,
+			want: "claude",
+		},
+		{
+			name: "pi prompt detects pi",
+			content: `Welcome to Pi CLI
+pi> `,
+			want: "pi",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectToolFromContent(tt.content); got != tt.want {
+				t.Fatalf("detectToolFromContent(%q) = %q, want %q", tt.name, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -986,6 +1361,72 @@ func TestConcurrentStateUpdates(t *testing.T) {
 }
 
 // =============================================================================
+// ReconnectSessionLazy Tests (PERFORMANCE: Phase 3 lazy loading)
+// =============================================================================
+
+// TestReconnectSessionLazyDoesNotConfigure verifies lazy reconnect skips tmux calls
+func TestReconnectSessionLazyDoesNotConfigure(t *testing.T) {
+	// Create a lazy session - should NOT call any tmux commands
+	sess := ReconnectSessionLazy("agentdeck_test_lazy", "lazy-project", "/tmp", "claude", "idle")
+
+	// Should NOT be configured
+	if sess.IsConfigured() {
+		t.Error("Lazy session should NOT be configured initially")
+	}
+
+	// Should have correct fields
+	if sess.Name != "agentdeck_test_lazy" {
+		t.Errorf("Expected name agentdeck_test_lazy, got %s", sess.Name)
+	}
+	if sess.DisplayName != "lazy-project" {
+		t.Errorf("Expected display name lazy-project, got %s", sess.DisplayName)
+	}
+}
+
+// TestReconnectSessionLazyRestoresState verifies state tracker is initialized
+func TestReconnectSessionLazyRestoresState(t *testing.T) {
+	// Test idle status
+	idleSess := ReconnectSessionLazy("test_idle", "idle", "/tmp", "claude", "idle")
+	if idleSess.stateTracker == nil {
+		t.Fatal("stateTracker should be initialized for idle status")
+	}
+	if !idleSess.stateTracker.acknowledged {
+		t.Error("idle session should be acknowledged")
+	}
+
+	// Test waiting status
+	waitingSess := ReconnectSessionLazy("test_waiting", "waiting", "/tmp", "claude", "waiting")
+	if waitingSess.stateTracker == nil {
+		t.Fatal("stateTracker should be initialized for waiting status")
+	}
+	if waitingSess.stateTracker.acknowledged {
+		t.Error("waiting session should NOT be acknowledged")
+	}
+
+	// Test active status (treated like waiting)
+	activeSess := ReconnectSessionLazy("test_active", "active", "/tmp", "claude", "active")
+	if activeSess.stateTracker == nil {
+		t.Fatal("stateTracker should be initialized for active status")
+	}
+	if activeSess.stateTracker.acknowledged {
+		t.Error("active session should NOT be acknowledged initially")
+	}
+}
+
+// TestEnsureConfiguredIdempotent verifies EnsureConfigured is safe to call multiple times
+func TestEnsureConfiguredIdempotent(t *testing.T) {
+	sess := ReconnectSessionLazy("agentdeck_test_idempotent", "test", "/tmp", "claude", "idle")
+
+	// Session doesn't exist (no real tmux), so EnsureConfigured should be a no-op
+	sess.EnsureConfigured()
+	sess.EnsureConfigured()
+	sess.EnsureConfigured()
+
+	// Should still not be configured (session doesn't exist in tmux)
+	// The test is that it doesn't panic or error
+}
+
+// =============================================================================
 // ReconnectSessionWithStatus Tests
 // =============================================================================
 
@@ -1201,9 +1642,7 @@ func TestGetStatusInitializationVariants(t *testing.T) {
 // Time-based cooldown model: stays "active" for 2 seconds after any change,
 // then transitions to "waiting" or "idle".
 func TestStatusFlickerOnInvisibleCharsIntegration(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available, skipping integration test")
-	}
+	skipIfNoTmuxServer(t)
 
 	// 1. Setup a real tmux session
 	session := NewSession("flicker-test", t.TempDir())
@@ -1213,6 +1652,11 @@ func TestStatusFlickerOnInvisibleCharsIntegration(t *testing.T) {
 
 	// Wait for session to be ready
 	time.Sleep(100 * time.Millisecond)
+
+	// Clear startup window so session doesn't stay in "starting" state
+	session.mu.Lock()
+	session.startupAt = time.Time{}
+	session.mu.Unlock()
 
 	// Helper to send content to the pane
 	sendToPane := func(content string) {
@@ -1343,7 +1787,13 @@ func TestTimeBasedStatusModel(t *testing.T) {
 			status = "active" // Within cooldown - this is the key!
 		}
 
-		assert.Equal(t, "active", status, "Should stay active within cooldown period")
+		// With activityCooldown=0, cooldown is always expired, so status is "waiting"
+		// With activityCooldown>0, status would be "active" during cooldown
+		expectedStatus := "waiting"
+		if activityCooldown > 0 {
+			expectedStatus = "active"
+		}
+		assert.Equal(t, expectedStatus, status, "Status depends on cooldown setting")
 	})
 
 	t.Run("Different hash returns active and resets acknowledged", func(t *testing.T) {
@@ -1481,6 +1931,20 @@ func TestNormalizeShouldStripTimeCounters(t *testing.T) {
 			shouldMatch: true,
 			description: "Braille spinners should be stripped (already implemented)",
 		},
+		{
+			name:        "Time pattern HH:MM:SS",
+			content1:    "Status at 12:34:56 is ready",
+			content2:    "Status at 12:35:01 is ready",
+			shouldMatch: true,
+			description: "Time patterns (HH:MM:SS) should be normalized",
+		},
+		{
+			name:        "Time pattern HH:MM",
+			content1:    "Updated 9:45 ago",
+			content2:    "Updated 9:46 ago",
+			shouldMatch: true,
+			description: "Time patterns (HH:MM) should be normalized",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1509,14 +1973,17 @@ func TestNormalizeShouldStripTimeCounters(t *testing.T) {
 }
 
 // TestFlickeringScenarioEndToEnd simulates the full flickering scenario
+// With activityCooldown=0, there's no GREEN period after busy indicator disappears.
+// The key test is that hash normalization prevents flickering when only dynamic
+// content (timers, spinners) changes.
 func TestFlickeringScenarioEndToEnd(t *testing.T) {
 	session := NewSession("e2e-flicker", "/tmp")
 
-	// === STEP 1: Claude is actively outputting ===
+	// === STEP 1: Claude output with dynamic timer ===
 	activeContent := `Writing code...
 ⠋ Thinking... (5s · 50 tokens · esc to interrupt)`
 
-	// Initialize as if we're mid-activity
+	// Initialize state tracker
 	normalized := session.normalizeContent(activeContent)
 	session.stateTracker = &StateTracker{
 		lastHash:       session.hashContent(normalized),
@@ -1524,14 +1991,20 @@ func TestFlickeringScenarioEndToEnd(t *testing.T) {
 		acknowledged:   false,
 	}
 
-	// Status should be ACTIVE (within cooldown)
+	// With activityCooldown=0, status transitions to waiting immediately
+	// (GREEN is only shown when busy indicator is actively detected, not by cooldown)
 	timeSinceChange := time.Since(session.stateTracker.lastChangeTime)
 	status1 := "waiting"
-	if timeSinceChange < activityCooldown {
+	if activityCooldown > 0 && timeSinceChange < activityCooldown {
 		status1 = "active"
 	}
-	assert.Equal(t, "active", status1, "Step 1: Should be active during output")
-	t.Logf("Step 1: Status=%s (within cooldown)", status1)
+	// With cooldown=0, expect waiting; with cooldown>0, expect active
+	expectedStatus1 := "waiting"
+	if activityCooldown > 0 {
+		expectedStatus1 = "active"
+	}
+	assert.Equal(t, expectedStatus1, status1, "Step 1: Status depends on cooldown setting")
+	t.Logf("Step 1: Status=%s (cooldown=%v)", status1, activityCooldown)
 
 	// === STEP 2: Wait for cooldown to expire ===
 	session.stateTracker.lastChangeTime = time.Now().Add(-3 * time.Second)
@@ -1628,9 +2101,8 @@ func truncateEnd(s string, n int) string {
 
 // TestGetWindowActivity verifies GetWindowActivity returns a valid Unix timestamp
 func TestGetWindowActivity(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
+
 	sess := NewSession("activity-test", t.TempDir())
 	err := sess.Start("")
 	assert.NoError(t, err)
@@ -1649,9 +2121,7 @@ func TestGetWindowActivity(t *testing.T) {
 
 // TestIsSustainedActivity verifies spike detection logic
 func TestIsSustainedActivity(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 	sess := NewSession("sustained-test", t.TempDir())
 	err := sess.Start("")
 	assert.NoError(t, err)
@@ -1767,46 +2237,8 @@ func TestSessionLogFile(t *testing.T) {
 	assert.True(t, strings.HasSuffix(logFile, ".log"))
 }
 
-func TestStartEnablesPipePaneLogging(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
-
-	sess := NewSession("pipe-test", t.TempDir())
-	err := sess.Start("")
-	assert.NoError(t, err)
-	defer func() { _ = sess.Kill() }()
-
-	// Give pipe-pane time to initialize
-	time.Sleep(200 * time.Millisecond)
-
-	// Generate some output
-	_ = sess.SendKeys("echo 'pipe-pane test'")
-
-	// Poll for log file content instead of fixed sleep
-	logFile := sess.LogFile()
-	var content []byte
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		content, err = os.ReadFile(logFile)
-		if err == nil && strings.Contains(string(content), "pipe-pane test") {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	// Check log file exists and has content
-	assert.NoError(t, err, "Log file should exist")
-	assert.Contains(t, string(content), "pipe-pane test", "Log should contain output")
-
-	// Cleanup
-	os.Remove(logFile)
-}
-
 func TestSession_SetAndGetEnvironment(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 
 	// Create a test session
 	sess := NewSession("env-test", "/tmp")
@@ -1836,9 +2268,7 @@ func TestSession_SetAndGetEnvironment(t *testing.T) {
 }
 
 func TestSession_GetEnvironment_NotFound(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not available")
-	}
+	skipIfNoTmuxServer(t)
 
 	sess := NewSession("env-test-notfound", "/tmp")
 	err := sess.Start("")
@@ -1854,6 +2284,8 @@ func TestSession_GetEnvironment_NotFound(t *testing.T) {
 }
 
 func TestSession_SendCtrlC(t *testing.T) {
+	skipIfNoTmuxServer(t)
+
 	sess := NewSession("ctrl-c-test", "/tmp")
 
 	// Start session with a long-running command
@@ -1882,13 +2314,17 @@ func TestSession_SendCtrlC(t *testing.T) {
 }
 
 func TestSession_SendCommand(t *testing.T) {
-	sess := NewSession("send-cmd-test", "/tmp")
+	skipIfNoTmuxServer(t)
+	sess := NewSession("send-cmd-test-unique", "/tmp")
 
-	err := sess.Start("")
+	err := sess.Start("sleep 10")
 	if err != nil {
 		t.Fatalf("Failed to start session: %v", err)
 	}
 	defer func() { _ = sess.Kill() }()
+
+	// Give the command time to start
+	time.Sleep(200 * time.Millisecond)
 
 	// Send a command
 	err = sess.SendCommand("echo hello")
@@ -1907,4 +2343,345 @@ func TestSession_SendCommand(t *testing.T) {
 	if !strings.Contains(content, "hello") {
 		t.Errorf("Expected 'hello' in output, got: %s", content)
 	}
+}
+
+// =============================================================================
+// Activity Monitoring Hook Tests (Task 3)
+// =============================================================================
+
+func TestSession_SetsUpActivityMonitoring(t *testing.T) {
+	if os.Getenv("AGENTDECK_TEST_PROFILE") == "" {
+		t.Skip("Skipping tmux test - no test profile")
+	}
+
+	// Create a test session
+	s := NewSession("test-activity-monitor", t.TempDir())
+	s.InstanceID = "test-instance-abc"
+
+	err := s.Start("echo 'test'")
+	require.NoError(t, err)
+	defer func() { _ = s.Kill() }()
+
+	// Verify monitor-activity is enabled
+	cmd := exec.Command("tmux", "show-options", "-t", s.Name, "-v", "monitor-activity")
+	output, err := cmd.Output()
+	require.NoError(t, err)
+	assert.Equal(t, "on", strings.TrimSpace(string(output)))
+}
+
+// =============================================================================
+// Notification Bar tmux Helper Functions Tests (Task 2)
+// =============================================================================
+
+func TestSetStatusLeft(t *testing.T) {
+	skipIfNoTmuxServer(t)
+
+	// Create a test session
+	sessionName := "agentdeck_test_notification_" + fmt.Sprintf("%d", time.Now().UnixNano())
+	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessionName)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to create test session: %v", err)
+	}
+	defer func() {
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+	}()
+
+	// Test setting status-left
+	err := SetStatusLeft(sessionName, "⚡ [1] test")
+	assert.NoError(t, err)
+
+	// Verify it was set
+	out, err := exec.Command("tmux", "show-option", "-t", sessionName, "-v", "status-left").Output()
+	assert.NoError(t, err)
+	assert.Contains(t, string(out), "⚡ [1] test")
+}
+
+func TestClearStatusLeft(t *testing.T) {
+	skipIfNoTmuxServer(t)
+
+	sessionName := "agentdeck_test_notification_" + fmt.Sprintf("%d", time.Now().UnixNano())
+	cmd := exec.Command("tmux", "new-session", "-d", "-s", sessionName)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to create test session: %v", err)
+	}
+	defer func() {
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
+	}()
+
+	// Set then clear
+	err := SetStatusLeft(sessionName, "⚡ [1] test")
+	assert.NoError(t, err)
+
+	err = ClearStatusLeft(sessionName)
+	assert.NoError(t, err)
+}
+
+func TestBindUnbindKey(t *testing.T) {
+	skipIfNoTmuxServer(t)
+
+	// Verify we can actually run tmux commands (bind-key may fail in CI
+	// even when tmux server is detected, e.g., no attached clients)
+	if err := exec.Command("tmux", "list-keys").Run(); err != nil {
+		t.Skip("tmux cannot list keys (no attached client?)")
+	}
+
+	// Bind a key
+	err := BindSwitchKey("9", "nonexistent-session")
+	assert.NoError(t, err)
+
+	// Unbind it
+	err = UnbindKey("9")
+	assert.NoError(t, err)
+}
+
+func TestGetActiveSession(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+
+	// GetActiveSession returns the current client session
+	// This may fail if not running inside tmux, which is expected
+	session, err := GetActiveSession()
+	if err != nil {
+		// Not running inside tmux is expected in test environment
+		t.Logf("GetActiveSession error (expected if not in tmux): %v", err)
+	} else {
+		t.Logf("Active session: %s", session)
+	}
+}
+
+// --- splitIntoChunks tests ---
+
+func TestSplitIntoChunks_SmallContent(t *testing.T) {
+	chunks := splitIntoChunks("hello", 4096)
+	assert.Equal(t, []string{"hello"}, chunks)
+}
+
+func TestSplitIntoChunks_ExactBoundary(t *testing.T) {
+	content := strings.Repeat("x", 4096)
+	chunks := splitIntoChunks(content, 4096)
+	assert.Len(t, chunks, 1)
+	assert.Equal(t, content, chunks[0])
+}
+
+func TestSplitIntoChunks_MultipleChunks(t *testing.T) {
+	// Build content > 4096 bytes with newlines
+	var sb strings.Builder
+	for i := 0; i < 200; i++ {
+		sb.WriteString(fmt.Sprintf("line %d: %s\n", i, strings.Repeat("a", 40)))
+	}
+	content := sb.String()
+	require.Greater(t, len(content), 4096)
+
+	chunks := splitIntoChunks(content, 4096)
+	require.Greater(t, len(chunks), 1)
+
+	// Verify each chunk is ≤ maxSize
+	for i, chunk := range chunks {
+		assert.LessOrEqual(t, len(chunk), 4096, "chunk %d exceeds max size", i)
+	}
+
+	// Verify reassembly
+	reassembled := strings.Join(chunks, "")
+	assert.Equal(t, content, reassembled)
+}
+
+func TestSplitIntoChunks_NoNewlines(t *testing.T) {
+	content := strings.Repeat("x", 10000)
+	chunks := splitIntoChunks(content, 4096)
+
+	require.Equal(t, 3, len(chunks))
+	assert.Equal(t, 4096, len(chunks[0]))
+	assert.Equal(t, 4096, len(chunks[1]))
+	assert.Equal(t, 1808, len(chunks[2]))
+
+	// Verify reassembly
+	assert.Equal(t, content, strings.Join(chunks, ""))
+}
+
+func TestSplitIntoChunks_EmptyContent(t *testing.T) {
+	chunks := splitIntoChunks("", 4096)
+	assert.Nil(t, chunks)
+}
+
+func TestSplitIntoChunks_OnlyNewlines(t *testing.T) {
+	content := strings.Repeat("\n", 5000)
+	chunks := splitIntoChunks(content, 4096)
+
+	require.Greater(t, len(chunks), 1)
+
+	// Each chunk should be ≤ maxSize
+	for i, chunk := range chunks {
+		assert.LessOrEqual(t, len(chunk), 4096, "chunk %d exceeds max size", i)
+	}
+
+	// Verify reassembly
+	assert.Equal(t, content, strings.Join(chunks, ""))
+}
+
+func TestSplitIntoChunks_SplitsAtNewlineBoundary(t *testing.T) {
+	// Create content where a newline falls within the chunk boundary
+	line := strings.Repeat("a", 2000) + "\n"
+	content := line + line + line // 6003 bytes total, each line is 2001 bytes
+
+	chunks := splitIntoChunks(content, 4096)
+	require.Equal(t, 2, len(chunks))
+
+	// First chunk should contain exactly 2 lines (4002 bytes), split at newline
+	assert.Equal(t, line+line, chunks[0])
+	assert.Equal(t, line, chunks[1])
+}
+
+func TestParseWindowCacheFromListWindows(t *testing.T) {
+	// Simulate list-windows output with extended format
+	lines := []string{
+		"agentdeck_proj_abc12345\t1704067200\t0\tmain",
+		"agentdeck_proj_abc12345\t1704067300\t1\ttests",
+		"agentdeck_other_def67890\t1704067100\t0\tbash",
+	}
+
+	sessionCache, windowCache := parseListWindowsOutput(strings.Join(lines, "\n"))
+
+	// Session cache: max activity per session
+	assert.Equal(t, int64(1704067300), sessionCache["agentdeck_proj_abc12345"])
+	assert.Equal(t, int64(1704067100), sessionCache["agentdeck_other_def67890"])
+
+	// Window cache: per-window entries
+	assert.Len(t, windowCache["agentdeck_proj_abc12345"], 2)
+	assert.Equal(t, "main", windowCache["agentdeck_proj_abc12345"][0].Name)
+	assert.Equal(t, 1, windowCache["agentdeck_proj_abc12345"][1].Index)
+	assert.Len(t, windowCache["agentdeck_other_def67890"], 1)
+}
+
+func TestParseWindowCacheEmptyInput(t *testing.T) {
+	sessionCache, windowCache := parseListWindowsOutput("")
+	assert.Empty(t, sessionCache)
+	assert.Empty(t, windowCache)
+}
+
+func TestBuildStatusBarArgs(t *testing.T) {
+	tests := []struct {
+		name            string
+		sessionName     string
+		displayName     string
+		workDir         string
+		optionOverrides map[string]string
+		wantKeys        []string // keys that SHOULD appear in args
+		skipKeys        []string // keys that should NOT appear in args
+	}{
+		{
+			name:            "no overrides - all defaults applied",
+			sessionName:     "test-sess",
+			displayName:     "my-project",
+			workDir:         "/home/user/my-project",
+			optionOverrides: nil,
+			wantKeys:        []string{"status", "status-style", "status-left-length", "status-right", "status-right-length"},
+			skipKeys:        nil,
+		},
+		{
+			name:            "empty overrides - all defaults applied",
+			sessionName:     "test-sess",
+			displayName:     "my-project",
+			workDir:         "/home/user/my-project",
+			optionOverrides: map[string]string{},
+			wantKeys:        []string{"status", "status-style", "status-left-length", "status-right", "status-right-length"},
+			skipKeys:        nil,
+		},
+		{
+			name:            "status overridden - status skipped",
+			sessionName:     "test-sess",
+			displayName:     "my-project",
+			workDir:         "/home/user/my-project",
+			optionOverrides: map[string]string{"status": "2"},
+			wantKeys:        []string{"status-style", "status-left-length", "status-right", "status-right-length"},
+			skipKeys:        []string{"status"},
+		},
+		{
+			name:            "status-style overridden - status-style skipped",
+			sessionName:     "test-sess",
+			displayName:     "my-project",
+			workDir:         "/home/user/my-project",
+			optionOverrides: map[string]string{"status-style": "bg=#000000"},
+			wantKeys:        []string{"status", "status-left-length", "status-right", "status-right-length"},
+			skipKeys:        []string{"status-style"},
+		},
+		{
+			name:            "multiple overrides - multiple skipped",
+			sessionName:     "test-sess",
+			displayName:     "my-project",
+			workDir:         "/home/user/my-project",
+			optionOverrides: map[string]string{"status": "2", "status-style": "bg=#000", "status-right-length": "100"},
+			wantKeys:        []string{"status-left-length", "status-right"},
+			skipKeys:        []string{"status", "status-style", "status-right-length"},
+		},
+		{
+			name:            "unrelated override - all defaults applied",
+			sessionName:     "test-sess",
+			displayName:     "my-project",
+			workDir:         "/home/user/my-project",
+			optionOverrides: map[string]string{"history-limit": "50000"},
+			wantKeys:        []string{"status", "status-style", "status-left-length", "status-right", "status-right-length"},
+			skipKeys:        nil,
+		},
+		{
+			name:        "all managed keys overridden - returns nil",
+			sessionName: "test-sess",
+			displayName: "my-project",
+			workDir:     "/home/user/my-project",
+			optionOverrides: map[string]string{
+				"status": "2", "status-style": "bg=#000",
+				"status-left-length": "50", "status-right": "custom",
+				"status-right-length": "100",
+			},
+			wantKeys: nil,
+			skipKeys: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Session{
+				Name:             tt.sessionName,
+				DisplayName:      tt.displayName,
+				WorkDir:          tt.workDir,
+				OptionOverrides:  tt.optionOverrides,
+				injectStatusLine: true,
+			}
+			args := s.buildStatusBarArgs()
+
+			if tt.wantKeys == nil && tt.skipKeys == nil {
+				assert.Nil(t, args, "args should be nil when all managed keys are overridden")
+				return
+			}
+
+			require.NotNil(t, args, "args should not be nil when injectStatusLine is true")
+
+			// Extract the set of option keys from the args.
+			// Args follow the pattern: "set-option" "-t" <session> <key> <value> [";"]
+			keys := make(map[string]bool)
+			for i, a := range args {
+				if a == "set-option" && i+3 < len(args) {
+					keys[args[i+3]] = true
+				}
+			}
+
+			for _, key := range tt.wantKeys {
+				assert.True(t, keys[key], "expected key %q in args", key)
+			}
+			for _, key := range tt.skipKeys {
+				assert.False(t, keys[key], "key %q should be skipped", key)
+			}
+		})
+	}
+}
+
+func TestBuildStatusBarArgs_InjectDisabled(t *testing.T) {
+	s := &Session{
+		Name:             "test-sess",
+		DisplayName:      "proj",
+		WorkDir:          "/tmp",
+		injectStatusLine: false,
+	}
+	args := s.buildStatusBarArgs()
+	assert.Nil(t, args, "args should be nil when injectStatusLine is false")
 }

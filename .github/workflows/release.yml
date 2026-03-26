@@ -1,3 +1,7 @@
+# Automated release via GoReleaser when a version tag is pushed.
+# Replaces the manual `make release-local` step that was previously
+# required after tagging, preventing empty releases (see #332).
+
 name: Release
 
 on:
@@ -9,7 +13,7 @@ permissions:
   contents: write
 
 jobs:
-  goreleaser:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,17 +24,70 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
+
+      - name: Validate tag matches code version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CODE=$(grep 'const Version' cmd/agent-deck/main.go | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG" != "$CODE" ]; then
+            echo "ERROR: Tag v$TAG does not match code Version $CODE"
+            exit 1
+          fi
+          echo "Version: $CODE"
 
       - name: Run tests
-        run: go test -v ./...
+        run: go test -race ./...
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
-          distribution: goreleaser
-          version: latest
+          version: '~> v2'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Validate release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Validating assets for release ${GITHUB_REF_NAME} (version ${VERSION})..."
+
+          ASSETS=$(gh api "repos/${{ github.repository }}/releases/tags/${GITHUB_REF_NAME}" --jq '.assets[].name')
+
+          EXPECTED=(
+            "agent-deck_${VERSION}_darwin_amd64.tar.gz"
+            "agent-deck_${VERSION}_darwin_arm64.tar.gz"
+            "agent-deck_${VERSION}_linux_amd64.tar.gz"
+            "agent-deck_${VERSION}_linux_arm64.tar.gz"
+          )
+
+          MISSING=()
+          for asset in "${EXPECTED[@]}"; do
+            if ! echo "$ASSETS" | grep -qx "$asset"; then
+              MISSING+=("$asset")
+            fi
+          done
+
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo "ERROR: The following expected release assets are missing:"
+            for m in "${MISSING[@]}"; do
+              echo "  - $m"
+            done
+            echo ""
+            echo "All available assets:"
+            echo "$ASSETS"
+            exit 1
+          fi
+
+          # Also verify checksums.txt is present
+          if ! echo "$ASSETS" | grep -qx "checksums.txt"; then
+            echo "ERROR: checksums.txt is missing from the release assets"
+            exit 1
+          fi
+
+          ASSET_COUNT=$(echo "$ASSETS" | wc -l | tr -d ' ')
+          echo "All ${#EXPECTED[@]} platform tarballs and checksums.txt verified successfully."
+          echo "Total assets in release: ${ASSET_COUNT}"

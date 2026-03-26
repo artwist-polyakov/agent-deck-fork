@@ -1,7 +1,14 @@
 package session
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestNewGroupTree(t *testing.T) {
@@ -207,6 +214,62 @@ func TestFlattenWithNestedGroupsCollapsed(t *testing.T) {
 	}
 }
 
+// TestSubgroupSortingWithUnrelatedRoots verifies that subgroups stay with their
+// parent root and are not sorted between unrelated root groups.
+// This was a bug where "agent-deck/github-issues" would sort between "My Sessions"
+// and "agent-deck" because full path comparison doesn't respect tree hierarchy.
+func TestSubgroupSortingWithUnrelatedRoots(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Create root groups with names that alphabetically interleave
+	// "My Sessions" (M) < "agent-deck" (a) in ASCII (uppercase < lowercase)
+	// But "agent-deck/github-issues" would sort before "my-sessions" by full path
+	tree.CreateGroup("My Sessions") // path: my-sessions
+	tree.CreateGroup("agent-deck")  // path: agent-deck
+	tree.CreateGroup("ard")         // path: ard
+	tree.CreateSubgroup("agent-deck", "github-issues")
+
+	// Expand all so subgroups are visible
+	tree.ExpandGroup("my-sessions")
+	tree.ExpandGroup("agent-deck")
+	tree.ExpandGroup("ard")
+
+	// Flatten the tree
+	items := tree.Flatten()
+
+	// Find positions of each group
+	positions := make(map[string]int)
+	for i, item := range items {
+		if item.Type == ItemTypeGroup {
+			positions[item.Path] = i
+		}
+	}
+
+	// Verify: github-issues must come immediately after agent-deck, not before my-sessions
+	agentDeckPos := positions["agent-deck"]
+	githubIssuesPos := positions["agent-deck/github-issues"]
+	mySessionsPos := positions["my-sessions"]
+	ardPos := positions["ard"]
+
+	// agent-deck/github-issues should come right after agent-deck
+	if githubIssuesPos != agentDeckPos+1 {
+		t.Errorf("github-issues (pos %d) should come right after agent-deck (pos %d)",
+			githubIssuesPos, agentDeckPos)
+	}
+
+	// my-sessions should NOT be between agent-deck and github-issues
+	if mySessionsPos > agentDeckPos && mySessionsPos < githubIssuesPos {
+		t.Errorf("my-sessions (pos %d) should not be between agent-deck (pos %d) and github-issues (pos %d)",
+			mySessionsPos, agentDeckPos, githubIssuesPos)
+	}
+
+	// ard should come after both agent-deck and github-issues (same root family, then ard)
+	if ardPos < githubIssuesPos {
+		t.Errorf("ard (pos %d) should come after github-issues (pos %d)",
+			ardPos, githubIssuesPos)
+	}
+}
+
 func TestToggleGroup(t *testing.T) {
 	tree := NewGroupTree([]*Instance{})
 	tree.CreateGroup("Test")
@@ -362,6 +425,65 @@ func TestRenameGroupWithSubgroups(t *testing.T) {
 	}
 }
 
+// TestRenameSubgroup verifies that renaming a subgroup keeps it under its parent.
+// This was a bug where renaming "parent/child" to "NewChild" would result in path "newchild"
+// instead of "parent/newchild", effectively moving the group to root level.
+func TestRenameSubgroup(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Create hierarchy: project-a -> task-b
+	tree.CreateGroup("Project A")
+	tree.CreateSubgroup("project-a", "Task B")
+
+	// Add a session to the subgroup
+	session := &Instance{ID: "1", Title: "my-session", GroupPath: "project-a/task-b"}
+	tree.Groups["project-a/task-b"].Sessions = []*Instance{session}
+
+	// Verify initial structure
+	if tree.Groups["project-a/task-b"] == nil {
+		t.Fatal("Subgroup project-a/task-b should exist")
+	}
+
+	// Rename the subgroup from "Task B" to "Task C"
+	tree.RenameGroup("project-a/task-b", "Task C")
+
+	// OLD path should NOT exist
+	if tree.Groups["project-a/task-b"] != nil {
+		t.Error("Old path project-a/task-b should not exist after rename")
+	}
+
+	// NEW path should be "project-a/task-c" (preserved parent), NOT "task-c" (root level)
+	if tree.Groups["task-c"] != nil {
+		t.Error("Bug: Renamed subgroup should NOT be at root level (task-c)")
+	}
+	renamedGroup := tree.Groups["project-a/task-c"]
+	if renamedGroup == nil {
+		t.Fatal("Renamed subgroup should be at project-a/task-c")
+	}
+
+	// Verify the group properties
+	if renamedGroup.Name != "Task C" {
+		t.Errorf("Expected name 'Task C', got '%s'", renamedGroup.Name)
+	}
+	if renamedGroup.Path != "project-a/task-c" {
+		t.Errorf("Expected path 'project-a/task-c', got '%s'", renamedGroup.Path)
+	}
+
+	// Verify session GroupPath was updated
+	if session.GroupPath != "project-a/task-c" {
+		t.Errorf("Session GroupPath should be 'project-a/task-c', got '%s'", session.GroupPath)
+	}
+
+	// Verify parent group still exists and is unaffected
+	parentGroup := tree.Groups["project-a"]
+	if parentGroup == nil {
+		t.Fatal("Parent group project-a should still exist")
+	}
+	if parentGroup.Name != "Project A" {
+		t.Errorf("Parent name should be 'Project A', got '%s'", parentGroup.Name)
+	}
+}
+
 func TestDeleteGroup(t *testing.T) {
 	instances := []*Instance{
 		{ID: "1", Title: "session-1", GroupPath: "to-delete"},
@@ -470,6 +592,145 @@ func TestMoveSessionToGroup(t *testing.T) {
 	// Target group should have the session
 	if len(tree.Groups["target"].Sessions) != 1 {
 		t.Error("Target group should have 1 session")
+	}
+}
+
+func TestGroupDefaultPath(t *testing.T) {
+	now := time.Now()
+
+	instances := []*Instance{
+		{ID: "1", Title: "old-session", GroupPath: "projects", ProjectPath: "/old/path", LastAccessedAt: now.Add(-1 * time.Hour)},
+		{ID: "2", Title: "new-session", GroupPath: "projects", ProjectPath: "/new/path", LastAccessedAt: now},
+		{ID: "3", Title: "other-session", GroupPath: "other", ProjectPath: "/other/path", LastAccessedAt: now},
+	}
+
+	tree := NewGroupTree(instances)
+
+	// Check that effective default path resolves from most recent session.
+	if got := tree.DefaultPathForGroup("projects"); got != "/new/path" {
+		t.Errorf("Expected default path '/new/path', got '%s'", got)
+	}
+	if got := tree.DefaultPathForGroup("other"); got != "/other/path" {
+		t.Errorf("Expected default path '/other/path', got '%s'", got)
+	}
+}
+
+func TestGroupDefaultPathOnMove(t *testing.T) {
+	now := time.Now()
+
+	instances := []*Instance{
+		{ID: "1", Title: "session-1", GroupPath: "source", ProjectPath: "/source/path", LastAccessedAt: now},
+	}
+
+	tree := NewGroupTree(instances)
+	tree.CreateGroup("target")
+
+	// Move session to target group
+	tree.MoveSessionToGroup(instances[0], "target")
+
+	// Target group should resolve to the moved session's path.
+	if got := tree.DefaultPathForGroup("target"); got != "/source/path" {
+		t.Errorf("Expected target default path '/source/path', got '%s'", got)
+	}
+}
+
+func TestGroupDefaultPathPersistence(t *testing.T) {
+	now := time.Now()
+
+	// Simulate stored groups with default path
+	storedGroups := []*GroupData{
+		{Name: "Projects", Path: "projects", Expanded: true, Order: 0, DefaultPath: "/stored/path"},
+	}
+
+	// Create instances with older path
+	instances := []*Instance{
+		{ID: "1", Title: "session-1", GroupPath: "projects", ProjectPath: "/newer/path", LastAccessedAt: now},
+	}
+
+	tree := NewGroupTreeWithGroups(instances, storedGroups)
+
+	// Explicit stored default path should be preserved.
+	if got := tree.DefaultPathForGroup("projects"); got != "/stored/path" {
+		t.Errorf("Expected default path '/stored/path', got '%s'", got)
+	}
+}
+
+func TestSetDefaultPathForGroup(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+	tree.CreateGroup("Projects")
+
+	if ok := tree.SetDefaultPathForGroup("projects", "/tmp/project-root"); !ok {
+		t.Fatal("SetDefaultPathForGroup should return true for existing group")
+	}
+
+	if got := tree.DefaultPathForGroup("projects"); got != "/tmp/project-root" {
+		t.Fatalf("Expected explicit default path '/tmp/project-root', got %q", got)
+	}
+
+	if ok := tree.SetDefaultPathForGroup("projects", ""); !ok {
+		t.Fatal("SetDefaultPathForGroup should allow clearing")
+	}
+
+	if got := tree.DefaultPathForGroup("projects"); got != "" {
+		t.Fatalf("Expected empty default path after clear, got %q", got)
+	}
+}
+
+func TestDefaultPathForGroupResolvesWorktreeToRepoRoot(t *testing.T) {
+	// Skip if git is unavailable in test environment.
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	tmpDir := t.TempDir()
+	repoDir := filepath.Join(tmpDir, "repo")
+	wtDir := filepath.Join(tmpDir, "repo-worktree")
+
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Env = testutil.CleanGitEnv(os.Environ())
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+
+	run("init", repoDir)
+	run("-C", repoDir, "config", "user.email", "test@example.com")
+	run("-C", repoDir, "config", "user.name", "Test User")
+
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("failed to write repo file: %v", err)
+	}
+	run("-C", repoDir, "add", "README.md")
+	run("-C", repoDir, "commit", "-m", "init")
+	run("-C", repoDir, "worktree", "add", wtDir, "-b", "feature/test")
+
+	instances := []*Instance{
+		{
+			ID:             "1",
+			Title:          "worktree-session",
+			GroupPath:      "projects",
+			ProjectPath:    wtDir,
+			LastAccessedAt: time.Now(),
+		},
+	}
+
+	tree := NewGroupTree(instances)
+	got := tree.DefaultPathForGroup("projects")
+
+	realRepoDir, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		realRepoDir = repoDir
+	}
+	realGot, err := filepath.EvalSymlinks(got)
+	if err != nil {
+		realGot = got
+	}
+
+	if realGot != realRepoDir {
+		t.Fatalf("Expected default path to resolve to repo root %q, got %q", realRepoDir, realGot)
 	}
 }
 
@@ -682,6 +943,27 @@ func TestGetParentPath(t *testing.T) {
 	}
 }
 
+func TestGetRootPath(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"root", "root"},
+		{"parent/child", "parent"},
+		{"a/b/c", "a"},
+		{"my-sessions", "my-sessions"},
+		{"agent-deck/github-issues", "agent-deck"},
+		{"deep/nested/path/here", "deep"},
+	}
+
+	for _, tt := range tests {
+		result := getRootPath(tt.path)
+		if result != tt.expected {
+			t.Errorf("getRootPath(%s) = %s, want %s", tt.path, result, tt.expected)
+		}
+	}
+}
+
 func TestExtractGroupName(t *testing.T) {
 	tests := []struct {
 		path     string
@@ -885,4 +1167,329 @@ func TestNewGroupTreeAutoCreatesParents(t *testing.T) {
 	if tree.Groups["projects/backend/api"].Name != "api" {
 		t.Errorf("Expected name 'api', got '%s'", tree.Groups["projects/backend/api"].Name)
 	}
+}
+
+func TestAddSessionUpdatesDefaultPath(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Empty group should have no DefaultPath
+	tree.AddSession(&Instance{
+		ID:          "1",
+		Title:       "first",
+		GroupPath:   "dev",
+		ProjectPath: "",
+	})
+	group := tree.Groups["dev"]
+	if group == nil {
+		t.Fatal("dev group not found after AddSession")
+	}
+	if group.DefaultPath != "" {
+		t.Errorf("Expected empty DefaultPath for session with no ProjectPath, got %q", group.DefaultPath)
+	}
+
+	// After adding a session with a ProjectPath, DefaultPath should be set
+	now := time.Now()
+	tree.AddSession(&Instance{
+		ID:             "2",
+		Title:          "second",
+		GroupPath:      "dev",
+		ProjectPath:    "/home/user/project-a",
+		LastAccessedAt: now,
+	})
+	if got := tree.DefaultPathForGroup("dev"); got != "/home/user/project-a" {
+		t.Errorf("Expected default path '/home/user/project-a', got %q", got)
+	}
+
+	// After adding a more recently accessed session, DefaultPath should update
+	tree.AddSession(&Instance{
+		ID:             "3",
+		Title:          "third",
+		GroupPath:      "dev",
+		ProjectPath:    "/home/user/project-b",
+		LastAccessedAt: now.Add(time.Minute),
+	})
+	if got := tree.DefaultPathForGroup("dev"); got != "/home/user/project-b" {
+		t.Errorf("Expected default path '/home/user/project-b', got %q", got)
+	}
+
+	// The stored field remains empty until explicitly configured.
+	if group.DefaultPath != "" {
+		t.Errorf("Expected stored DefaultPath to remain empty for derived defaults, got %q", group.DefaultPath)
+	}
+}
+
+func TestMoveSessionUpOrder(t *testing.T) {
+	instances := []*Instance{
+		{ID: "a", Title: "first", GroupPath: "test"},
+		{ID: "b", Title: "second", GroupPath: "test"},
+		{ID: "c", Title: "third", GroupPath: "test"},
+	}
+
+	tree := NewGroupTree(instances)
+	group := tree.Groups["test"]
+
+	// Move second session up (swap with first)
+	tree.MoveSessionUp(instances[1])
+
+	// Verify slice order: b, a, c
+	if group.Sessions[0].ID != "b" {
+		t.Errorf("Expected 'b' at index 0, got '%s'", group.Sessions[0].ID)
+	}
+	if group.Sessions[1].ID != "a" {
+		t.Errorf("Expected 'a' at index 1, got '%s'", group.Sessions[1].ID)
+	}
+	if group.Sessions[2].ID != "c" {
+		t.Errorf("Expected 'c' at index 2, got '%s'", group.Sessions[2].ID)
+	}
+
+	// Verify Order field values are normalized
+	for i, s := range group.Sessions {
+		if s.Order != i {
+			t.Errorf("Expected Order %d for session '%s', got %d", i, s.ID, s.Order)
+		}
+	}
+}
+
+func TestMoveSessionDownOrder(t *testing.T) {
+	instances := []*Instance{
+		{ID: "a", Title: "first", GroupPath: "test"},
+		{ID: "b", Title: "second", GroupPath: "test"},
+		{ID: "c", Title: "third", GroupPath: "test"},
+	}
+
+	tree := NewGroupTree(instances)
+	group := tree.Groups["test"]
+
+	// Move second session down (swap with third)
+	tree.MoveSessionDown(instances[1])
+
+	// Verify slice order: a, c, b
+	if group.Sessions[0].ID != "a" {
+		t.Errorf("Expected 'a' at index 0, got '%s'", group.Sessions[0].ID)
+	}
+	if group.Sessions[1].ID != "c" {
+		t.Errorf("Expected 'c' at index 1, got '%s'", group.Sessions[1].ID)
+	}
+	if group.Sessions[2].ID != "b" {
+		t.Errorf("Expected 'b' at index 2, got '%s'", group.Sessions[2].ID)
+	}
+
+	// Verify Order field values are normalized
+	for i, s := range group.Sessions {
+		if s.Order != i {
+			t.Errorf("Expected Order %d for session '%s', got %d", i, s.ID, s.Order)
+		}
+	}
+}
+
+func TestSessionOrderPersistence(t *testing.T) {
+	// Simulate sessions with Order values (as if saved after reorder)
+	instances := []*Instance{
+		{ID: "a", Title: "first", GroupPath: "test", Order: 2},
+		{ID: "b", Title: "second", GroupPath: "test", Order: 0},
+		{ID: "c", Title: "third", GroupPath: "test", Order: 1},
+	}
+
+	storedGroups := []*GroupData{
+		{Name: "test", Path: "test", Expanded: true, Order: 0},
+	}
+
+	tree := NewGroupTreeWithGroups(instances, storedGroups)
+	group := tree.Groups["test"]
+
+	// Sessions should be sorted by Order: b(0), c(1), a(2)
+	if group.Sessions[0].ID != "b" {
+		t.Errorf("Expected 'b' at index 0 (Order 0), got '%s' (Order %d)", group.Sessions[0].ID, group.Sessions[0].Order)
+	}
+	if group.Sessions[1].ID != "c" {
+		t.Errorf("Expected 'c' at index 1 (Order 1), got '%s' (Order %d)", group.Sessions[1].ID, group.Sessions[1].Order)
+	}
+	if group.Sessions[2].ID != "a" {
+		t.Errorf("Expected 'a' at index 2 (Order 2), got '%s' (Order %d)", group.Sessions[2].ID, group.Sessions[2].Order)
+	}
+}
+
+func TestSessionOrderMigration(t *testing.T) {
+	// Simulate legacy sessions with no Order field (all zero)
+	// SliceStable should preserve original JSON array order
+	instances := []*Instance{
+		{ID: "x", Title: "first", GroupPath: "test", Order: 0},
+		{ID: "y", Title: "second", GroupPath: "test", Order: 0},
+		{ID: "z", Title: "third", GroupPath: "test", Order: 0},
+	}
+
+	storedGroups := []*GroupData{
+		{Name: "test", Path: "test", Expanded: true, Order: 0},
+	}
+
+	tree := NewGroupTreeWithGroups(instances, storedGroups)
+	group := tree.Groups["test"]
+
+	// With all Order==0, SliceStable preserves original order: x, y, z
+	if group.Sessions[0].ID != "x" {
+		t.Errorf("Expected 'x' at index 0 (stable sort), got '%s'", group.Sessions[0].ID)
+	}
+	if group.Sessions[1].ID != "y" {
+		t.Errorf("Expected 'y' at index 1 (stable sort), got '%s'", group.Sessions[1].ID)
+	}
+	if group.Sessions[2].ID != "z" {
+		t.Errorf("Expected 'z' at index 2 (stable sort), got '%s'", group.Sessions[2].ID)
+	}
+}
+
+func TestSyncWithInstancesUpdatesDefaultPath(t *testing.T) {
+	now := time.Now()
+	instances := []*Instance{
+		{
+			ID:             "1",
+			Title:          "older",
+			GroupPath:      "work",
+			ProjectPath:    "/old/path",
+			LastAccessedAt: now,
+		},
+		{
+			ID:             "2",
+			Title:          "newer",
+			GroupPath:      "work",
+			ProjectPath:    "/new/path",
+			LastAccessedAt: now.Add(time.Hour),
+		},
+	}
+
+	tree := NewGroupTree([]*Instance{})
+	tree.SyncWithInstances(instances)
+
+	group := tree.Groups["work"]
+	if group == nil {
+		t.Fatal("work group not found after SyncWithInstances")
+	}
+	if got := tree.DefaultPathForGroup("work"); got != "/new/path" {
+		t.Errorf("Expected default path '/new/path' after sync, got %q", got)
+	}
+	if group.DefaultPath != "" {
+		t.Errorf("Expected stored DefaultPath to remain empty for derived defaults, got %q", group.DefaultPath)
+	}
+}
+
+func TestSubgroupAppearsAfterParent(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Create multiple root groups
+	tree.CreateGroup("Alpha")
+	tree.CreateGroup("Beta")
+	tree.CreateGroup("Gamma")
+
+	// Create subgroup under Beta
+	child := tree.CreateSubgroup("beta", "Child")
+
+	// Verify path is correct
+	if child.Path != "beta/child" {
+		t.Errorf("Expected path 'beta/child', got '%s'", child.Path)
+	}
+
+	// Verify parent-child relationship in GroupList ordering
+	var betaIdx, childIdx int = -1, -1
+	for i, g := range tree.GroupList {
+		if g.Path == "beta" {
+			betaIdx = i
+		}
+		if g.Path == "beta/child" {
+			childIdx = i
+		}
+	}
+
+	// Child should come after parent in GroupList
+	if childIdx <= betaIdx {
+		t.Errorf("Subgroup should appear after parent in GroupList. Parent at %d, child at %d",
+			betaIdx, childIdx)
+	}
+}
+
+func TestSortingTransitivity(t *testing.T) {
+	// Reproduce the exact scenario that caused the bug:
+	// When alphabetical order differs from creation order, deep nesting
+	// could cause children to appear before their parents
+	tree := NewGroupTree([]*Instance{})
+
+	// Create "My Sessions" first (Order=0), then "Beta" (Order=1)
+	// Alphabetically: "beta" < "my-sessions", but by Order: my-sessions < beta
+	tree.CreateGroup("My Sessions")
+	tree.CreateGroup("Beta")
+	tree.CreateSubgroup("beta", "Tasks")
+	tree.CreateSubgroup("beta/tasks", "Urgent")
+
+	// Verify beta comes before its descendants
+	var betaIdx, tasksIdx, urgentIdx int = -1, -1, -1
+	for i, g := range tree.GroupList {
+		switch g.Path {
+		case "beta":
+			betaIdx = i
+		case "beta/tasks":
+			tasksIdx = i
+		case "beta/tasks/urgent":
+			urgentIdx = i
+		}
+	}
+
+	if betaIdx == -1 || tasksIdx == -1 || urgentIdx == -1 {
+		t.Fatal("Expected groups not found in GroupList")
+	}
+
+	// Parent chain should be in order: beta < tasks < urgent
+	if !(betaIdx < tasksIdx && tasksIdx < urgentIdx) {
+		t.Errorf("Parent chain out of order: beta=%d, tasks=%d, urgent=%d",
+			betaIdx, tasksIdx, urgentIdx)
+	}
+}
+
+func TestBranchOrderingByOrder(t *testing.T) {
+	tree := NewGroupTree([]*Instance{})
+
+	// Create groups where alphabetical order differs from Order
+	tree.CreateGroup("Zebra") // Created first, Order=0
+	tree.CreateGroup("Alpha") // Created second, Order=1
+
+	// Create subgroups
+	tree.CreateSubgroup("zebra", "Child")
+	tree.CreateSubgroup("alpha", "Child")
+
+	// Zebra branch should come before Alpha branch (by Order, not alphabetically)
+	var zebraIdx, alphaIdx int = -1, -1
+	for i, g := range tree.GroupList {
+		if g.Path == "zebra" {
+			zebraIdx = i
+		}
+		if g.Path == "alpha" {
+			alphaIdx = i
+		}
+	}
+
+	if zebraIdx > alphaIdx {
+		t.Errorf("Zebra (Order=0) should come before Alpha (Order=1). Zebra=%d, Alpha=%d",
+			zebraIdx, alphaIdx)
+	}
+}
+
+func TestFlattenIncludesWindowType(t *testing.T) {
+	instances := []*Instance{
+		{ID: "1", Title: "session-1", GroupPath: "project-a"},
+	}
+	tree := NewGroupTree(instances)
+	tree.ExpandGroup("project-a")
+
+	items := tree.Flatten()
+
+	// Without windows, just group + session
+	sessionCount := 0
+	windowCount := 0
+	for _, item := range items {
+		if item.Type == ItemTypeSession {
+			sessionCount++
+		}
+		if item.Type == ItemTypeWindow {
+			windowCount++
+		}
+	}
+	assert.Equal(t, 1, sessionCount)
+	assert.Equal(t, 0, windowCount, "no windows injected at Flatten level")
 }

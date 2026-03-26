@@ -157,9 +157,12 @@ func ListProfiles() ([]string, error) {
 	var profiles []string
 	for _, entry := range entries {
 		if entry.IsDir() {
-			// Verify it has a sessions.json file (valid profile)
-			sessionsPath := filepath.Join(profilesDir, entry.Name(), "sessions.json")
-			if _, err := os.Stat(sessionsPath); err == nil {
+			// Check for state.db (SQLite, v0.11.0+) or sessions.json (legacy, auto-migrates on open)
+			dbPath := filepath.Join(profilesDir, entry.Name(), "state.db")
+			jsonPath := filepath.Join(profilesDir, entry.Name(), "sessions.json")
+			if _, err := os.Stat(dbPath); err == nil {
+				profiles = append(profiles, entry.Name())
+			} else if _, err := os.Stat(jsonPath); err == nil {
 				profiles = append(profiles, entry.Name())
 			}
 		}
@@ -176,15 +179,19 @@ func ProfileExists(profile string) (bool, error) {
 		return false, err
 	}
 
-	sessionsPath := filepath.Join(profileDir, "sessions.json")
-	_, err = os.Stat(sessionsPath)
+	// Check for state.db (SQLite, v0.11.0+) or sessions.json (legacy)
+	dbPath := filepath.Join(profileDir, "state.db")
+	if _, err = os.Stat(dbPath); err == nil {
+		return true, nil
+	}
+	jsonPath := filepath.Join(profileDir, "sessions.json")
+	if _, err = os.Stat(jsonPath); err == nil {
+		return true, nil
+	}
 	if os.IsNotExist(err) {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return false, err
 }
 
 // CreateProfile creates a new empty profile
@@ -213,20 +220,11 @@ func CreateProfile(profile string) error {
 		return fmt.Errorf("failed to create profile directory: %w", err)
 	}
 
-	// Create empty sessions.json
-	emptyData := StorageData{
-		Instances: []*InstanceData{},
-		Groups:    []*GroupData{},
-	}
-
-	data, err := json.MarshalIndent(emptyData, "", "  ")
+	// Initialize SQLite database for the new profile.
+	// NewStorageWithProfile auto-creates tables, so just opening it is sufficient.
+	_, err = NewStorageWithProfile(profile)
 	if err != nil {
-		return fmt.Errorf("failed to marshal empty sessions: %w", err)
-	}
-
-	sessionsPath := filepath.Join(profileDir, "sessions.json")
-	if err := os.WriteFile(sessionsPath, data, 0600); err != nil {
-		return fmt.Errorf("failed to create sessions file: %w", err)
+		return fmt.Errorf("failed to initialize profile storage: %w", err)
 	}
 
 	return nil

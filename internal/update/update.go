@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
 const (
@@ -55,11 +57,11 @@ type Asset struct {
 
 // UpdateCache stores the last check result
 type UpdateCache struct {
-	CheckedAt     time.Time `json:"checked_at"`
-	LatestVersion string    `json:"latest_version"`
-	CurrentVersion string   `json:"current_version"`
-	DownloadURL   string    `json:"download_url"`
-	ReleaseURL    string    `json:"release_url"`
+	CheckedAt      time.Time `json:"checked_at"`
+	LatestVersion  string    `json:"latest_version"`
+	CurrentVersion string    `json:"current_version"`
+	DownloadURL    string    `json:"download_url"`
+	ReleaseURL     string    `json:"release_url"`
 }
 
 // UpdateInfo contains information about an available update
@@ -146,9 +148,11 @@ func fetchLatestRelease() (*Release, error) {
 
 // getAssetURL returns the download URL for the current platform
 func getAssetURL(release *Release) string {
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
+	return GetAssetURLForPlatform(release, runtime.GOOS, runtime.GOARCH)
+}
 
+// GetAssetURLForPlatform returns the download URL for a specific OS/arch combination.
+func GetAssetURLForPlatform(release *Release, goos, goarch string) string {
 	// Construct expected asset name: agent-deck_X.Y.Z_os_arch.tar.gz
 	version := strings.TrimPrefix(release.TagName, "v")
 	expectedName := fmt.Sprintf("agent-deck_%s_%s_%s.tar.gz", version, goos, goarch)
@@ -160,6 +164,40 @@ func getAssetURL(release *Release) string {
 	}
 
 	return ""
+}
+
+// FetchLatestRelease fetches the latest release from GitHub (exported for remote update).
+func FetchLatestRelease() (*Release, error) {
+	return fetchLatestRelease()
+}
+
+// DownloadAndExtractBinary downloads a release tarball and returns the binary bytes.
+func DownloadAndExtractBinary(downloadURL string) ([]byte, error) {
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download failed with status %d", resp.StatusCode)
+	}
+
+	tmpFile, err := os.CreateTemp("", "agent-deck-update-*.tar.gz")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err = io.Copy(tmpFile, resp.Body); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("failed to save download: %w", err)
+	}
+	tmpFile.Close()
+
+	return extractBinaryFromTarGz(tmpPath)
 }
 
 // CompareVersions compares two semantic versions
@@ -269,16 +307,12 @@ func PerformUpdate(downloadURL string) error {
 		return fmt.Errorf("no download URL available for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
-	// Get current executable path
-	execPath, err := os.Executable()
+	execPath, upgradeCmd, managed, err := DetectHomebrewManagedInstall()
 	if err != nil {
-		return fmt.Errorf("failed to get executable path: %w", err)
+		return fmt.Errorf("failed to detect install type: %w", err)
 	}
-
-	// Resolve symlinks to get actual binary location
-	execPath, err = filepath.EvalSymlinks(execPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve symlinks: %w", err)
+	if managed {
+		return fmt.Errorf("homebrew-managed install detected at %s; use `%s`", execPath, upgradeCmd)
 	}
 
 	// Download the release
@@ -344,6 +378,184 @@ func PerformUpdate(downloadURL string) error {
 	return nil
 }
 
+// HomebrewUpgradeHint returns the recommended Homebrew upgrade command when the
+// binary path points into a known Homebrew Cellar location.
+func HomebrewUpgradeHint(execPath string) (string, bool) {
+	clean := filepath.Clean(execPath)
+	// Homebrew-managed binaries resolve to Cellar paths. Self-overwriting these
+	// can leave installs in a bad state; prefer brew-managed upgrades.
+	knownCellars := []string{
+		"/opt/homebrew/Cellar/agent-deck/",
+		"/usr/local/Cellar/agent-deck/",
+		"/home/linuxbrew/.linuxbrew/Cellar/agent-deck/",
+	}
+	for _, prefix := range knownCellars {
+		if strings.HasPrefix(clean, prefix) {
+			return "brew upgrade asheshgoplani/tap/agent-deck", true
+		}
+	}
+	return "", false
+}
+
+// DetectHomebrewManagedInstall resolves the current executable path and reports
+// whether it is managed by Homebrew.
+func DetectHomebrewManagedInstall() (execPath string, upgradeCmd string, managed bool, err error) {
+	execPath, err = os.Executable()
+	if err != nil {
+		return "", "", false, err
+	}
+	execPath, err = filepath.EvalSymlinks(execPath)
+	if err != nil {
+		return "", "", false, err
+	}
+	upgradeCmd, managed = HomebrewUpgradeHint(execPath)
+	return execPath, upgradeCmd, managed, nil
+}
+
+// ChangelogEntry represents a single version's changelog
+type ChangelogEntry struct {
+	Version string
+	Date    string
+	Content string
+}
+
+// FetchChangelog fetches the CHANGELOG.md from GitHub
+func FetchChangelog() (string, error) {
+	url := fmt.Sprintf("https://raw.githubusercontent.com/%s/main/CHANGELOG.md", GitHubRepo)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch changelog: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to fetch changelog: status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MB max
+	if err != nil {
+		return "", fmt.Errorf("failed to read changelog: %w", err)
+	}
+
+	return string(data), nil
+}
+
+// ParseChangelog parses CHANGELOG.md and returns entries for versions
+func ParseChangelog(content string) []ChangelogEntry {
+	var entries []ChangelogEntry
+	lines := strings.Split(content, "\n")
+
+	var currentEntry *ChangelogEntry
+	var contentBuilder strings.Builder
+
+	for _, line := range lines {
+		// Match version headers: ## [0.6.1] - 2025-12-24
+		if strings.HasPrefix(line, "## [") {
+			// Save previous entry
+			if currentEntry != nil {
+				currentEntry.Content = strings.TrimSpace(contentBuilder.String())
+				entries = append(entries, *currentEntry)
+			}
+
+			// Parse new entry
+			// Extract version and date from "## [0.6.1] - 2025-12-24"
+			rest := strings.TrimPrefix(line, "## [")
+			parts := strings.SplitN(rest, "]", 2)
+			if len(parts) >= 1 {
+				version := parts[0]
+				date := ""
+				if len(parts) >= 2 && strings.Contains(parts[1], " - ") {
+					dateParts := strings.SplitN(parts[1], " - ", 2)
+					if len(dateParts) >= 2 {
+						date = strings.TrimSpace(dateParts[1])
+					}
+				}
+				currentEntry = &ChangelogEntry{
+					Version: version,
+					Date:    date,
+				}
+				contentBuilder.Reset()
+			}
+		} else if currentEntry != nil {
+			contentBuilder.WriteString(line)
+			contentBuilder.WriteString("\n")
+		}
+	}
+
+	// Save last entry
+	if currentEntry != nil {
+		currentEntry.Content = strings.TrimSpace(contentBuilder.String())
+		entries = append(entries, *currentEntry)
+	}
+
+	return entries
+}
+
+// GetChangesBetweenVersions returns changelog entries between two versions (exclusive of current, inclusive of latest)
+func GetChangesBetweenVersions(entries []ChangelogEntry, currentVersion, latestVersion string) []ChangelogEntry {
+	var result []ChangelogEntry
+
+	currentVersion = strings.TrimPrefix(currentVersion, "v")
+	latestVersion = strings.TrimPrefix(latestVersion, "v")
+
+	for _, entry := range entries {
+		entryVersion := strings.TrimPrefix(entry.Version, "v")
+
+		// Include if version is greater than current and less than or equal to latest
+		if CompareVersions(entryVersion, currentVersion) > 0 &&
+			CompareVersions(entryVersion, latestVersion) <= 0 {
+			result = append(result, entry)
+		}
+	}
+
+	return result
+}
+
+// FormatChangelogForDisplay formats changelog entries for terminal display
+func FormatChangelogForDisplay(entries []ChangelogEntry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n━━━ What's New ━━━\n")
+
+	for _, entry := range entries {
+		header := fmt.Sprintf("\n📦 v%s", entry.Version)
+		if entry.Date != "" {
+			header += fmt.Sprintf(" (%s)", entry.Date)
+		}
+		sb.WriteString(header)
+		sb.WriteString("\n")
+
+		// Process content - indent and clean up
+		lines := strings.Split(entry.Content, "\n")
+		for _, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			// Skip section headers that are just category names, but keep content
+			if strings.HasPrefix(line, "### ") {
+				section := strings.TrimPrefix(line, "### ")
+				sb.WriteString(fmt.Sprintf("\n  [%s]\n", section))
+			} else if strings.HasPrefix(line, "- ") {
+				sb.WriteString(fmt.Sprintf("  %s\n", line))
+			} else if strings.HasPrefix(line, "  ") {
+				// Nested content
+				sb.WriteString(fmt.Sprintf("  %s\n", line))
+			} else {
+				// Preserve unrecognized non-empty lines (e.g. plain text paragraphs)
+				sb.WriteString(fmt.Sprintf("  %s\n", line))
+			}
+		}
+	}
+
+	sb.WriteString("\n━━━━━━━━━━━━━━━━━━\n")
+	return sb.String()
+}
+
 // extractBinaryFromTarGz extracts the agent-deck binary from a .tar.gz file
 func extractBinaryFromTarGz(tarPath string) ([]byte, error) {
 	file, err := os.Open(tarPath)
@@ -369,8 +581,8 @@ func extractBinaryFromTarGz(tarPath string) ([]byte, error) {
 			return nil, err
 		}
 
-		// Look for the agent-deck binary
-		if header.Typeflag == tar.TypeReg && header.Name == "agent-deck" {
+		// Look for the agent-deck binary (may be at root or nested in a directory)
+		if header.Typeflag == tar.TypeReg && filepath.Base(header.Name) == "agent-deck" {
 			data, err := io.ReadAll(tr)
 			if err != nil {
 				return nil, err
@@ -380,4 +592,44 @@ func extractBinaryFromTarGz(tarPath string) ([]byte, error) {
 	}
 
 	return nil, fmt.Errorf("agent-deck binary not found in archive")
+}
+
+// UpdateBridgePy refreshes the installed bridge.py from the embedded runtime template.
+// This keeps bridge behavior in sync with the currently running binary.
+func UpdateBridgePy() error {
+	// Get the conductor directory
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	conductorDir := filepath.Join(home, ".agent-deck", "conductor")
+	bridgePath := filepath.Join(conductorDir, "bridge.py")
+
+	// Check if conductor directory exists
+	if _, err := os.Stat(conductorDir); os.IsNotExist(err) {
+		// Conductor not installed, skip update
+		return nil
+	}
+
+	fmt.Println("Updating bridge.py...")
+	// Backup existing bridge.py if present
+	if _, err := os.Stat(bridgePath); err == nil {
+		content, readErr := os.ReadFile(bridgePath)
+		if readErr != nil {
+			return fmt.Errorf("failed to read existing bridge.py: %w", readErr)
+		}
+		backupPath := bridgePath + ".backup"
+		if err := os.WriteFile(backupPath, content, 0644); err != nil {
+			return fmt.Errorf("failed to backup bridge.py: %w", err)
+		}
+	}
+
+	// Install latest bridge template from embedded runtime.
+	if err := session.InstallBridgeScript(); err != nil {
+		return fmt.Errorf("failed to install bridge.py: %w", err)
+	}
+
+	fmt.Println("✓ bridge.py updated!")
+	return nil
 }

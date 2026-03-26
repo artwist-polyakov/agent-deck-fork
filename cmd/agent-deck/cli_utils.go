@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,128 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
+
+// normalizeArgs reorders args so flags come before positional arguments.
+// Go's flag package stops parsing at the first non-flag argument, which means
+// "session show my-title --json" silently ignores --json. This function
+// moves all flags to the front so they get parsed correctly.
+func normalizeArgs(fs *flag.FlagSet, args []string) []string {
+	// Build set of known boolean flags (don't need a value argument)
+	boolFlags := make(map[string]bool)
+	fs.VisitAll(func(f *flag.Flag) {
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			boolFlags[f.Name] = true
+		}
+	})
+
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		// "--" terminates flag processing
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flags = append(flags, arg)
+
+			// Determine flag name (strip leading dashes)
+			name := strings.TrimLeft(arg, "-")
+
+			// Handle --flag=value (value is part of the arg, nothing to move)
+			if strings.Contains(name, "=") {
+				continue
+			}
+
+			// If it's not a bool flag, the next arg is its value
+			if !boolFlags[name] && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		} else {
+			positional = append(positional, arg)
+		}
+	}
+	return append(flags, positional...)
+}
+
+// firstNonEmpty returns the first non-empty string after trimming whitespace.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// resolveSessionCommand normalizes the user-provided --cmd/-c input.
+//
+// Behavior:
+//   - Plain tool name (e.g. "claude", "codex"): use built-in/default command.
+//   - Tool with extra args (e.g. "codex --dangerously-bypass-approvals-and-sandbox"):
+//     keep tool detection but forward extra args via wrapper so they are not lost.
+//   - Generic shell command: keep full command as-is.
+//   - Explicit wrapper always wins.
+func resolveSessionCommand(rawCommand, explicitWrapper string) (toolName, command, wrapper, note string) {
+	raw := strings.TrimSpace(rawCommand)
+	wrapper = strings.TrimSpace(explicitWrapper)
+	if raw == "" {
+		return "", "", wrapper, ""
+	}
+
+	toolName = detectTool(raw)
+	base, extra := splitFirstWord(raw)
+
+	// No explicit wrapper provided and command looks like "tool arg1 arg2".
+	// Preserve extra args by turning them into wrapper suffix.
+	if wrapper == "" && extra != "" {
+		baseTool := detectTool(base)
+		if baseTool != "shell" {
+			toolName = baseTool
+			if toolDef := session.GetToolDef(toolName); toolDef != nil {
+				command = toolDef.Command
+			} else {
+				command = base
+			}
+			wrapper = strings.TrimSpace("{command} " + extra)
+			note = fmt.Sprintf("parsed --cmd as tool '%s' and forwarded extra args via wrapper", toolName)
+			return toolName, command, wrapper, note
+		}
+	}
+
+	if toolDef := session.GetToolDef(toolName); toolDef != nil {
+		command = toolDef.Command
+	} else {
+		command = raw
+	}
+	return toolName, command, wrapper, note
+}
+
+func splitFirstWord(raw string) (string, string) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", ""
+	}
+	for i, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			return s[:i], strings.TrimSpace(s[i+1:])
+		}
+	}
+	return s, ""
+}
+
+// resolveGroupSelection applies parent-group inheritance rules.
+// If the user explicitly provided -g/--group, keep that value.
+// Otherwise inherit the parent's group.
+func resolveGroupSelection(currentGroup, parentGroup string, explicitGroupProvided bool) string {
+	if explicitGroupProvided {
+		return currentGroup
+	}
+	return parentGroup
+}
 
 // CLIOutput handles consistent output formatting across all CLI commands
 type CLIOutput struct {
@@ -207,6 +330,8 @@ func StatusSymbol(status session.Status) string {
 		return "○"
 	case session.StatusError:
 		return "✕"
+	case session.StatusStopped:
+		return "■"
 	default:
 		return "?"
 	}
@@ -223,6 +348,8 @@ func StatusString(status session.Status) string {
 		return "idle"
 	case session.StatusError:
 		return "error"
+	case session.StatusStopped:
+		return "stopped"
 	default:
 		return "unknown"
 	}

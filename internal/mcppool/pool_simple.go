@@ -3,14 +3,18 @@ package mcppool
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
+
+var poolLog = logging.ForComponent(logging.CompPool)
 
 type Pool struct {
 	proxies map[string]*SocketProxy
@@ -21,11 +25,11 @@ type Pool struct {
 }
 
 type PoolConfig struct {
-	Enabled        bool
-	PoolAll        bool
-	ExcludeMCPs    []string
-	PoolMCPs       []string
-	FallbackStdio  bool
+	Enabled       bool
+	PoolAll       bool
+	ExcludeMCPs   []string
+	PoolMCPs      []string
+	FallbackStdio bool
 }
 
 func NewPool(ctx context.Context, config *PoolConfig) (*Pool, error) {
@@ -89,17 +93,23 @@ func (p *Pool) IsRunning(name string) bool {
 		return false
 	}
 
+	// Permanently failed proxies are never considered running
+	if proxy.GetStatus() == StatusPermanentlyFailed {
+		p.mu.RUnlock()
+		return false
+	}
+
 	// Double-check: verify the socket is actually alive (not just marked as running)
 	if proxy.GetStatus() == StatusRunning {
 		if !isSocketAliveCheck(proxy.socketPath) {
 			p.mu.RUnlock()
-			log.Printf("[Pool] ⚠️ %s: marked running but socket is DEAD - attempting restart", name)
+			poolLog.Warn("socket_dead_restart", slog.String("mcp", name))
 			// Try to restart the proxy
 			if err := p.RestartProxy(name); err != nil {
-				log.Printf("[Pool] ✗ %s: restart failed: %v", name, err)
+				poolLog.Error("restart_failed", slog.String("mcp", name), slog.String("error", err.Error()))
 				return false
 			}
-			log.Printf("[Pool] ✓ %s: successfully restarted", name)
+			poolLog.Info("restart_success", slog.String("mcp", name))
 			return true
 		}
 		p.mu.RUnlock()
@@ -119,6 +129,11 @@ func (p *Pool) RestartProxy(name string) error {
 		return fmt.Errorf("proxy %s not found", name)
 	}
 
+	// Don't restart permanently failed proxies
+	if proxy.GetStatus() == StatusPermanentlyFailed {
+		return fmt.Errorf("proxy %s is permanently failed", name)
+	}
+
 	// Stop the old proxy (cleanup)
 	_ = proxy.Stop()
 	delete(p.proxies, name)
@@ -133,6 +148,8 @@ func (p *Pool) RestartProxy(name string) error {
 	}
 
 	if err := newProxy.Start(); err != nil {
+		// Clean up the failed proxy to avoid leaking its context/goroutines
+		_ = newProxy.Stop()
 		return fmt.Errorf("failed to start proxy: %w", err)
 	}
 
@@ -165,19 +182,36 @@ func (p *Pool) Shutdown() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	var wg sync.WaitGroup
 	for name, proxy := range p.proxies {
-		log.Printf("Stopping socket proxy: %s", name)
-		_ = proxy.Stop()
+		wg.Add(1)
+		go func(n string, sp *SocketProxy) {
+			defer wg.Done()
+			poolLog.Info("proxy_stopping", slog.String("mcp", n))
+			_ = sp.Stop()
+		}(name, proxy)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		poolLog.Info("all_proxies_stopped")
+	case <-time.After(10 * time.Second):
+		poolLog.Warn("shutdown_timeout")
 	}
 
 	return nil
 }
 
 // StartHealthMonitor launches a background goroutine that checks for
-// failed proxies every 10 seconds and restarts them automatically.
+// failed proxies every 3 seconds and restarts them automatically.
 func (p *Pool) StartHealthMonitor() {
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -189,7 +223,7 @@ func (p *Pool) StartHealthMonitor() {
 			}
 		}
 	}()
-	log.Printf("[Pool] Health monitor started (10s interval)")
+	poolLog.Info("health_monitor_started")
 }
 
 func (p *Pool) restartFailedProxies() {
@@ -200,7 +234,26 @@ func (p *Pool) restartFailedProxies() {
 		if proxy.mcpProcess == nil {
 			continue
 		}
-		if proxy.GetStatus() == StatusFailed {
+		status := proxy.GetStatus()
+		// Skip permanently failed proxies
+		if status == StatusPermanentlyFailed {
+			continue
+		}
+		// Reset failure counters for proxies that have been healthy for 5+ minutes
+		if status == StatusRunning {
+			proxy.statusMu.RLock()
+			successSince := proxy.successSince
+			proxy.statusMu.RUnlock()
+			if !successSince.IsZero() && time.Since(successSince) > 5*time.Minute {
+				if proxy.totalFailures > 0 || proxy.restartCount > 0 {
+					poolLog.Info("failure_counters_reset", slog.String("mcp", name), slog.Int("prev_failures", proxy.totalFailures))
+					proxy.totalFailures = 0
+					proxy.restartCount = 0
+				}
+			}
+			continue
+		}
+		if status == StatusFailed {
 			failedProxies = append(failedProxies, name)
 		}
 	}
@@ -208,10 +261,15 @@ func (p *Pool) restartFailedProxies() {
 
 	for _, name := range failedProxies {
 		if err := p.RestartProxyWithRateLimit(name); err != nil {
-			log.Printf("[Pool] Failed to restart %s: %v", name, err)
+			poolLog.Error("restart_failed", slog.String("mcp", name), slog.String("error", err.Error()))
 		}
 	}
 }
+
+// maxTotalRestartFailures is the maximum number of cumulative failures before
+// a proxy is permanently disabled. This prevents infinite restart loops for
+// broken MCPs (e.g., removed npm packages) from leaking memory.
+const maxTotalRestartFailures = 10
 
 // RestartProxyWithRateLimit restarts a proxy with rate limiting to prevent loops
 func (p *Pool) RestartProxyWithRateLimit(name string) error {
@@ -223,6 +281,18 @@ func (p *Pool) RestartProxyWithRateLimit(name string) error {
 		return fmt.Errorf("proxy %s not found", name)
 	}
 
+	// Already permanently failed, nothing to do
+	if proxy.GetStatus() == StatusPermanentlyFailed {
+		return fmt.Errorf("proxy %s is permanently failed", name)
+	}
+
+	// Check if we've exceeded the total failure limit
+	if proxy.totalFailures >= maxTotalRestartFailures {
+		poolLog.Error("permanently_disabled", slog.String("mcp", name), slog.Int("total_failures", proxy.totalFailures))
+		proxy.SetStatus(StatusPermanentlyFailed)
+		return fmt.Errorf("proxy %s permanently disabled after %d failures", name, proxy.totalFailures)
+	}
+
 	// Rate limit: minimum 5 seconds between restarts, max 3 per minute
 	if time.Since(proxy.lastRestart) < 5*time.Second {
 		return fmt.Errorf("rate limited: last restart was %v ago", time.Since(proxy.lastRestart))
@@ -231,13 +301,14 @@ func (p *Pool) RestartProxyWithRateLimit(name string) error {
 		return fmt.Errorf("rate limited: %d restarts in last minute", proxy.restartCount)
 	}
 
-	log.Printf("[Pool] Auto-restarting failed proxy: %s", name)
+	poolLog.Info("auto_restart", slog.String("mcp", name), slog.Int("total_failures", proxy.totalFailures), slog.Int("max_failures", maxTotalRestartFailures))
 
 	// Save config before stopping
 	command := proxy.command
 	args := proxy.args
 	env := proxy.env
 	prevRestartCount := proxy.restartCount
+	prevTotalFailures := proxy.totalFailures
 
 	// Stop and remove old proxy
 	_ = proxy.Stop()
@@ -251,15 +322,32 @@ func (p *Pool) RestartProxyWithRateLimit(name string) error {
 	}
 
 	if err := newProxy.Start(); err != nil {
+		// Clean up the failed proxy to avoid leaking its context/goroutines
+		_ = newProxy.Stop()
+
+		// Track the failure even though start failed - re-add to map so
+		// health monitor can see it and eventually mark it permanently failed
+		newProxy.totalFailures = prevTotalFailures + 1
+		newProxy.restartCount = prevRestartCount + 1
+		newProxy.lastRestart = time.Now()
+		if newProxy.totalFailures >= maxTotalRestartFailures {
+			poolLog.Error("permanently_disabled", slog.String("mcp", name), slog.Int("total_failures", newProxy.totalFailures))
+			newProxy.SetStatus(StatusPermanentlyFailed)
+		} else {
+			newProxy.SetStatus(StatusFailed)
+		}
+		p.proxies[name] = newProxy
+
 		return fmt.Errorf("failed to start proxy: %w", err)
 	}
 
 	// Track restart history
 	newProxy.restartCount = prevRestartCount + 1
+	newProxy.totalFailures = prevTotalFailures
 	newProxy.lastRestart = time.Now()
 
 	p.proxies[name] = newProxy
-	log.Printf("[Pool] Successfully restarted %s (restart #%d)", name, newProxy.restartCount)
+	poolLog.Info("restart_complete", slog.String("mcp", name), slog.Int("restart_num", newProxy.restartCount))
 
 	return nil
 }
@@ -271,13 +359,27 @@ func (p *Pool) ListServers() []ProxyInfo {
 	list := []ProxyInfo{}
 	for _, proxy := range p.proxies {
 		list = append(list, ProxyInfo{
-			Name:        proxy.name,
-			SocketPath:  proxy.socketPath,
-			Status:      proxy.GetStatus().String(),
-			Clients:     proxy.GetClientCount(),
+			Name:       proxy.name,
+			SocketPath: proxy.socketPath,
+			Status:     proxy.GetStatus().String(),
+			Clients:    proxy.GetClientCount(),
 		})
 	}
 	return list
+}
+
+// GetRunningCount returns the number of running MCP proxies
+func (p *Pool) GetRunningCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	count := 0
+	for _, proxy := range p.proxies {
+		if proxy.GetStatus() == StatusRunning {
+			count++
+		}
+	}
+	return count
 }
 
 type ProxyInfo struct {
@@ -293,7 +395,7 @@ func (p *Pool) DiscoverExistingSockets() int {
 	pattern := filepath.Join("/tmp", "agentdeck-mcp-*.sock")
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		log.Printf("[Pool] Failed to scan for existing sockets: %v", err)
+		poolLog.Warn("socket_scan_failed", slog.String("error", err.Error()))
 		return 0
 	}
 
@@ -317,22 +419,23 @@ func (p *Pool) DiscoverExistingSockets() int {
 
 		// Check if socket is alive (owned by another instance)
 		if !isSocketAliveCheck(socketPath) {
-			log.Printf("[Pool] Socket %s exists but not alive, skipping", name)
+			poolLog.Debug("stale_socket_removed", slog.String("mcp", name))
+			os.Remove(socketPath)
 			continue
 		}
 
 		// Register the external socket
 		if err := p.RegisterExternalSocket(name, socketPath); err != nil {
-			log.Printf("[Pool] Failed to register external socket %s: %v", name, err)
+			poolLog.Warn("external_register_failed", slog.String("mcp", name), slog.String("error", err.Error()))
 			continue
 		}
 
-		log.Printf("[Pool] ✓ Discovered external socket: %s → %s", name, socketPath)
+		poolLog.Info("external_socket_discovered", slog.String("mcp", name), slog.String("path", socketPath))
 		discovered++
 	}
 
 	if discovered > 0 {
-		log.Printf("[Pool] Discovered %d existing sockets from another agent-deck instance", discovered)
+		poolLog.Info("discovery_complete", slog.Int("count", discovered))
 	}
 	return discovered
 }
@@ -360,12 +463,12 @@ func (p *Pool) RegisterExternalSocket(name, socketPath string) error {
 		return nil // Already registered
 	}
 
-	// Create a SocketProxy that points to the external socket (no process to manage)
+	// Create a SocketProxy that points to the external socket (no process to manage).
+	// nextID and idMap zero values are ready to use without explicit initialization.
 	proxy := &SocketProxy{
 		name:       name,
 		socketPath: socketPath,
 		clients:    make(map[string]net.Conn),
-		requestMap: make(map[interface{}]string),
 		ctx:        p.ctx,
 		Status:     StatusRunning, // External socket is alive
 		// mcpProcess is nil - we don't own this process

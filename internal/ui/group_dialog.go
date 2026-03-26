@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -20,16 +21,21 @@ const (
 
 // GroupDialog handles group creation, renaming, and moving sessions
 type GroupDialog struct {
-	visible    bool
-	mode       GroupDialogMode
-	nameInput  textinput.Model
-	width      int
-	height     int
-	groupPath  string   // Current group being edited (for rename) or parent path (for create subgroup)
-	parentName string   // Display name of parent group (for subgroup creation)
-	groupNames []string // Available groups (for move)
-	selected   int      // Selected group index (for move)
-	sessionID  string   // Session ID being renamed (for rename session)
+	visible       bool
+	mode          GroupDialogMode
+	nameInput     textinput.Model
+	width         int
+	height        int
+	groupPath     string   // Current group being edited (for rename) or parent path (for create subgroup)
+	parentName    string   // Display name of parent group (for subgroup creation)
+	groupPaths    []string // Available target group paths (for move)
+	selected      int      // Selected group index (for move)
+	sessionID     string   // Session ID being renamed (for rename session)
+	validationErr string   // Inline validation error displayed inside the dialog
+
+	// Tab toggle between Root and Subgroup modes (Issue #111)
+	contextParentPath string // Original cursor context parent path (for toggling back)
+	contextParentName string // Original cursor context parent name (for toggling back)
 }
 
 // NewGroupDialog creates a new group dialog
@@ -41,7 +47,7 @@ func NewGroupDialog() *GroupDialog {
 
 	return &GroupDialog{
 		nameInput:  ti,
-		groupNames: []string{},
+		groupPaths: []string{},
 	}
 }
 
@@ -51,6 +57,7 @@ func (g *GroupDialog) Show() {
 	g.mode = GroupDialogCreate
 	g.groupPath = "" // No parent = root level
 	g.parentName = ""
+	g.validationErr = ""
 	g.nameInput.SetValue("")
 	g.nameInput.Focus()
 }
@@ -61,8 +68,72 @@ func (g *GroupDialog) ShowCreateSubgroup(parentPath, parentName string) {
 	g.mode = GroupDialogCreate
 	g.groupPath = parentPath // Parent path for the new subgroup
 	g.parentName = parentName
+	g.validationErr = ""
 	g.nameInput.SetValue("")
 	g.nameInput.Focus()
+}
+
+// ShowCreateWithContext opens the create dialog with cursor context for Tab toggling.
+// If parentPath is non-empty, defaults to subgroup mode with Tab toggle available.
+// If parentPath is empty, opens as root-level group with no toggle.
+func (g *GroupDialog) ShowCreateWithContext(parentPath, parentName string) {
+	g.visible = true
+	g.mode = GroupDialogCreate
+	g.contextParentPath = parentPath
+	g.contextParentName = parentName
+	g.validationErr = ""
+	g.nameInput.SetValue("")
+	g.nameInput.Focus()
+
+	if parentPath != "" {
+		// Default to subgroup mode
+		g.groupPath = parentPath
+		g.parentName = parentName
+	} else {
+		// Root mode, no toggle
+		g.groupPath = ""
+		g.parentName = ""
+	}
+}
+
+// ShowCreateWithContextDefaultRoot opens the create dialog defaulting to root mode,
+// but stores the cursor context so Tab toggle can switch to subgroup mode.
+// Used when the cursor is on a session inside a group (not on the group header itself).
+func (g *GroupDialog) ShowCreateWithContextDefaultRoot(parentPath, parentName string) {
+	g.visible = true
+	g.mode = GroupDialogCreate
+	g.contextParentPath = parentPath
+	g.contextParentName = parentName
+	g.validationErr = ""
+	g.nameInput.SetValue("")
+	g.nameInput.Focus()
+
+	// Default to root mode, Tab toggles to subgroup
+	g.groupPath = ""
+	g.parentName = ""
+}
+
+// CanToggle returns true when the Tab toggle between Root and Subgroup is available.
+// Only applies in Create mode when the cursor was on a group context.
+func (g *GroupDialog) CanToggle() bool {
+	return g.mode == GroupDialogCreate && g.contextParentPath != ""
+}
+
+// ToggleRootSubgroup swaps between root-level and subgroup creation modes.
+func (g *GroupDialog) ToggleRootSubgroup() {
+	if !g.CanToggle() {
+		return
+	}
+	if g.groupPath == "" {
+		// Currently root → switch to subgroup
+		g.groupPath = g.contextParentPath
+		g.parentName = g.contextParentName
+	} else {
+		// Currently subgroup → switch to root
+		g.groupPath = ""
+		g.parentName = ""
+	}
+	g.validationErr = ""
 }
 
 // ShowRename shows the dialog in rename mode
@@ -70,15 +141,17 @@ func (g *GroupDialog) ShowRename(currentPath, currentName string) {
 	g.visible = true
 	g.mode = GroupDialogRename
 	g.groupPath = currentPath
+	g.validationErr = ""
 	g.nameInput.SetValue(currentName)
 	g.nameInput.Focus()
 }
 
-// ShowMove shows the dialog for moving a session to a group
-func (g *GroupDialog) ShowMove(groups []string) {
+// ShowMove shows the dialog for moving a session to a group path.
+func (g *GroupDialog) ShowMove(groupPaths []string) {
 	g.visible = true
 	g.mode = GroupDialogMove
-	g.groupNames = groups
+	g.validationErr = ""
+	g.groupPaths = groupPaths
 	g.selected = 0
 }
 
@@ -87,6 +160,7 @@ func (g *GroupDialog) ShowRenameSession(sessionID, currentName string) {
 	g.visible = true
 	g.mode = GroupDialogRenameSession
 	g.sessionID = sessionID
+	g.validationErr = ""
 	g.nameInput.SetValue(currentName)
 	g.nameInput.Focus()
 }
@@ -134,8 +208,8 @@ func (g *GroupDialog) Validate() string {
 	}
 
 	// Check name length
-	if len(name) > 50 {
-		return "Name too long (max 50 characters)"
+	if len(name) > MaxNameLength {
+		return fmt.Sprintf("Name too long (max %d characters)", MaxNameLength)
 	}
 
 	// Check for "/" in group names (would break path hierarchy)
@@ -146,6 +220,16 @@ func (g *GroupDialog) Validate() string {
 	}
 
 	return "" // Valid
+}
+
+// SetError sets an inline validation error displayed inside the dialog
+func (g *GroupDialog) SetError(msg string) {
+	g.validationErr = msg
+}
+
+// ClearError clears the inline validation error
+func (g *GroupDialog) ClearError() {
+	g.validationErr = ""
 }
 
 // GetGroupPath returns the group path being edited (or parent path for subgroup creation)
@@ -165,8 +249,8 @@ func (g *GroupDialog) HasParent() bool {
 
 // GetSelectedGroup returns the selected group for move mode
 func (g *GroupDialog) GetSelectedGroup() string {
-	if g.selected >= 0 && g.selected < len(g.groupNames) {
-		return g.groupNames[g.selected]
+	if g.selected >= 0 && g.selected < len(g.groupPaths) {
+		return g.groupPaths[g.selected]
 	}
 	return ""
 }
@@ -186,10 +270,16 @@ func (g *GroupDialog) Update(msg tea.KeyMsg) (*GroupDialog, tea.Cmd) {
 				g.selected--
 			}
 		case "down", "j":
-			if g.selected < len(g.groupNames)-1 {
+			if g.selected < len(g.groupPaths)-1 {
 				g.selected++
 			}
 		}
+		return g, nil
+	}
+
+	// Tab toggles between Root and Subgroup modes
+	if msg.String() == "tab" && g.CanToggle() {
+		g.ToggleRootSubgroup()
 		return g, nil
 	}
 
@@ -219,25 +309,43 @@ func (g *GroupDialog) View() string {
 			title = "Create New Group"
 			content = g.nameInput.View()
 		}
+
+		// Add Root/Subgroup toggle indicator when Tab toggle is available
+		if g.CanToggle() {
+			activeStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
+			dimStyle := lipgloss.NewStyle().Foreground(ColorTextDim)
+
+			rootTab := "Root"
+			subTab := "Subgroup"
+			var tabs string
+			if g.groupPath == "" {
+				// Root mode active
+				tabs = activeStyle.Render("["+rootTab+"]") + " ─── " + dimStyle.Render(subTab)
+			} else {
+				// Subgroup mode active
+				tabs = dimStyle.Render(rootTab) + " ─── " + activeStyle.Render("["+subTab+"]")
+			}
+			content = tabs + "\n\n" + content
+		}
 	case GroupDialogRename:
 		title = "Rename Group"
 		content = g.nameInput.View()
 	case GroupDialogMove:
 		title = "Move to Group"
 		var items []string
-		for i, name := range g.groupNames {
+		for i, groupPath := range g.groupPaths {
 			if i == g.selected {
 				items = append(items, lipgloss.NewStyle().
 					Foreground(ColorBg).
 					Background(ColorAccent).
 					Bold(true).
 					Padding(0, 1).
-					Render(name))
+					Render(groupPath))
 			} else {
 				items = append(items, lipgloss.NewStyle().
 					Foreground(ColorText).
 					Padding(0, 1).
-					Render(name))
+					Render(groupPath))
 			}
 		}
 		content = strings.Join(items, "\n")
@@ -258,13 +366,25 @@ func (g *GroupDialog) View() string {
 
 	titleStyle := DialogTitleStyle.Width(titleWidth)
 	hintStyle := lipgloss.NewStyle().Foreground(ColorComment)
-	hint := hintStyle.Render("Enter confirm │ Esc cancel")
+	var hint string
+	if g.CanToggle() {
+		hint = hintStyle.Render("Tab toggle │ Enter confirm │ Esc cancel")
+	} else {
+		hint = hintStyle.Render("Enter confirm │ Esc cancel")
+	}
+
+	errContent := ""
+	if g.validationErr != "" {
+		errStyle := lipgloss.NewStyle().Foreground(ColorRed).Bold(true)
+		errContent = errStyle.Render("⚠ " + g.validationErr)
+	}
 
 	dialogContent := lipgloss.JoinVertical(
 		lipgloss.Center,
 		titleStyle.Render(title),
 		"",
 		content,
+		errContent,
 		"",
 		hint,
 	)

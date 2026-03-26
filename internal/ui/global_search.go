@@ -14,26 +14,26 @@ import (
 
 var (
 	globalSearchBoxStyle = lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(ColorCyan).
-		Padding(0, 1)
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(ColorCyan).
+				Padding(0, 1)
 
 	globalResultStyle = lipgloss.NewStyle().
-		Padding(0, 2)
+				Padding(0, 2)
 
 	globalSelectedStyle = lipgloss.NewStyle().
-		Padding(0, 2).
-		Background(ColorCyan).
-		Foreground(ColorBg)
+				Padding(0, 2).
+				Background(ColorCyan).
+				Foreground(ColorBg)
 
 	globalSearchHeaderStyle = lipgloss.NewStyle().
-		Foreground(ColorCyan).
-		Bold(true)
+				Foreground(ColorCyan).
+				Bold(true)
 
 	highlightStyle = lipgloss.NewStyle().
-		Background(ColorYellow).
-		Foreground(ColorBg).
-		Bold(true)
+			Background(ColorYellow).
+			Foreground(ColorBg).
+			Bold(true)
 )
 
 // GlobalSearchResult wraps a search result for UI display
@@ -41,13 +41,24 @@ type GlobalSearchResult struct {
 	SessionID   string
 	Summary     string
 	Snippet     string
-	Content     string    // Full conversation content for preview
+	Content     string // Full conversation content for preview
 	CWD         string
 	ModTime     time.Time // Last modified time
 	Score       int       // Fuzzy match score (higher = better match)
 	MatchCount  int       // Number of query matches in content
 	InAgentDeck bool      // True if this session is already in Agent Deck
 	InstanceID  string    // Agent Deck instance ID if exists
+}
+
+// globalSearchResultsMsg delivers async search results back to the UI
+type globalSearchResultsMsg struct {
+	query   string                  // The query these results are for
+	results []*session.SearchResult // Raw search results from index
+}
+
+// globalSearchDebounceMsg fires after the debounce interval
+type globalSearchDebounceMsg struct {
+	query string // The query to search for
 }
 
 // GlobalSearch represents the global session search overlay
@@ -61,9 +72,10 @@ type GlobalSearch struct {
 	loading       bool
 	tierName      string
 	entryCount    int
-	switchToLocal bool  // Flag to signal switch to local search
-	previewScroll int   // Scroll offset for preview pane
+	switchToLocal bool   // Flag to signal switch to local search
+	previewScroll int    // Scroll offset for preview pane
 	query         string // Current search query for highlighting
+	searching     bool   // True while async search is in flight
 
 	// Index reference (set by Home)
 	index *session.GlobalSearchIndex
@@ -117,6 +129,7 @@ func (gs *GlobalSearch) Show() {
 	gs.cursor = 0
 	gs.switchToLocal = false
 	gs.previewScroll = 0
+	gs.searching = false
 	gs.RefreshStats()
 }
 
@@ -161,6 +174,45 @@ func (gs *GlobalSearch) Update(msg tea.Msg) (*GlobalSearch, tea.Cmd) {
 	gs.RefreshStats()
 
 	switch msg := msg.(type) {
+	case globalSearchDebounceMsg:
+		// Debounce timer fired: if query still matches, run async search
+		if msg.query == gs.input.Value() && msg.query != "" {
+			gs.searching = true
+			query := msg.query
+			index := gs.index
+			return gs, func() tea.Msg {
+				results := index.Search(query)
+				if len(results) == 0 {
+					results = index.FuzzySearch(query)
+				}
+				return globalSearchResultsMsg{query: query, results: results}
+			}
+		}
+		return gs, nil
+
+	case globalSearchResultsMsg:
+		// Async search results arrived: only apply if query still matches
+		if msg.query == gs.input.Value() {
+			gs.searching = false
+			gs.applySearchResults(msg.query, msg.results)
+		}
+		return gs, nil
+
+	case tea.MouseMsg:
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			if gs.cursor > 0 {
+				gs.cursor--
+				gs.previewScroll = 0
+			}
+		case tea.MouseButtonWheelDown:
+			if gs.cursor < len(gs.results)-1 {
+				gs.cursor++
+				gs.previewScroll = 0
+			}
+		}
+		return gs, nil
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc":
@@ -222,31 +274,27 @@ func (gs *GlobalSearch) Update(msg tea.Msg) (*GlobalSearch, tea.Cmd) {
 		default:
 			var cmd tea.Cmd
 			gs.input, cmd = gs.input.Update(msg)
-			gs.updateResults()
-			return gs, cmd
+			query := gs.input.Value()
+			gs.query = query
+			if query == "" {
+				gs.results = nil
+				gs.searching = false
+				return gs, cmd
+			}
+			// Debounce: schedule search after 250ms
+			gs.searching = true
+			debounceCmd := tea.Tick(250*time.Millisecond, func(t time.Time) tea.Msg {
+				return globalSearchDebounceMsg{query: query}
+			})
+			return gs, tea.Batch(cmd, debounceCmd)
 		}
 	}
 
 	return gs, nil
 }
 
-// updateResults performs search and updates results
-func (gs *GlobalSearch) updateResults() {
-	gs.query = gs.input.Value() // Store for highlighting
-	query := gs.query
-	if gs.index == nil || query == "" {
-		gs.results = nil
-		return
-	}
-
-	// Perform full-content search first (more comprehensive)
-	searchResults := gs.index.Search(query)
-
-	// If no substring matches, fall back to fuzzy search (typo tolerance)
-	if len(searchResults) == 0 {
-		searchResults = gs.index.FuzzySearch(query)
-	}
-
+// applySearchResults converts raw search results into UI results
+func (gs *GlobalSearch) applySearchResults(query string, searchResults []*session.SearchResult) {
 	// Convert to UI results (limit to 15 for split view)
 	gs.results = make([]*GlobalSearchResult, 0, min(len(searchResults), 15))
 	queryLower := strings.ToLower(query)
@@ -254,13 +302,21 @@ func (gs *GlobalSearch) updateResults() {
 		if i >= 15 {
 			break
 		}
+		content := sr.Entry.ContentString()
+		if content == "" {
+			if sr.Snippet != "" {
+				content = sr.Snippet
+			} else {
+				content = sr.Entry.Summary
+			}
+		}
 		// Count occurrences of query in content (case-insensitive)
-		matchCount := strings.Count(strings.ToLower(sr.Entry.Content), queryLower)
+		matchCount := strings.Count(strings.ToLower(content), queryLower)
 		gs.results = append(gs.results, &GlobalSearchResult{
 			SessionID:  sr.Entry.SessionID,
 			Summary:    sr.Entry.Summary,
 			Snippet:    sr.Snippet,
-			Content:    sr.Entry.Content, // Full content for preview
+			Content:    content, // Full content for preview (fallbacks for balanced tier)
 			CWD:        sr.Entry.CWD,
 			ModTime:    sr.Entry.ModTime,
 			Score:      sr.Score,
@@ -301,7 +357,7 @@ func (gs *GlobalSearch) View() string {
 	if totalWidth < 100 {
 		totalWidth = 100
 	}
-	leftWidth := totalWidth * 35 / 100  // 35% for results
+	leftWidth := totalWidth * 35 / 100       // 35% for results
 	rightWidth := totalWidth - leftWidth - 3 // Rest for preview (minus border)
 
 	previewHeight := gs.height - 12 // Leave room for header, input, hints
@@ -327,7 +383,11 @@ func (gs *GlobalSearch) View() string {
 	leftPane.WriteString(searchBox + "\n\n")
 
 	// Results list
-	if len(gs.results) == 0 && gs.input.Value() != "" {
+	if gs.searching && len(gs.results) == 0 {
+		leftPane.WriteString(lipgloss.NewStyle().
+			Foreground(ColorYellow).
+			Render("  Searching..."))
+	} else if len(gs.results) == 0 && gs.input.Value() != "" {
 		leftPane.WriteString(lipgloss.NewStyle().
 			Foreground(ColorComment).
 			Render("  No results"))
@@ -472,14 +532,14 @@ func (gs *GlobalSearch) View() string {
 	// Style the panes
 	leftStyle := lipgloss.NewStyle().
 		Width(leftWidth).
-		Height(previewHeight + 6).
+		Height(previewHeight+6).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(ColorAccent).
 		Padding(0, 1)
 
 	rightStyle := lipgloss.NewStyle().
 		Width(rightWidth).
-		Height(previewHeight + 6).
+		Height(previewHeight+6).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(ColorCyan).
 		Padding(0, 1)

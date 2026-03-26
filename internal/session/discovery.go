@@ -32,13 +32,25 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 			continue
 		}
 
-		// Skip agent-deck sessions (they should already be tracked)
+		// For orphaned agent-deck sessions, extract the original title from the tmux name
+		// Format: agentdeck_<title>_<hash> -> extract <title>
+		title := sess.DisplayName
+		groupPath := ""
+		isOrphaned := false
 		if strings.HasPrefix(sess.Name, tmux.SessionPrefix) {
-			continue
+			isOrphaned = true
+			// Extract title from session name: agentdeck_<title>_<8-char-hash>
+			namePart := strings.TrimPrefix(sess.Name, tmux.SessionPrefix)
+			if lastUnderscore := strings.LastIndex(namePart, "_"); lastUnderscore > 0 {
+				title = namePart[:lastUnderscore]
+			} else {
+				title = namePart
+			}
+			// Put orphaned sessions in a "Recovered" group so user knows they were recovered
+			groupPath = "recovered"
 		}
 
 		// Create instance for discovered session
-		title := sess.DisplayName
 		projectPath := sess.WorkDir
 		if projectPath == "" {
 			projectPath = "~"
@@ -48,12 +60,19 @@ func DiscoverExistingTmuxSessions(existingInstances []*Instance) ([]*Instance, e
 		// Ignore errors - non-fatal, older tmux versions may not support all options
 		_ = sess.EnableMouseMode()
 
+		// Determine tool type - for orphaned agent-deck sessions, assume claude (most common)
+		tool := detectToolFromName(title)
+		if isOrphaned && tool == "shell" {
+			tool = "claude" // Most agent-deck sessions are Claude sessions
+		}
+
 		inst := &Instance{
 			ID:          generateID(),
 			Title:       title,
 			ProjectPath: projectPath,
+			GroupPath:   groupPath,
 			Status:      StatusIdle,
-			Tool:        detectToolFromName(title),
+			Tool:        tool,
 			tmuxSession: sess,
 		}
 		_ = inst.UpdateStatus()
@@ -91,6 +110,7 @@ func FilterByQuery(instances []*Instance, query string) []*Instance {
 		"running": StatusRunning,
 		"idle":    StatusIdle,
 		"error":   StatusError,
+		"stopped": StatusStopped,
 	}
 
 	// If query matches a status filter exactly, filter by status
